@@ -275,13 +275,9 @@ run_toggle_boot_mode() {
     fi
 
     # --- 2. DETECTION ---
-    # Default to Game Mode — correct for this hardware out of the box.
-    # Only report Desktop Mode if plasma.desktop is positively found in the active config.
-    local current_mode="${BOLD}${GREEN}Game Mode${RESET}"
-    if [[ -f "$OVERRIDE_FILE" ]]; then
-        grep -q "plasma.desktop" "$OVERRIDE_FILE" && current_mode="${BOLD}${CYAN}Desktop Mode${RESET}"
-    else
-        grep -rq "plasma.desktop" "$CONF_DIR"/*.conf 2>/dev/null && current_mode="${BOLD}${CYAN}Desktop Mode${RESET}"
+    local current_mode="${BOLD}${CYAN}Desktop Mode${RESET}"
+    if [[ -f "$OVERRIDE_FILE" ]] && grep -q "gamescope" "$OVERRIDE_FILE"; then
+        current_mode="${BOLD}${GREEN}Game Mode${RESET}"
     fi
 
     print_info "Current Boot Mode: $current_mode"
@@ -1079,6 +1075,22 @@ run_status() {
     local CPU_CONF="/etc/bc250-smu-oc.conf"
     local GPU_CONF="/etc/cyan-skillfish-governor-smu/config.toml"
     local MKINITCPIO="/etc/mkinitcpio.conf"
+
+    # --- System ---
+    echo -e "  ${BOLD}${YELLOW}System${RESET}"
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+
+    local OVERRIDE_FILE="/etc/plasmalogin.conf.d/zzz-bc250-boot.conf"
+    local CONF_DIR="/etc/plasmalogin.conf.d"
+    local boot_mode="${BOLD}${GREEN}Game Mode${RESET}"
+    if [[ -f "$OVERRIDE_FILE" ]]; then
+        grep -q "plasma.desktop" "$OVERRIDE_FILE" && boot_mode="${BOLD}${CYAN}Desktop Mode${RESET}"
+    else
+        grep -rq "plasma.desktop" "$CONF_DIR"/*.conf 2>/dev/null && boot_mode="${BOLD}${CYAN}Desktop Mode${RESET}"
+    fi
+    echo -e "  ${CYAN}Boot Mode${RESET}         ${boot_mode}"
+    echo -e "  ${CYAN}Kernel${RESET}            $(uname -r)"
+    echo ""
 
     # --- Overclock Profile ---
     echo -e "  ${BOLD}${YELLOW}Overclock${RESET}"
