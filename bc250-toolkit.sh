@@ -258,7 +258,7 @@ run_toggle_boot_mode() {
     local CONF_DIR="/etc/plasmalogin.conf.d"
     local BACKUP_DIR="$CONF_DIR/original_backups"
     local OVERRIDE_FILE="$CONF_DIR/zzz-bc250-boot.conf"
-    local USER_NAME="gennro"
+    local USER_NAME="$REAL_USER"
 
     # --- 1. ONE-TIME BACKUP & CLEANUP ---
     if [[ ! -d "$BACKUP_DIR" ]]; then
