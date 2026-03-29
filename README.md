@@ -15,6 +15,4 @@ It does the following:
 7. Displays a status window showing you your current settings.
 
 Installation:
-1. Download the script: wget https://github.com/redbeard1083/bc250-toolkit/blob/main/bc250-toolkit.sh
-2. Make it executable with:  chmod +x bc250-toolkit.sh
-3. Run it:  ./bc250-toolkit.sh
+curl -sSLO https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main/bc250-toolkit.sh && chmod +x bc250-toolkit.sh && ./bc250-toolkit.sh
