@@ -106,19 +106,18 @@ run_cpu_governor() {
     else
         git clone https://github.com/bc250-collective/bc250_smu_oc.git || { print_error "Failed to clone repository."; return 1; }
     fi
-    (
-        cd bc250_smu_oc || { print_error "Failed to enter bc250_smu_oc directory."; exit 1; }
-        print_info "Installing via pipx..."
-        pipx install . || { print_error "Failed to install via pipx."; exit 1; }
-        pipx ensurepath || true
-        export PATH="$PATH:/root/.local/bin"
-        print_info "Running bc250-detect..."
-        bc250-detect --frequency 3500 --vid 1000 --keep || { print_error "bc250-detect failed."; exit 1; }
-        print_info "Applying overclock config..."
-        bc250-apply --install overclock.conf || { print_error "bc250-apply failed."; exit 1; }
-        print_info "Enabling systemd service..."
-        systemctl enable bc250-smu-oc || { print_error "Failed to enable service."; exit 1; }
-    ) || return 1
+    cd bc250_smu_oc
+    print_info "Installing via pipx..."
+    pipx install . || { print_error "Failed to install via pipx."; cd ..; return 1; }
+    pipx ensurepath || true
+    export PATH="$PATH:/root/.local/bin"
+    print_info "Running bc250-detect..."
+    bc250-detect --frequency 3500 --vid 1000 --keep || { print_error "bc250-detect failed."; cd ..; return 1; }
+    print_info "Applying overclock config..."
+    bc250-apply --install overclock.conf || { print_error "bc250-apply failed."; cd ..; return 1; }
+    print_info "Enabling systemd service..."
+    systemctl enable bc250-smu-oc || { print_error "Failed to enable service."; cd ..; return 1; }
+    cd ..
     print_success "CPU Governor installed successfully!"
 }
 
@@ -188,9 +187,6 @@ run_set_loglevel() {
         limine-update
     fi
     print_success "loglevel set to 0. Reboot to apply."
-    if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        confirm "Reboot now?" && reboot || true
-    fi
 }
 
 run_disable_zram_enable_zswap() {
@@ -229,7 +225,7 @@ run_disable_zram_enable_zswap() {
 
     # --- Add lz4 modules to initramfs ---
     local MKINITCPIO="/etc/mkinitcpio.conf"
-    if grep -qE '\blz4\b' "$MKINITCPIO" && grep -qE '\blz4_compress\b' "$MKINITCPIO"; then
+    if grep -q 'lz4' "$MKINITCPIO"; then
         print_info "lz4 modules already present in $MKINITCPIO — skipping."
     else
         print_info "Adding lz4 and lz4_compress modules to initramfs..."
@@ -245,9 +241,6 @@ run_disable_zram_enable_zswap() {
     fi
     print_success "ZRAM disabled && ZSWAP enabled! Reboot to apply."
     echo -e "  ${DIM}After reboot, verify with: cat /sys/module/zswap/parameters/enabled${RESET}\n"
-    if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        confirm "Reboot now?" && reboot || true
-    fi
 }
 
 # ==============================================================================
@@ -608,12 +601,37 @@ install_cpu() {
 }
 
 install_gpu() {
-    cp "$GPU_TMPFILE" "$GPU_DEST"
+    # Check if a new temporary config was actually provided (for presets)
+    if [[ -f "${1:-}" ]]; then
+        cp "$1" "$GPU_DEST"
+    fi
+
+    # Restart the service to load whatever is currently in $GPU_DEST
     systemctl restart "$GPU_SERVICE"
+
     if systemctl is-active --quiet "$GPU_SERVICE"; then
-        print_info "GPU service is running."
+        print_info "GPU service is running with current config."
     else
         print_error "GPU service failed to start! Check: journalctl -u $GPU_SERVICE"
+    fi
+}
+
+oc_edit_gpu_config_kate() {
+    print_step "07-E" "Opening GPU Config in Kate"
+
+    if [[ ! -f "$GPU_DEST" ]]; then
+        print_error "Configuration file not found at $GPU_DEST"
+        return 1
+    fi
+
+    print_info "Launching Kate as $REAL_USER..."
+    # Launching as the real user prevents permission issues and root-execution blocks
+    sudo -u "$REAL_USER" kate "$GPU_DEST" &>/dev/null &
+
+    print_success "Kate opened. Make your changes and save the file."
+
+    if confirm "Would you like to restart the GPU service to apply manual changes?"; then
+        install_gpu
     fi
 }
 
@@ -715,7 +733,7 @@ oc_apply_preset() {
 
     print_info "Writing and installing GPU config..."
     "${PRESET_GPU_WRITERS[$idx]}"
-    install_gpu
+    install_gpu "$GPU_TMPFILE"
 
     echo ""
     print_success "Preset '${name}' applied!"
@@ -796,7 +814,7 @@ oc_apply_custom() {
         sed -i "s/^throttling = .*/throttling = ${custom_temp}/" "$GPU_TMPFILE"
         sed -i "s/^throttling_recovery = .*/throttling_recovery = ${recovery}/" "$GPU_TMPFILE"
     fi
-    install_gpu
+    install_gpu "$GPU_TMPFILE"
 
     echo ""
     print_success "Custom profile applied!"
@@ -816,13 +834,15 @@ run_overclock_menu() {
         done
         echo ""
         print_item "C" "Custom"           "Mix & match CPU and GPU profiles"
+        print_item "E" "Edit with Kate"  "Manually edit GPU overclock"
         print_item "0" "Back to Main Menu" ""
         echo ""
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
         read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" oc_choice
 
         case "${oc_choice^^}" in
-            C) oc_apply_custom;   press_enter ;;
+            C) oc_apply_custom;      press_enter ;;
+            E) oc_edit_gpu_config_kate; press_enter ;;
             0) return 0 ;;
             *)
                 if [[ "$oc_choice" =~ ^[0-9]+$ ]] && (( oc_choice >= 1 && oc_choice <= ${#PRESET_NAMES[@]} )); then
@@ -837,58 +857,6 @@ run_overclock_menu() {
     done
 }
 
-run_create_patch() {
-    local PATCH_FILE="0001-drm-amd-fix-dcn-2.01-check.patch"
-    print_step "06" "DP Audio Fix — Creating Patch for CachyOS Kernel Manager"
-
-    if [[ -f "$PATCH_FILE" ]]; then
-        print_info "Patch file already exists: $PATCH_FILE — skipping."
-        return 0
-    fi
-
-    cat > "$PATCH_FILE" << 'EOF'
-From: Andy Nguyen <theofficialflow1996@gmail.com>
-Subject: [PATCH] drm/amd: fix dcn 2.01 check
-The ASICREV_IS_BEIGE_GOBY_P check always took precedence, because it
-includes all chip revisions upto NV_UNKNOWN.
-Fixes: 54b822b3eac3 ("drm/amd/display: Use dce_version instead of chip_id")
-Signed-off-by: Andy Nguyen <theofficialflow1996@gmail.com>
----
- drivers/gpu/drm/amd/display/dc/clk_mgr/clk_mgr.c | 8 ++++----
- 1 file changed, 4 insertions(+), 4 deletions(-)
-
-diff --git a/drivers/gpu/drm/amd/display/dc/clk_mgr/clk_mgr.c b/drivers/gpu/drm/amd/display/dc/clk_mgr/clk_mgr.c
-index 08d0e05a313e..d237d7b41dfd 100644
---- a/drivers/gpu/drm/amd/display/dc/clk_mgr/clk_mgr.c
-+++ b/drivers/gpu/drm/amd/display/dc/clk_mgr/clk_mgr.c
-@@ -255,6 +255,10 @@ struct clk_mgr *dc_clk_mgr_create(struct dc_context *ctx, struct pp_smu_funcs *p
- 			BREAK_TO_DEBUGGER();
- 			return NULL;
- 		}
-+		if (ctx->dce_version == DCN_VERSION_2_01) {
-+			dcn201_clk_mgr_construct(ctx, clk_mgr, pp_smu, dccg);
-+			return &clk_mgr->base;
-+		}
- 		if (ASICREV_IS_SIENNA_CICHLID_P(asic_id.hw_internal_rev)) {
- 			dcn3_clk_mgr_construct(ctx, clk_mgr, pp_smu, dccg);
- 			return &clk_mgr->base;
-@@ -267,10 +271,6 @@ struct clk_mgr *dc_clk_mgr_create(struct dc_context *ctx, struct pp_smu_funcs *p
- 			dcn3_clk_mgr_construct(ctx, clk_mgr, pp_smu, dccg);
- 			return &clk_mgr->base;
- 		}
--		if (ctx->dce_version == DCN_VERSION_2_01) {
--			dcn201_clk_mgr_construct(ctx, clk_mgr, pp_smu, dccg);
--			return &clk_mgr->base;
--		}
- 		dcn20_clk_mgr_construct(ctx, clk_mgr, pp_smu, dccg);
- 		return &clk_mgr->base;
- 	}
--- 
-2.43.0
-EOF
-
-    print_success "Patch file created: $PATCH_FILE"
-}
 
 run_revert_zswap() {
     local CONF="/etc/default/limine"
@@ -924,9 +892,9 @@ run_revert_zswap() {
 
     # --- Remove lz4 from mkinitcpio ---
     local MKINITCPIO="/etc/mkinitcpio.conf"
-    if grep -qE '\blz4\b|\blz4_compress\b' "$MKINITCPIO"; then
+    if grep -q 'lz4' "$MKINITCPIO"; then
         print_info "Removing lz4 modules from initramfs..."
-        sed -i 's/[[:space:]]\+lz4_compress\b//g;s/[[:space:]]\+lz4\b//g' "$MKINITCPIO"
+        sed -i 's/ lz4_compress//g;s/ lz4//g' "$MKINITCPIO"
         print_info "Rebuilding initramfs..."
         mkinitcpio -P
         print_info "Initramfs rebuilt."
@@ -937,8 +905,7 @@ run_revert_zswap() {
     print_info "Regenerating /boot/limine.conf..."
     limine-update
     print_success "Revert complete! Reboot to restore ZRAM and disable ZSWAP."
-    echo -e "  ${DIM}After reboot, verify with: systemctl show systemd-zram-setup@zram0.service --property=ActiveState --value${RESET}\n"
-    confirm "Reboot now?" && reboot || true
+    echo -e "  ${DIM}After reboot, verify with: systemctl is-active systemd-zram-setup@zram0.service${RESET}\n"
 }
 
 
@@ -971,9 +938,6 @@ run_disable_mitigations() {
     fi
     print_success "mitigations=off added. Reboot to apply."
     echo -e "  ${DIM}Note: this disables Spectre/Meltdown mitigations for a performance gain.${RESET}\n"
-    if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        confirm "Reboot now?" && reboot || true
-    fi
 }
 
 run_status() {
@@ -1027,77 +991,6 @@ run_status() {
     echo -e "  ${CYAN}GPU Service${RESET}       ${gpu_color}${gpu_svc_state}${RESET}"
     echo ""
 
-    # --- Temperatures ---
-    echo -e "  ${BOLD}${YELLOW}Temperatures${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
-
-    local hwmon_path=""
-    for d in /sys/class/hwmon/hwmon*; do
-        if [[ "$(cat "$d/name" 2>/dev/null)" == "k10temp" ]]; then
-            hwmon_path="$d"
-            break
-        fi
-    done
-
-    if [[ -n "$hwmon_path" ]]; then
-        read_temp() {
-            local raw
-            raw=$(cat "$1" 2>/dev/null) || { echo "N/A"; return; }
-            printf "%d.%d" $(( raw / 1000 )) $(( (raw % 1000) / 100 ))
-        }
-        temp_color() {
-            local val_raw
-            val_raw=$(cat "$1" 2>/dev/null) || { echo "$DIM"; return; }
-            local deg=$(( val_raw / 1000 ))
-            if   (( deg >= $3 )); then echo "$RED"
-            elif (( deg >= $2 )); then echo "$YELLOW"
-            else echo "$GREEN"
-            fi
-        }
-
-        local tctl_file="" tccd_file="" gpu_temp_file=""
-        for f in "$hwmon_path"/temp*_label; do
-            [[ -f "$f" ]] || continue
-            local label; label=$(cat "$f" 2>/dev/null)
-            case "$label" in
-                Tctl)  tctl_file="${f/_label/_input}" ;;
-                Tccd*) [[ -z "$tccd_file" ]] && tccd_file="${f/_label/_input}" ;;
-                GPU)   gpu_temp_file="${f/_label/_input}" ;;
-            esac
-        done
-
-        local cpu_warn=75 cpu_crit=85 gpu_warn=75 gpu_crit=85
-        if [[ -f "$CPU_CONF" ]]; then
-            local cfg_max
-            cfg_max=$(awk -F'= ' '/^max_temperature/{print $2}' "$CPU_CONF" | tr -d ' ')
-            [[ "$cfg_max" =~ ^[0-9]+$ ]] && cpu_crit=$cfg_max && cpu_warn=$(( cfg_max - 10 ))
-        fi
-        if [[ -f "$GPU_CONF" ]]; then
-            local cfg_throttle
-            cfg_throttle=$(awk -F'= ' '/^throttling /{print $2}' "$GPU_CONF" | tr -d ' ')
-            [[ "$cfg_throttle" =~ ^[0-9]+$ ]] && gpu_crit=$cfg_throttle && gpu_warn=$(( cfg_throttle - 10 ))
-        fi
-
-        if [[ -n "$tctl_file" ]]; then
-            local tctl_col; tctl_col=$(temp_color "$tctl_file" "$cpu_warn" "$cpu_crit")
-            echo -e "  ${CYAN}CPU Tctl${RESET}          ${tctl_col}$(read_temp "$tctl_file")°C${RESET}  ${DIM}(warn ${cpu_warn}° / crit ${cpu_crit}°)${RESET}"
-        fi
-        if [[ -n "$tccd_file" ]]; then
-            local tccd_col; tccd_col=$(temp_color "$tccd_file" "$cpu_warn" "$cpu_crit")
-            echo -e "  ${CYAN}CPU Tccd${RESET}          ${tccd_col}$(read_temp "$tccd_file")°C${RESET}"
-        fi
-        if [[ -n "$gpu_temp_file" ]]; then
-            local gpu_t_col; gpu_t_col=$(temp_color "$gpu_temp_file" "$gpu_warn" "$gpu_crit")
-            echo -e "  ${CYAN}GPU${RESET}               ${gpu_t_col}$(read_temp "$gpu_temp_file")°C${RESET}  ${DIM}(warn ${gpu_warn}° / crit ${gpu_crit}°)${RESET}"
-        fi
-        if [[ -z "$tctl_file" && -z "$gpu_temp_file" ]]; then
-            echo -e "  ${DIM}k10temp found but no labeled temp inputs detected${RESET}"
-        fi
-    else
-        echo -e "  ${DIM}k10temp hwmon driver not found — sensors unavailable${RESET}"
-    fi
-    echo ""
-
     # --- Memory / Swap ---
     echo -e "  ${BOLD}${YELLOW}Memory & Swap${RESET}"
     echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
@@ -1111,7 +1004,7 @@ run_status() {
     echo -e "  ${CYAN}ZSWAP${RESET}             ${zswap_color}${zswap_enabled}${RESET}  compressor=${zswap_compressor}  pool=${zswap_pool}%"
 
     local zram_state
-    zram_state=$(systemctl show systemd-zram-setup@zram0.service --property=ActiveState --value 2>/dev/null || echo "inactive")
+    zram_state=$(systemctl is-active systemd-zram-setup@zram0.service 2>/dev/null || echo "inactive")
     local zram_color
     [[ "$zram_state" == "active" ]] && zram_color="$GREEN" || zram_color="$DIM"
     echo -e "  ${CYAN}ZRAM${RESET}              ${zram_color}${zram_state}${RESET}"
@@ -1179,7 +1072,6 @@ run_revert_loglevel() {
     print_info "Regenerating /boot/limine.conf..."
     limine-update
     print_success "loglevel restored to 3. Reboot to apply."
-    confirm "Reboot now?" && reboot || true
 }
 
 run_revert_mitigations() {
@@ -1206,7 +1098,6 @@ run_revert_mitigations() {
     print_info "Regenerating /boot/limine.conf..."
     limine-update
     print_success "mitigations=off removed. Reboot to re-enable CPU security mitigations."
-    confirm "Reboot now?" && reboot || true
 }
 
 run_all() {
@@ -1244,7 +1135,6 @@ run_all() {
     else
         print_error "$failed task(s) encountered errors. Review output above."
     fi
-    confirm "Reboot now?" && reboot || true
 }
 
 # ==============================================================================
@@ -1287,14 +1177,14 @@ while true; do
         2) run_cpu_governor;              press_enter ;;
         3) run_gpu_governor;              press_enter ;;
         4) run_enable_swap;               press_enter ;;
-        5) run_set_loglevel ;;
-        6) run_disable_zram_enable_zswap ;;
-        7) run_disable_mitigations ;;
-        8) run_revert_zswap ;;
-        9) run_revert_mitigations ;;
-        10) run_revert_loglevel ;;
+        5) run_set_loglevel;              press_enter ;;
+        6) run_disable_zram_enable_zswap; press_enter ;;
+        7) run_disable_mitigations;       press_enter ;;
+        8) run_revert_zswap;              press_enter ;;
+        9) run_revert_mitigations;        press_enter ;;
+        10) run_revert_loglevel;          press_enter ;;
         S) run_status;                    press_enter ;;
-        A) run_all ;;
+        A) run_all;                       press_enter ;;
         0)
             echo -e "\n  ${DIM}Goodbye.${RESET}\n"
             exit 0
