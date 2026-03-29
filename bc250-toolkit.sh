@@ -243,6 +243,81 @@ run_disable_zram_enable_zswap() {
     echo -e "  ${DIM}After reboot, verify with: cat /sys/module/zswap/parameters/enabled${RESET}\n"
 }
 
+run_toggle_boot_mode() {
+    print_step "11" "Toggle Boot Mode (Safety Restore)"
+
+    local CONF_DIR="/etc/plasmalogin.conf.d"
+    local BACKUP_DIR="$CONF_DIR/original_backups"
+    local OVERRIDE_FILE="$CONF_DIR/zzz-bc250-boot.conf"
+    local USER_NAME="gennro"
+
+    # --- 1. ONE-TIME BACKUP & CLEANUP ---
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        print_info "First run: Archiving CachyOS handheld configs..."
+        mkdir -p "$BACKUP_DIR"
+        chattr -i "$CONF_DIR"/* 2>/dev/null
+
+        for file in "$CONF_DIR"/*.conf; do
+            filename=$(basename "$file")
+            if [[ -f "$file" && "$filename" != "cachyos.conf" && "$filename" != "zzz-bc250-boot.conf" ]]; then
+                mv "$file" "$BACKUP_DIR/"
+            fi
+        done
+    fi
+
+    # --- 2. DETECTION ---
+    local current_mode="${BOLD}${CYAN}Desktop Mode${RESET}"
+    if [[ -f "$OVERRIDE_FILE" ]] && grep -q "gamescope" "$OVERRIDE_FILE"; then
+        current_mode="${BOLD}${GREEN}Game Mode${RESET}"
+    fi
+
+    print_info "Current Boot Mode: $current_mode"
+    echo ""
+    print_item "1" "Game Mode" "Boot to Steam UI (Autologin $USER_NAME)"
+    print_item "2" "Desktop Mode" "Boot to Plasma (Manual Login)"
+    print_item "0" "Cancel & Restore" "Return to System Defaults"
+    echo ""
+
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Select choice:${RESET} ")" mode_choice
+
+    case "$mode_choice" in
+        1)
+            print_info "Applying Game Mode..."
+            cat <<EOF > "$OVERRIDE_FILE"
+[Autologin]
+Relogin=false
+Session=gamescope-session.desktop
+User=$USER_NAME
+EOF
+            print_success "Game Mode active."
+            ;;
+        2)
+            print_info "Applying Desktop Mode..."
+            cat <<EOF > "$OVERRIDE_FILE"
+[Autologin]
+Relogin=false
+Session=plasma.desktop
+User=
+EOF
+            print_success "Desktop Mode active."
+            ;;
+        *)
+            print_info "Cancelling and restoring original CachyOS configs..."
+            # 1. Remove our override
+            rm -f "$OVERRIDE_FILE"
+
+            # 2. Move original files back if they exist
+            if [[ -d "$BACKUP_DIR" ]]; then
+                mv "$BACKUP_DIR"/* "$CONF_DIR/" 2>/dev/null
+                rmdir "$BACKUP_DIR" 2>/dev/null
+                print_success "Original configs restored. Backup directory removed."
+            else
+                print_info "No backup found to restore."
+            fi
+            return 0
+            ;;
+    esac
+}
 # ==============================================================================
 # OVERCLOCK MENU (embedded from 07-overclock_menu.sh)
 # ==============================================================================
@@ -1160,6 +1235,7 @@ show_menu() {
     print_item  "8"  "Revert ZSWAP"        "Remove zswap, re-enable ZRAM"
     print_item  "9"  "Revert Mitigations"  "Re-enable CPU security mitigations"
     print_item  "10" "Revert loglevel"     "Restore loglevel to default (3)"
+    print_item  "11" "Toggle Boot Mode"    "Switch between Game Mode & Desktop"
     echo ""
     print_item  "S"  "Status"              "Summary of current system settings"
     echo ""
@@ -1183,6 +1259,7 @@ while true; do
         8) run_revert_zswap;              press_enter ;;
         9) run_revert_mitigations;        press_enter ;;
         10) run_revert_loglevel;          press_enter ;;
+        11) run_toggle_boot_mode;         press_enter ;;
         S) run_status;                    press_enter ;;
         A) run_all;                       press_enter ;;
         0)
