@@ -97,28 +97,44 @@ confirm() {
 
 run_cpu_governor() {
     print_step "02" "Installing CPU Governor"
-    print_info "Installing dependencies: python-pipx, stress"
-    pacman -Syu python-pipx stress --noconfirm || { print_error "Failed to install dependencies."; return 1; }
-    print_info "Cloning bc250_smu_oc repository..."
+
+    # 1. System-wide dependencies still need root (pacman)
+    print_info "Installing dependencies: python-pipx, stress, git"
+    pacman -Syu python-pipx stress git --noconfirm || { print_error "Failed to install dependencies."; return 1; }
+
+    # 2. Git operations as REAL_USER to ensure file ownership
+    print_info "Cloning bc250_smu_oc repository as $REAL_USER..."
     if [[ -d "bc250_smu_oc" ]]; then
         print_info "Directory already exists — pulling latest changes..."
-        git -C bc250_smu_oc pull || { print_error "Failed to pull repository."; return 1; }
+        sudo -u "$REAL_USER" git -C bc250_smu_oc pull || { print_error "Failed to pull repository."; return 1; }
     else
-        git clone https://github.com/bc250-collective/bc250_smu_oc.git || { print_error "Failed to clone repository."; return 1; }
+        sudo -u "$REAL_USER" git clone https://github.com/bc250-collective/bc250_smu_oc.git || { print_error "Failed to clone repository."; return 1; }
     fi
+
     cd bc250_smu_oc
-    print_info "Installing via pipx..."
-    pipx install . || { print_error "Failed to install via pipx."; cd ..; return 1; }
-    pipx ensurepath || true
-    export PATH="$PATH:/root/.local/bin"
+
+    # 3. Pipx install as REAL_USER (installs to /home/$REAL_USER/.local/bin)
+    print_info "Installing via pipx as $REAL_USER..."
+    sudo -u "$REAL_USER" pipx install . --force || { print_error "Failed to install via pipx."; cd ..; return 1; }
+    sudo -u "$REAL_USER" pipx ensurepath || true
+
+    # 4. Define paths for the rest of the function
+    # We point to the REAL_USER's local bin so the script can find 'bc250-detect'
+    local USER_BIN="/home/$REAL_USER/.local/bin"
+    export PATH="$PATH:$USER_BIN"
+
+    # 5. Hardware detection and service setup (needs root/sudo)
     print_info "Running bc250-detect..."
-    bc250-detect --frequency 3500 --vid 1000 --keep || { print_error "bc250-detect failed."; cd ..; return 1; }
+    $USER_BIN/bc250-detect --frequency 3500 --vid 1000 --keep || { print_error "bc250-detect failed."; cd ..; return 1; }
+
     print_info "Applying overclock config..."
-    bc250-apply --install overclock.conf || { print_error "bc250-apply failed."; cd ..; return 1; }
+    $USER_BIN/bc250-apply --install overclock.conf || { print_error "bc250-apply failed."; cd ..; return 1; }
+
     print_info "Enabling systemd service..."
     systemctl enable bc250-smu-oc || { print_error "Failed to enable service."; cd ..; return 1; }
+
     cd ..
-    print_success "CPU Governor installed successfully!"
+    print_success "CPU Governor installed successfully for $REAL_USER!"
 }
 
 run_gpu_governor() {
