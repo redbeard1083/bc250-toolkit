@@ -253,7 +253,7 @@ run_disable_zram_enable_zswap() {
 }
 
 run_toggle_boot_mode() {
-    print_step "11" "Toggle Boot Mode (Safety Restore)"
+    print_step "12" "Toggle Boot Mode (Safety Restore)"
 
     local CONF_DIR="/etc/plasmalogin.conf.d"
     local BACKUP_DIR="$CONF_DIR/original_backups"
@@ -329,7 +329,7 @@ EOF
 }
 
 run_switch_to_default_kernel() {
-    print_step "12" "Migrating to Default CachyOS Kernel"
+    print_step "14" "Migrating to Default CachyOS Kernel"
 
     # 1. Check if we are already on the standard kernel
     if pacman -Qq linux-cachyos &>/dev/null; then
@@ -369,6 +369,162 @@ run_switch_to_default_kernel() {
 
     print_success "System successfully migrated to default kernel."
     print_info "Please reboot to apply changes."
+}
+
+run_install_acpi_fix() {
+    print_step "08" "Installing BC250 ACPI Fix"
+
+    local CPIO_NAME="bc250_acpi.cpio"
+    local CPIO_DEST="/boot/$CPIO_NAME"
+    local LIMINE_CONFIG="/boot/limine.conf"
+    local HOOK_DIR="/etc/pacman.d/hooks"
+    local HOOK_FILE="$HOOK_DIR/bc250-acpi-fix.hook"
+    local INJECT_SCRIPT="/usr/local/bin/bc250-acpi-inject.sh"
+
+    # 1. Dependency & Lock Check
+    while [ -f /var/lib/pacman/db.lck ]; do sleep 2; done
+    if ! command -v git &>/dev/null || ! command -v cpio &>/dev/null; then
+        pacman -S --noconfirm git cpio
+    fi
+
+    # 2. Build the CPIO
+    local BUILD_DIR="/tmp/bc250-acpi-build"
+    rm -rf "$BUILD_DIR"
+    print_info "Cloning bc250-acpi-fix repository..."
+    git clone "https://github.com/bc250-collective/bc250-acpi-fix.git" "$BUILD_DIR" \
+        || { print_error "Failed to clone repository."; return 1; }
+    mkdir -p "$BUILD_DIR/kernel/firmware/acpi"
+    cp "$BUILD_DIR"/*.aml "$BUILD_DIR/kernel/firmware/acpi/" \
+        || { print_error "No .aml files found in repository."; return 1; }
+    ( cd "$BUILD_DIR" && find kernel | cpio -o -H newc > "$CPIO_DEST" 2>/dev/null )
+    print_success "ACPI archive created at $CPIO_DEST"
+
+    # 3. Install the inject script that pacman hook will call
+    print_info "Installing inject script at $INJECT_SCRIPT..."
+    mkdir -p /usr/local/bin
+    cat > "$INJECT_SCRIPT" <<'INJECT'
+#!/bin/bash
+# bc250-acpi-inject.sh — Re-inserts the ACPI CPIO module line into
+# /boot/limine.conf after every limine-update run.
+LIMINE_CONFIG="/boot/limine.conf"
+CPIO_NAME="bc250_acpi.cpio"
+
+if [[ ! -f "$LIMINE_CONFIG" ]]; then
+    echo "bc250-acpi-inject: $LIMINE_CONFIG not found, skipping." >&2
+    exit 0
+fi
+
+if grep -q "$CPIO_NAME" "$LIMINE_CONFIG"; then
+    exit 0  # already present, nothing to do
+fi
+
+# Insert one ACPI module_path line before the FIRST protocol: linux entry.
+# This ensures the CPIO is loaded for every kernel without duplicating lines.
+sed -i "0,/^  protocol: linux/{s/^  protocol: linux/  module_path: boot():\/${CPIO_NAME}\n  protocol: linux/}" \
+    "$LIMINE_CONFIG"
+
+echo "bc250-acpi-inject: ACPI module line inserted into $LIMINE_CONFIG."
+INJECT
+    chmod +x "$INJECT_SCRIPT"
+    print_success "Inject script installed."
+
+    # 4. Install the pacman hook so the inject script runs after every limine upgrade
+    print_info "Installing pacman hook at $HOOK_FILE..."
+    mkdir -p "$HOOK_DIR"
+    cat > "$HOOK_FILE" <<'HOOK'
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = limine
+
+[Action]
+Description = Re-injecting BC250 ACPI fix module into limine.conf...
+When = PostTransaction
+Exec = /usr/local/bin/bc250-acpi-inject.sh
+HOOK
+    print_success "Pacman hook installed — fix will survive kernel and limine updates."
+
+    # 5. Inject into the current limine.conf immediately
+    if [[ -f "$LIMINE_CONFIG" ]]; then
+        if grep -q "$CPIO_NAME" "$LIMINE_CONFIG"; then
+            print_info "ACPI module already present in $LIMINE_CONFIG."
+        else
+            print_info "Injecting ACPI module into current $LIMINE_CONFIG..."
+            "$INJECT_SCRIPT"
+            print_success "ACPI module line inserted."
+        fi
+    else
+        print_error "Could not find $LIMINE_CONFIG"
+        return 1
+    fi
+
+    print_success "ACPI fix installed. Reboot to apply."
+    echo -e "  ${DIM}After reboot, verify with: journalctl -k | grep -i 'acpi\\|c-state'${RESET}\n"
+    if confirm "Reboot now?"; then
+        reboot
+    fi
+}
+
+run_revert_acpi_fix() {
+    print_step "13" "Revert BC250 ACPI Fix"
+
+    local CPIO_DEST="/boot/bc250_acpi.cpio"
+    local HOOK_FILE="/etc/pacman.d/hooks/bc250-acpi-fix.hook"
+    local INJECT_SCRIPT="/usr/local/bin/bc250-acpi-inject.sh"
+    local LIMINE_CONFIG="/boot/limine.conf"
+    local CPIO_NAME="bc250_acpi.cpio"
+
+    if [[ ! -f "$CPIO_DEST" ]] && [[ ! -f "$HOOK_FILE" ]]; then
+        print_info "ACPI fix does not appear to be installed — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "This will remove the BC250 ACPI fix and its pacman hook. Proceed?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    # Remove the pacman hook
+    if [[ -f "$HOOK_FILE" ]]; then
+        print_info "Removing pacman hook..."
+        rm -f "$HOOK_FILE"
+        print_success "Pacman hook removed."
+    else
+        print_info "Pacman hook not found — skipping."
+    fi
+
+    # Remove the inject script
+    if [[ -f "$INJECT_SCRIPT" ]]; then
+        print_info "Removing inject script..."
+        rm -f "$INJECT_SCRIPT"
+        print_success "Inject script removed."
+    else
+        print_info "Inject script not found — skipping."
+    fi
+
+    # Remove the ACPI module line from limine.conf
+    if [[ -f "$LIMINE_CONFIG" ]] && grep -q "$CPIO_NAME" "$LIMINE_CONFIG"; then
+        print_info "Removing ACPI module line from $LIMINE_CONFIG..."
+        sed -i "/${CPIO_NAME}/d" "$LIMINE_CONFIG"
+        print_success "ACPI module line removed from $LIMINE_CONFIG."
+    else
+        print_info "ACPI module line not found in $LIMINE_CONFIG — skipping."
+    fi
+
+    # Remove the CPIO archive
+    if [[ -f "$CPIO_DEST" ]]; then
+        print_info "Removing ACPI CPIO archive..."
+        rm -f "$CPIO_DEST"
+        print_success "CPIO archive removed."
+    else
+        print_info "CPIO archive not found — skipping."
+    fi
+
+    print_success "ACPI fix reverted. Reboot to apply."
+    if confirm "Reboot now?"; then
+        reboot
+    fi
 }
 # ==============================================================================
 # OVERCLOCK MENU (embedded from 07-overclock_menu.sh)
@@ -987,7 +1143,7 @@ run_overclock_menu() {
 
 run_revert_zswap() {
     local CONF="/etc/default/limine"
-    print_step "08" "Revert ZSWAP — Re-enabling ZRAM"
+    print_step "09" "Revert ZSWAP — Re-enabling ZRAM"
 
     if [[ ! -f "$CONF" ]]; then
         print_error "File not found: $CONF"
@@ -1196,12 +1352,26 @@ run_status() {
     fi
     echo ""
 
+    # --- ACPI Fix ---
+    echo -e "  ${BOLD}${YELLOW}ACPI Fix${RESET}"
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    local acpi_cpio acpi_hook acpi_inject acpi_injected
+    [[ -f "/boot/bc250_acpi.cpio" ]] && acpi_cpio="${GREEN}present${RESET}" || acpi_cpio="${RED}not found${RESET}"
+    [[ -f "/etc/pacman.d/hooks/bc250-acpi-fix.hook" ]] && acpi_hook="${GREEN}installed${RESET}" || acpi_hook="${RED}not installed${RESET}"
+    [[ -f "/usr/local/bin/bc250-acpi-inject.sh" ]] && acpi_inject="${GREEN}installed${RESET}" || acpi_inject="${RED}not installed${RESET}"
+    grep -q "bc250_acpi.cpio" /boot/limine.conf 2>/dev/null && acpi_injected="${GREEN}yes${RESET}" || acpi_injected="${RED}no${RESET}"
+    echo -e "  ${CYAN}CPIO archive${RESET}      ${acpi_cpio}"
+    echo -e "  ${CYAN}In limine.conf${RESET}    ${acpi_injected}"
+    echo -e "  ${CYAN}Pacman hook${RESET}       ${acpi_hook}"
+    echo -e "  ${CYAN}Inject script${RESET}     ${acpi_inject}"
+    echo ""
+
     echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
 }
 
 run_revert_loglevel() {
     local CONF="/etc/default/limine"
-    print_step "10" "Revert loglevel — Restoring default"
+    print_step "11" "Revert loglevel — Restoring default"
 
     if [[ ! -f "$CONF" ]]; then
         print_error "File not found: $CONF"
@@ -1231,7 +1401,7 @@ run_revert_loglevel() {
 
 run_revert_mitigations() {
     local CONF="/etc/default/limine"
-    print_step "09" "Revert Mitigations — Re-enabling in $CONF"
+    print_step "10" "Revert Mitigations — Re-enabling in $CONF"
 
     if [[ ! -f "$CONF" ]]; then
         print_error "File not found: $CONF"
@@ -1332,13 +1502,15 @@ show_menu() {
     print_item  "5"  "Hide RDSEED Warning" "Set loglevel=0 in /boot/limine.conf"
     print_item  "6"  "ZRAM -> ZSWAP"       "Disable ZRAM, enable ZSWAP w/ lz4"
     print_item  "7"  "Disable Mitigations" "Add mitigations=off to limine.conf"
+    print_item  "8"  "Install ACPI Fix"    "Enable CPU C-States (800MHz-3.2GHz)"
     echo ""
     print_section "Extras"
-    print_item  "8"  "Revert ZSWAP"        "Remove zswap, re-enable ZRAM"
-    print_item  "9"  "Revert Mitigations"  "Re-enable CPU security mitigations"
-    print_item  "10" "Revert loglevel"     "Restore loglevel to default (3)"
-    print_item  "11" "Toggle Boot Mode"    "Switch between Game Mode & Desktop"
-    print_item "12" "CachyOS Kernel"       "Replaces Deckify kernel with standard CachyOS"
+    print_item  "9"  "Revert ZSWAP"        "Remove zswap, re-enable ZRAM"
+    print_item  "10" "Revert Mitigations"  "Re-enable CPU security mitigations"
+    print_item  "11" "Revert loglevel"     "Restore loglevel to default (3)"
+    print_item  "12" "Toggle Boot Mode"    "Switch between Game Mode & Desktop"
+    print_item  "13" "Revert ACPI Fix"     "Remove ACPI fix and pacman hook"
+    print_item  "14" "CachyOS Kernel"      "Replaces Deckify kernel with standard CachyOS"
     echo ""
     print_item  "S"  "Status"              "Summary of current system settings"
     echo ""
@@ -1359,11 +1531,13 @@ while true; do
         5) run_set_loglevel;              press_enter ;;
         6) run_disable_zram_enable_zswap; press_enter ;;
         7) run_disable_mitigations;       press_enter ;;
-        8) run_revert_zswap;              press_enter ;;
-        9) run_revert_mitigations;        press_enter ;;
-        10) run_revert_loglevel;          press_enter ;;
-        11) run_toggle_boot_mode;         press_enter ;;
-        12) run_switch_to_default_kernel  press_enter ;;
+        8) run_install_acpi_fix;          press_enter ;;
+        9) run_revert_zswap;              press_enter ;;
+        10) run_revert_mitigations;       press_enter ;;
+        11) run_revert_loglevel;          press_enter ;;
+        12) run_toggle_boot_mode;         press_enter ;;
+        13) run_revert_acpi_fix;          press_enter ;;
+        14) run_switch_to_default_kernel; press_enter ;;
         S) run_status;                    press_enter ;;
         A) run_all;                       press_enter ;;
         0)
