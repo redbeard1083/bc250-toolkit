@@ -97,28 +97,44 @@ confirm() {
 
 run_cpu_governor() {
     print_step "02" "Installing CPU Governor"
-    print_info "Installing dependencies: python-pipx, stress"
-    pacman -Syu python-pipx stress --noconfirm || { print_error "Failed to install dependencies."; return 1; }
-    print_info "Cloning bc250_smu_oc repository..."
+
+    # 1. System-wide dependencies still need root (pacman)
+    print_info "Installing dependencies: python-pipx, stress, git"
+    pacman -Syu python-pipx stress git --noconfirm || { print_error "Failed to install dependencies."; return 1; }
+
+    # 2. Git operations as REAL_USER to ensure file ownership
+    print_info "Cloning bc250_smu_oc repository as $REAL_USER..."
     if [[ -d "bc250_smu_oc" ]]; then
         print_info "Directory already exists — pulling latest changes..."
-        git -C bc250_smu_oc pull || { print_error "Failed to pull repository."; return 1; }
+        sudo -u "$REAL_USER" git -C bc250_smu_oc pull || { print_error "Failed to pull repository."; return 1; }
     else
-        git clone https://github.com/bc250-collective/bc250_smu_oc.git || { print_error "Failed to clone repository."; return 1; }
+        sudo -u "$REAL_USER" git clone https://github.com/bc250-collective/bc250_smu_oc.git || { print_error "Failed to clone repository."; return 1; }
     fi
+
     cd bc250_smu_oc
-    print_info "Installing via pipx..."
-    pipx install . || { print_error "Failed to install via pipx."; cd ..; return 1; }
-    pipx ensurepath || true
-    export PATH="$PATH:/root/.local/bin"
+
+    # 3. Pipx install as REAL_USER (installs to /home/$REAL_USER/.local/bin)
+    print_info "Installing via pipx as $REAL_USER..."
+    sudo -u "$REAL_USER" pipx install . --force || { print_error "Failed to install via pipx."; cd ..; return 1; }
+    sudo -u "$REAL_USER" pipx ensurepath || true
+
+    # 4. Define paths for the rest of the function
+    # We point to the REAL_USER's local bin so the script can find 'bc250-detect'
+    local USER_BIN="/home/$REAL_USER/.local/bin"
+    export PATH="$PATH:$USER_BIN"
+
+    # 5. Hardware detection and service setup (needs root/sudo)
     print_info "Running bc250-detect..."
-    bc250-detect --frequency 3500 --vid 1000 --keep || { print_error "bc250-detect failed."; cd ..; return 1; }
+    $USER_BIN/bc250-detect --frequency 3500 --vid 1000 --keep || { print_error "bc250-detect failed."; cd ..; return 1; }
+
     print_info "Applying overclock config..."
-    bc250-apply --install overclock.conf || { print_error "bc250-apply failed."; cd ..; return 1; }
+    $USER_BIN/bc250-apply --install overclock.conf || { print_error "bc250-apply failed."; cd ..; return 1; }
+
     print_info "Enabling systemd service..."
     systemctl enable bc250-smu-oc || { print_error "Failed to enable service."; cd ..; return 1; }
+
     cd ..
-    print_success "CPU Governor installed successfully!"
+    print_success "CPU Governor installed successfully for $REAL_USER!"
 }
 
 run_gpu_governor() {
@@ -369,6 +385,47 @@ run_switch_to_default_kernel() {
 
     print_success "System successfully migrated to default kernel."
     print_info "Please reboot to apply changes."
+}
+
+run_install_acpi_fix() {
+    print_step "13" "Installing BC250 ACPI Fix (Independent Module)"
+
+    local CPIO_NAME="bc250_acpi.cpio"
+    local CPIO_DEST="/boot/$CPIO_NAME"
+    local LIMINE_CONFIG="/boot/limine.conf"
+
+    # 1. Dependency & Lock Check
+    while [ -f /var/lib/pacman/db.lck ]; do sleep 2; done
+    if ! command -v git &>/dev/null || ! command -v cpio &>/dev/null; then
+        sudo pacman -S --noconfirm git cpio
+    fi
+
+    # 2. Build the CPIO
+    local BUILD_DIR="/tmp/bc250-acpi-build"
+    rm -rf "$BUILD_DIR"
+    git clone "https://github.com/bc250-collective/bc250-acpi-fix.git" "$BUILD_DIR"
+    mkdir -p "$BUILD_DIR/kernel/firmware/acpi"
+    cp "$BUILD_DIR"/*.aml "$BUILD_DIR/kernel/firmware/acpi/"
+    ( cd "$BUILD_DIR" && find kernel | cpio -o -H newc > "$CPIO_DEST" 2>/dev/null )
+    print_success "ACPI archive created at $CPIO_DEST"
+
+    # 3. Insert as a SEPARATE module line
+    if [[ -f "$LIMINE_CONFIG" ]]; then
+        if grep -q "$CPIO_NAME" "$LIMINE_CONFIG"; then
+            print_info "ACPI module already exists in $LIMINE_CONFIG."
+        else
+            print_info "Adding independent ACPI module entry..."
+            # This finds the existing module_path line and inserts a NEW line above it
+            # The extra spaces match the indentation in your file
+            sudo sed -i "/module_path:/i \  module_path: boot():/$CPIO_NAME" "$LIMINE_CONFIG"
+            print_success "Inserted separate ACPI module line."
+        fi
+    else
+        print_error "Could not find $LIMINE_CONFIG"
+        return 1
+    fi
+
+    print_success "Fix installed. Reboot and check 'journalctl -k | grep ACPI'."
 }
 # ==============================================================================
 # OVERCLOCK MENU (embedded from 07-overclock_menu.sh)
@@ -1339,6 +1396,7 @@ show_menu() {
     print_item  "10" "Revert loglevel"     "Restore loglevel to default (3)"
     print_item  "11" "Toggle Boot Mode"    "Switch between Game Mode & Desktop"
     print_item "12" "CachyOS Kernel"       "Replaces Deckify kernel with standard CachyOS"
+    print_item "13" "Install ACPI Fix"     "Enable CPU C-States (800MHz-3.2GHz)"
     echo ""
     print_item  "S"  "Status"              "Summary of current system settings"
     echo ""
@@ -1363,7 +1421,8 @@ while true; do
         9) run_revert_mitigations;        press_enter ;;
         10) run_revert_loglevel;          press_enter ;;
         11) run_toggle_boot_mode;         press_enter ;;
-        12) run_switch_to_default_kernel  press_enter ;;
+        12) run_switch_to_default_kernel;  press_enter ;;
+        13) run_install_acpi_fix;         press_enter ;;
         S) run_status;                    press_enter ;;
         A) run_all;                       press_enter ;;
         0)
