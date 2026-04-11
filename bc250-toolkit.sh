@@ -588,7 +588,7 @@ lower = 0.40
 throttling = 80
 throttling_recovery = 75
 [[safe-points]]
-frequency = 350
+frequency = 400
 voltage = 700
 [[safe-points]]
 frequency = 500
@@ -630,7 +630,7 @@ lower = 0.40
 throttling = 80
 throttling_recovery = 75
 [[safe-points]]
-frequency = 350
+frequency = 400
 voltage = 700
 [[safe-points]]
 frequency = 500
@@ -684,7 +684,7 @@ lower = 0.40
 throttling = 80
 throttling_recovery = 75
 [[safe-points]]
-frequency = 350
+frequency = 400
 voltage = 700
 [[safe-points]]
 frequency = 500
@@ -744,7 +744,7 @@ lower = 0.40
 throttling = 90
 throttling_recovery = 85
 [[safe-points]]
-frequency = 350
+frequency = 400
 voltage = 700
 [[safe-points]]
 frequency = 500
@@ -819,7 +819,7 @@ lower = 0.40
 throttling = 90
 throttling_recovery = 85
 [[safe-points]]
-frequency = 350
+frequency = 400
 voltage = 700
 [[safe-points]]
 frequency = 500
