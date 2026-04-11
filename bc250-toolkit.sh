@@ -1485,8 +1485,292 @@ run_all() {
     fi
 }
 # ==============================================================================
+# EXPERIMENTAL FUNCTIONS
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# _parse_kernel_ver RAW_STRING
+#   Outputs: "MAJOR MINOR RC BUILD" as integers.
+#   A release kernel (no rcN) gets RC=999 so it sorts above any RC of that version.
+# ------------------------------------------------------------------------------
+_parse_kernel_ver() {
+    local raw="$1"
+    local major minor rc_num build
+
+    major=$(echo "$raw" | grep -oP '^\d+'       || echo 0)
+    minor=$(echo "$raw" | grep -oP '(?<=\.)\d+' | head -1 || echo 0)
+
+    if echo "$raw" | grep -qiP 'rc\d+'; then
+        rc_num=$(echo "$raw" | grep -oiP '(?<=rc)\d+' | head -1)
+    else
+        rc_num=999
+    fi
+
+    build=$(echo "$raw" | grep -oP '\d+' | tail -1 || echo 0)
+    echo "$major $minor $rc_num $build"
+}
+
+# Returns 0 (true) if version A >= version B
+# Args: A_major A_minor A_rc A_build  B_major B_minor B_rc B_build
+_ver_gte() {
+    local am=$1 an=$2 ar=$3 ab=$4
+    local bm=$5 bn=$6 br=$7 bb=$8
+
+    [[ "$am" -gt "$bm" ]] && return 0; [[ "$am" -lt "$bm" ]] && return 1
+    [[ "$an" -gt "$bn" ]] && return 0; [[ "$an" -lt "$bn" ]] && return 1
+    [[ "$ar" -gt "$br" ]] && return 0; [[ "$ar" -lt "$br" ]] && return 1
+    [[ "$ab" -ge "$bb" ]] && return 0
+    return 1
+}
+
+run_fix_amdgpu_vram() {
+    print_step "E1" "Fix AMDGPU VRAM Management for Low-End GPUs"
+
+    # Minimum kernel required for the AMDGPU VRAM fix
+    local REQ_MAJOR=7 REQ_MINOR=0 REQ_RC=7 REQ_BUILD=2
+
+    # -----------------------------------------------------------------------
+    # Step 1 – Check the currently running kernel
+    # -----------------------------------------------------------------------
+    print_info "Checking running kernel version..."
+    local installed_ver
+    installed_ver="$(uname -r)"
+    print_info "Running kernel: ${BOLD}${installed_ver}${RESET}"
+
+    read -r inst_major inst_minor inst_rc inst_build <<< "$(_parse_kernel_ver "$installed_ver")"
+
+    local needs_kernel=0
+    if _ver_gte "$inst_major" "$inst_minor" "$inst_rc" "$inst_build" \
+                "$REQ_MAJOR"  "$REQ_MINOR"  "$REQ_RC"  "$REQ_BUILD"; then
+        print_success "Running kernel meets the minimum requirement (>= 7.0-rc7-2). No kernel change needed."
+    else
+        echo -e "\n  ${BOLD}${YELLOW}WARNING  Running kernel ${installed_ver} is below 7.0-rc7-2.${RESET}"
+        echo -e "  ${DIM}A standard 'pacman -Syu' only upgrades already-installed packages and will"
+        echo -e "  not pull in an RC kernel. The script will detect and install the correct"
+        echo -e "  RC kernel package from your CachyOS repository.${RESET}\n"
+        needs_kernel=1
+    fi
+
+    # -----------------------------------------------------------------------
+    # Step 2 – If a new kernel is needed, detect the best RC candidate
+    # -----------------------------------------------------------------------
+    if [[ "$needs_kernel" -eq 1 ]]; then
+
+        # Pacman lock guard
+        while [[ -f /var/lib/pacman/db.lck ]]; do
+            print_info "Waiting for pacman lock to release..."; sleep 2
+        done
+
+        print_info "Synchronising package databases..."
+        if ! pacman -Sy --noconfirm 2>&1 | sed 's/^/    /'; then
+            print_error "Failed to sync package databases. Check your internet connection and mirrorlist."
+            return 1
+        fi
+
+        # Search the synced DB for all linux-cachyos-rc kernel packages.
+        # We only want the bare kernel package, not sub-packages
+        # (headers / zfs / nvidia / dbg / r8125).
+        print_info "Searching CachyOS repos for available RC kernel packages..."
+        local rc_candidates=()
+        while IFS= read -r line; do
+            local pkgname pkgver
+            pkgname=$(echo "$line" | awk '{print $1}' | cut -d'/' -f2)
+            pkgver=$(echo  "$line" | awk '{print $2}')
+            # Accept only the bare kernel: "linux-cachyos-rc" exactly
+            if [[ "$pkgname" == "linux-cachyos-rc" ]]; then
+                rc_candidates+=("${pkgname}|${pkgver}")
+            fi
+        done < <(pacman -Ss '^linux-cachyos-rc$' 2>/dev/null | grep -P '^\S+/linux-cachyos-rc\s')
+
+        # Fallback: broader search in case the strict regex found nothing
+        if [[ "${#rc_candidates[@]}" -eq 0 ]]; then
+            while IFS= read -r line; do
+                local pkgname pkgver
+                pkgname=$(echo "$line" | awk '{print $1}' | cut -d'/' -f2)
+                pkgver=$(echo  "$line" | awk '{print $2}')
+                if [[ "$pkgname" == "linux-cachyos-rc" ]]; then
+                    rc_candidates+=("${pkgname}|${pkgver}")
+                fi
+            done < <(pacman -Ss 'linux-cachyos-rc' 2>/dev/null | grep -P '^\S+/linux-cachyos-rc\s')
+        fi
+
+        if [[ "${#rc_candidates[@]}" -eq 0 ]]; then
+            print_error "No RC kernel package (linux-cachyos-rc) found in your enabled repositories."
+            echo -e "  ${DIM}Ensure the [cachyos] or [cachyos-v3]/[cachyos-v4] repo is in /etc/pacman.conf.${RESET}"
+            return 1
+        fi
+
+        # -----------------------------------------------------------------------
+        # Among candidates, pick the highest version; note if it satisfies minimum
+        # -----------------------------------------------------------------------
+        local best_pkg="" best_ver="" best_satisfies=0
+        for entry in "${rc_candidates[@]}"; do
+            local cand_pkg cand_ver
+            cand_pkg="${entry%%|*}"
+            cand_ver="${entry##*|}"
+
+            read -r cm cn cr cb <<< "$(_parse_kernel_ver "$cand_ver")"
+
+            if [[ -z "$best_ver" ]]; then
+                best_pkg="$cand_pkg"; best_ver="$cand_ver"
+                _ver_gte "$cm" "$cn" "$cr" "$cb" \
+                         "$REQ_MAJOR" "$REQ_MINOR" "$REQ_RC" "$REQ_BUILD" \
+                    && best_satisfies=1 || best_satisfies=0
+                continue
+            fi
+
+            read -r bm bn br bb <<< "$(_parse_kernel_ver "$best_ver")"
+            if _ver_gte "$cm" "$cn" "$cr" "$cb" "$bm" "$bn" "$br" "$bb"; then
+                best_pkg="$cand_pkg"; best_ver="$cand_ver"
+                _ver_gte "$cm" "$cn" "$cr" "$cb" \
+                         "$REQ_MAJOR" "$REQ_MINOR" "$REQ_RC" "$REQ_BUILD" \
+                    && best_satisfies=1 || best_satisfies=0
+            fi
+        done
+
+        # Show what we found
+        echo ""
+        echo -e "  ${BOLD}${CYAN}Detected RC kernel package:${RESET}"
+        echo -e "    Package : ${BOLD}${best_pkg}${RESET}"
+        echo -e "    Version : ${BOLD}${best_ver}${RESET}"
+
+        if [[ "$best_satisfies" -eq 0 ]]; then
+            echo -e "\n  ${BOLD}${RED}WARNING  The highest available RC kernel (${best_ver}) does NOT meet"
+            echo -e "           the minimum requirement of 7.0-rc7-2.${RESET}"
+            echo -e "  ${DIM}The required version may not be published yet. Options:"
+            echo -e "    - Wait for CachyOS to publish a newer RC build, then re-run this"
+            echo -e "    - Proceed anyway (the VRAM fix packages will still be installed,"
+            echo -e "      but the fix may not function correctly on this kernel)${RESET}\n"
+            if ! confirm "Install ${best_pkg} ${best_ver} anyway and continue?"; then
+                print_info "Cancelled."
+                return 0
+            fi
+        else
+            echo ""
+            if ! confirm "Install ${best_pkg} (${best_ver}) and its headers?"; then
+                print_info "Cancelled."
+                return 0
+            fi
+        fi
+
+        # Derive the headers package name
+        local headers_pkg="${best_pkg}-headers"
+
+        local install_headers=1
+        if ! pacman -Si "$headers_pkg" &>/dev/null; then
+            print_info "Headers package '${headers_pkg}' not found in repos — skipping headers."
+            install_headers=0
+        fi
+
+        while [[ -f /var/lib/pacman/db.lck ]]; do
+            print_info "Waiting for pacman lock..."; sleep 2
+        done
+
+        local pkgs_to_install=("$best_pkg")
+        [[ "$install_headers" -eq 1 ]] && pkgs_to_install+=("$headers_pkg")
+
+        print_info "Installing: ${pkgs_to_install[*]}"
+        if ! pacman -S --noconfirm "${pkgs_to_install[@]}"; then
+            print_error "Kernel installation failed. See output above."
+            return 1
+        fi
+
+        print_success "RC kernel ${best_ver} installed successfully!"
+        echo -e "  ${BOLD}${YELLOW}NOTE  You must reboot into the new kernel before the VRAM fix takes effect.${RESET}\n"
+    fi
+
+    # -----------------------------------------------------------------------
+    # Step 3 – Install the two VRAM management packages (always)
+    # -----------------------------------------------------------------------
+    print_info "Installing dmemcg-booster and plasma-foreground-booster..."
+
+    while [[ -f /var/lib/pacman/db.lck ]]; do
+        print_info "Waiting for pacman lock..."; sleep 2
+    done
+
+    if ! pacman -S --noconfirm dmemcg-booster plasma-foreground-booster; then
+        print_error "Failed to install VRAM fix packages. Check the output above."
+        return 1
+    fi
+
+    print_success "dmemcg-booster and plasma-foreground-booster installed!"
+    print_success "AMDGPU VRAM management fix complete!"
+
+    if [[ "$needs_kernel" -eq 1 ]]; then
+        echo -e "\n  ${BOLD}${YELLOW}NOTE  Reboot required to load the new RC kernel.${RESET}\n"
+        if confirm "Reboot now?"; then
+            reboot
+        fi
+    fi
+}
+
+show_experimental_menu() {
+    print_banner
+    print_section "Experimental"
+    echo -e "  ${DIM}These features may require non-stable packages or a reboot to take effect.${RESET}\n"
+    print_item  "1"  "Fix AMDGPU VRAM"   "VRAM mgmt fix for low-end GPUs (requires kernel >= 7.0-rc7-2)"
+    echo ""
+    print_item  "0"  "Back"             "Return to main menu"
+    echo ""
+    echo -e "  ${BOLD}${CYAN}======================================================================${RESET}"
+}
+
+run_experimental_menu() {
+    while true; do
+        show_experimental_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" exp_choice
+
+        case "${exp_choice^^}" in
+            1) run_fix_amdgpu_vram; press_enter ;;
+            0)  return ;;
+            *)
+                print_error "Invalid selection: '$exp_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ==============================================================================
 # MAIN MENU LOOP
 # ==============================================================================
+
+show_revert_menu() {
+    print_banner
+    print_section "Revert / Undo"
+    echo -e "  ${DIM}Undo previously applied settings and restore defaults.${RESET}\n"
+    print_item  "1"  "Revert ZSWAP"        "Remove zswap, re-enable ZRAM"
+    print_item  "2"  "Revert Mitigations"  "Re-enable CPU security mitigations"
+    print_item  "3"  "Revert loglevel"     "Restore loglevel to default (3)"
+    print_item  "4"  "Revert ACPI Fix"     "Remove ACPI fix and pacman hook"
+    print_item  "5"  "Toggle Boot Mode"    "Switch between Game Mode & Desktop"
+    print_item  "6"  "CachyOS Kernel"      "Replace Deckify kernel with standard CachyOS"
+    echo ""
+    print_item  "0"  "Back"                "Return to main menu"
+    echo ""
+    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_revert_menu() {
+    while true; do
+        show_revert_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" rev_choice
+
+        case "${rev_choice^^}" in
+            1) run_revert_zswap;              press_enter ;;
+            2) run_revert_mitigations;        press_enter ;;
+            3) run_revert_loglevel;           press_enter ;;
+            4) run_revert_acpi_fix;           press_enter ;;
+            5) run_toggle_boot_mode;          press_enter ;;
+            6) run_switch_to_default_kernel;  press_enter ;;
+            0) return ;;
+            *)
+                print_error "Invalid selection: '$rev_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
 
 show_menu() {
     print_banner
@@ -1494,8 +1778,6 @@ show_menu() {
     print_item  "1"  "Overclock Menu"      "CPU & GPU performance profiles"
     echo ""
     print_section "Setup Tasks"
-    print_item  "A"  "Run All (2-7)"       "Run all setup tasks in sequence"
-    echo ""
     print_item  "2"  "CPU Governor"        "bc250-smu-oc CPU overclock service"
     print_item  "3"  "GPU Governor"        "cyan-skillfish GPU governor service"
     print_item  "4"  "Enable Swap"         "16G Btrfs swapfile, swappiness=180"
@@ -1503,17 +1785,16 @@ show_menu() {
     print_item  "6"  "ZRAM -> ZSWAP"       "Disable ZRAM, enable ZSWAP w/ lz4"
     print_item  "7"  "Disable Mitigations" "Add mitigations=off to limine.conf"
     print_item  "8"  "Install ACPI Fix"    "Enable CPU C-States (800MHz-3.2GHz)"
+    print_item  "A"  "Run All (2-8)"       "Run all setup tasks in sequence"
     echo ""
-    print_section "Extras"
-    print_item  "9"  "Revert ZSWAP"        "Remove zswap, re-enable ZRAM"
-    print_item  "10" "Revert Mitigations"  "Re-enable CPU security mitigations"
-    print_item  "11" "Revert loglevel"     "Restore loglevel to default (3)"
-    print_item  "12" "Toggle Boot Mode"    "Switch between Game Mode & Desktop"
-    print_item  "13" "Revert ACPI Fix"     "Remove ACPI fix and pacman hook"
-    print_item  "14" "CachyOS Kernel"      "Replaces Deckify kernel with standard CachyOS"
+    print_section "Revert / Undo"
+    print_item  "R"  "Revert Menu"         "Undo previously applied settings"
     echo ""
-    print_item  "S"  "Status"              "Summary of current system settings"
+    print_section "Experimental"
+    print_item  "E"  "Experimental Menu"   "Experimental / bleeding-edge features"
     echo ""
+    print_section "System"
+    print_item  "S"  "Status"              "Current system summary"
     print_item  "0"  "Exit"                ""
     echo ""
     echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
@@ -1532,14 +1813,10 @@ while true; do
         6) run_disable_zram_enable_zswap; press_enter ;;
         7) run_disable_mitigations;       press_enter ;;
         8) run_install_acpi_fix;          press_enter ;;
-        9) run_revert_zswap;              press_enter ;;
-        10) run_revert_mitigations;       press_enter ;;
-        11) run_revert_loglevel;          press_enter ;;
-        12) run_toggle_boot_mode;         press_enter ;;
-        13) run_revert_acpi_fix;          press_enter ;;
-        14) run_switch_to_default_kernel; press_enter ;;
-        S) run_status;                    press_enter ;;
         A) run_all;                       press_enter ;;
+        R) run_revert_menu ;;
+        E) run_experimental_menu ;;
+        S) run_status;                    press_enter ;;
         0)
             echo -e "\n  ${DIM}Goodbye.${RESET}\n"
             exit 0
