@@ -1524,7 +1524,7 @@ _ver_gte() {
 }
 
 run_fix_amdgpu_vram() {
-    print_step "E1" "Fix AMDGPU VRAM Management for Low-End GPUs"
+    print_step "1" "Fix AMDGPU VRAM Management for Low-End GPUs"
 
     # Minimum kernel required for the AMDGPU VRAM fix
     local REQ_MAJOR=7 REQ_MINOR=0 REQ_RC=7 REQ_BUILD=2
