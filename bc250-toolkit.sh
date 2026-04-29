@@ -253,76 +253,80 @@ run_disable_zram_enable_zswap() {
 }
 
 run_toggle_boot_mode() {
-    print_step "12" "Toggle Boot Mode (Safety Restore)"
+    print_step "12" "Toggle Boot Mode"
 
     local CONF_DIR="/etc/plasmalogin.conf.d"
-    local BACKUP_DIR="$CONF_DIR/original_backups"
     local OVERRIDE_FILE="$CONF_DIR/zzz-bc250-boot.conf"
     local USER_NAME="$REAL_USER"
 
-    # --- 1. ONE-TIME BACKUP & CLEANUP ---
-    if [[ ! -d "$BACKUP_DIR" ]]; then
-        print_info "First run: Archiving CachyOS handheld configs..."
-        mkdir -p "$BACKUP_DIR"
-        chattr -i "$CONF_DIR"/* 2>/dev/null
-
-        for file in "$CONF_DIR"/*.conf; do
-            filename=$(basename "$file")
-            if [[ -f "$file" && "$filename" != "cachyos.conf" && "$filename" != "zzz-bc250-boot.conf" ]]; then
-                mv "$file" "$BACKUP_DIR/"
-            fi
-        done
+    # --- DETECTION ---
+    local current_session="gamescope"
+    local current_relogin="true"
+    if [[ -f "$OVERRIDE_FILE" ]]; then
+        grep -q "plasma.desktop" "$OVERRIDE_FILE" && current_session="plasma"
+        grep -q "Relogin=false"  "$OVERRIDE_FILE" && current_relogin="false"
     fi
 
-    # --- 2. DETECTION ---
-    local current_mode="${BOLD}${CYAN}Desktop Mode${RESET}"
-    if [[ -f "$OVERRIDE_FILE" ]] && grep -q "gamescope" "$OVERRIDE_FILE"; then
-        current_mode="${BOLD}${GREEN}Game Mode${RESET}"
+    local current_mode
+    if [[ "$current_session" == "gamescope" && "$current_relogin" == "true" ]]; then
+        current_mode="${BOLD}${GREEN}Game Mode — no password${RESET}"
+    elif [[ "$current_session" == "gamescope" && "$current_relogin" == "false" ]]; then
+        current_mode="${BOLD}${GREEN}Game Mode — password required${RESET}"
+    elif [[ "$current_session" == "plasma" && "$current_relogin" == "false" ]]; then
+        current_mode="${BOLD}${CYAN}Desktop Mode — password required${RESET}"
+    else
+        current_mode="${BOLD}${CYAN}Desktop Mode — no password${RESET}"
     fi
 
-    print_info "Current Boot Mode: $current_mode"
+    echo -e "  ${CYAN}→${RESET}  Current: $current_mode"
     echo ""
-    print_item "1" "Game Mode" "Boot to Steam UI (Autologin $USER_NAME)"
-    print_item "2" "Desktop Mode" "Boot to Plasma (Manual Login)"
-    print_item "0" "Cancel & Restore" "Return to System Defaults"
+    print_item "1" "Game Mode"         "No password — boot straight to Steam UI"
+    print_item "2" "Game Mode"         "Password required for desktop mode"
+    print_item "3" "Desktop Mode"      "Password required on boot"
+    print_item "4" "Desktop Mode"      "No password — autologin to Plasma"
+    echo ""
+    print_item "0" "Back"              "Return to menu"
     echo ""
 
     read -rp "$(echo -e "  ${BOLD}${WHITE}Select choice:${RESET} ")" mode_choice
 
     case "$mode_choice" in
         1)
-            print_info "Applying Game Mode..."
+            print_info "Switching to Game Mode (no password)..."
+            rm -f "$OVERRIDE_FILE"
+            print_success "Done. Reboot to apply."
+            ;;
+        2)
+            print_info "Switching to Game Mode (password required)..."
             cat <<EOF > "$OVERRIDE_FILE"
 [Autologin]
 Relogin=false
 Session=gamescope-session.desktop
 User=$USER_NAME
 EOF
-            print_success "Game Mode active."
+            print_success "Done. Reboot to apply."
             ;;
-        2)
-            print_info "Applying Desktop Mode..."
+        3)
+            print_info "Switching to Desktop Mode (password required)..."
             cat <<EOF > "$OVERRIDE_FILE"
 [Autologin]
-Relogin=false
-Session=plasma.desktop
 User=
+Session=plasma.desktop
 EOF
-            print_success "Desktop Mode active."
+            print_success "Done. Reboot to apply."
             ;;
-        *)
-            print_info "Cancelling and restoring original CachyOS configs..."
-            # 1. Remove our override
-            rm -f "$OVERRIDE_FILE"
-
-            # 2. Move original files back if they exist
-            if [[ -d "$BACKUP_DIR" ]]; then
-                mv "$BACKUP_DIR"/* "$CONF_DIR/" 2>/dev/null
-                rmdir "$BACKUP_DIR" 2>/dev/null
-                print_success "Original configs restored. Backup directory removed."
-            else
-                print_info "No backup found to restore."
-            fi
+        4)
+            print_info "Switching to Desktop Mode (no password)..."
+            cat <<EOF > "$OVERRIDE_FILE"
+[Autologin]
+Relogin=true
+Session=plasma.desktop
+User=$USER_NAME
+EOF
+            print_success "Done. Reboot to apply."
+            ;;
+        0|*)
+            print_info "No changes made."
             return 0
             ;;
     esac
@@ -1529,8 +1533,8 @@ EOF
 show_experimental_menu() {
     print_banner
     print_section "Additional Tools"
-    echo -e "  ${DIM}These features may require non-stable packages or a reboot to take effect.${RESET}\n"
-    print_item  "1"  "Fix AMDGPU VRAM"   "Experimental — VRAM mgmt fix for low-end GPUs (requires Linux kernel 7.0+)"
+    echo -e "  ${DIM}Additional system utilities and hardware support.${RESET}\n"
+    print_item  "1"  "Toggle Boot Mode"  "Switch between Game Mode & Desktop"
     print_item  "2"  "DolphinBar Setup"  "Install udev rules for Wiimote support via DolphinBar"
     echo ""
     print_item  "0"  "Back"             "Return to main menu"
@@ -1544,7 +1548,7 @@ run_experimental_menu() {
         read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" exp_choice
 
         case "${exp_choice^^}" in
-            1) run_fix_amdgpu_vram;   press_enter ;;
+            1) run_toggle_boot_mode;  press_enter ;;
             2) run_dolphinbar_udev;   press_enter ;;
             0)  return ;;
             *)
@@ -1602,10 +1606,8 @@ show_revert_menu() {
     print_item  "2"  "Revert Mitigations"  "Re-enable CPU security mitigations"
     print_item  "3"  "Revert loglevel"     "Restore loglevel to default (3)"
     print_item  "4"  "Revert ACPI Fix"     "Remove ACPI fix and pacman hook"
-    print_item  "5"  "Toggle Boot Mode"    "Switch between Game Mode & Desktop"
-    print_item  "6"  "CachyOS Kernel"      "Replace Deckify kernel with standard CachyOS"
-    print_item  "7"  "DolphinBar Setup"    "Remove DolphinBar udev rules"
-    print_item  "8"  "AMDGPU VRAM Fix"     "Uninstall VRAM fix packages"
+    print_item  "5"  "CachyOS Kernel"      "Replace Deckify kernel with standard CachyOS"
+    print_item  "6"  "DolphinBar Setup"    "Remove DolphinBar udev rules"
     echo ""
     print_item  "0"  "Back"                "Return to main menu"
     echo ""
@@ -1622,10 +1624,8 @@ run_revert_menu() {
             2) run_revert_mitigations;        press_enter ;;
             3) run_revert_loglevel;           press_enter ;;
             4) run_revert_acpi_fix;           press_enter ;;
-            5) run_toggle_boot_mode;          press_enter ;;
-            6) run_switch_to_default_kernel;  press_enter ;;
-            7) run_revert_dolphinbar;         press_enter ;;
-            8) run_revert_amdgpu_vram;        press_enter ;;
+            5) run_switch_to_default_kernel;  press_enter ;;
+            6) run_revert_dolphinbar;         press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
@@ -1647,14 +1647,13 @@ show_menu() {
     print_item  "5"  "Hide RDSEED Warning" "Set loglevel=0 in /boot/limine.conf"
     print_item  "6"  "ZRAM -> ZSWAP"       "Disable ZRAM, enable ZSWAP w/ lz4"
     print_item  "7"  "Disable Mitigations" "Add mitigations=off to limine.conf"
-    print_item  "8"  "Install ACPI Fix"    "Enable CPU C-States (800MHz-3.2GHz)"
-    print_item  "A"  "Run All (2-8)"       "Run all setup tasks in sequence"
+    print_item  "A"  "Run All (2-7)"       "Run all setup tasks in sequence"
     echo ""
     print_section "Revert / Undo"
     print_item  "R"  "Revert Menu"         "Undo previously applied settings"
     echo ""
     print_section "Additional Tools"
-    print_item  "E"  "Additional Tools"    "Experimental / bleeding-edge features"
+    print_item  "E"  "Additional Tools"    "Additional system utilities"
     echo ""
     print_section "System"
     print_item  "S"  "Status"              "Current system summary"
@@ -1675,7 +1674,6 @@ while true; do
         5) run_set_loglevel;              press_enter ;;
         6) run_disable_zram_enable_zswap; press_enter ;;
         7) run_disable_mitigations;       press_enter ;;
-        8) run_install_acpi_fix;          press_enter ;;
         A) run_all;                       press_enter ;;
         R) run_revert_menu ;;
         E) run_experimental_menu ;;
