@@ -15,6 +15,7 @@ It does the following:
 5. Enable ZSWAP
 6. Easily change CPU and GPU overclock settings on the fly
 7. Displays a status window showing you your current settings.
+8. Beta: Unlock compute units thanks to: https://github.com/WinnieLV/bc250-cu-live-manager
 
 In desktop mode run the below in the terminal(Konsole):
 <pre>
