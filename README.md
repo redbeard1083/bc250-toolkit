@@ -23,7 +23,7 @@ curl -sSLO https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main/bc2
 </pre>
 
 ```
- ╔══════════════════════════════════════════════════════════════╗
+  ╔══════════════════════════════════════════════════════════════╗
   ║                                                              ║
   ║              CachyOS BC250 Toolkit                           ║
   ║           System Setup & Configuration                       ║
