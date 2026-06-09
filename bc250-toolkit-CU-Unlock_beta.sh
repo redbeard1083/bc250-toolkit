@@ -6,6 +6,131 @@
 
 set -euo pipefail
 
+# ==============================================================================
+# SERVICE MODE — must run before interactive code, sudo check, or UI setup
+# Invoked by the systemd boot service as: bc250-toolkit --yes apply-service
+# ==============================================================================
+if [[ "${1:-}" == "apply-service" ]] || [[ "${2:-}" == "apply-service" ]]; then
+    # Minimal color codes needed for cu_info/cu_warn output to journal
+    BOLD=""; DIM=""; RESET=""; RED=""; GREEN=""; YELLOW=""; CYAN=""; WHITE=""
+
+    CU_ASIC="${UMR_ASIC:-cyan_skillfish.gfx1013}"
+    CU_REG_CC="mmCC_GC_SHADER_ARRAY_CONFIG"
+    CU_REG_SPI="mmSPI_PG_ENABLE_STATIC_WGP_MASK"
+    CU_REG_RLC="mmRLC_PG_ALWAYS_ON_WGP_MASK"
+    CU_SERVICE_CONF="/etc/bc250-cu-live-manager.conf"
+    CU_WGP_FULL_MASK=0x1f
+    CU_UMR="${UMR:-}"
+    CU_UMR_INSTANCE="${UMR_INSTANCE:-}"
+    CU_UMR_INSTANCE_ARGS=()
+    CU_LAST_REG_PATH=""
+    CU_DRY_RUN=0
+    CU_DISCLAIMER_ACCEPTED=1
+
+    cu_info() { echo "  ✔  $*"; }
+    cu_warn() { echo "  ⚠  $*" >&2; }
+    cu_err()  { echo "  ✘  $*" >&2; }
+    cu_die()  { cu_err "$@"; exit 1; }
+
+    cu_parse_hex() {
+        awk '{for(i=NF;i>=1;i--){if($i~/^0x[0-9a-fA-F]+$/){print $i;exit}}}'
+    }
+    cu_umr_output_failed() {
+        printf '%s\n' "$1" | grep -Eqi '(\[ERROR\]|error|failed|invalid|unknown|cannot|no such)'
+    }
+    cu_reg_candidates() { printf '%s\n' "$1"; }
+    cu_hex_mask()   { printf '0x%02x' "$(( $1 & 31 ))"; }
+    cu_hex_to_dec() { printf '%d' "$(( $1 ))"; }
+    cu_row_coords() {
+        case "$1" in 0) printf '0 0';; 1) printf '0 1';; 2) printf '1 0';; 3) printf '1 1';; esac
+    }
+    cu_wgp_mask_cu_count() {
+        local mask="$1" wgp count=0
+        for wgp in 0 1 2 3 4; do
+            if [ $((mask & (1 << wgp))) -ne 0 ]; then count=$((count + 2)); fi
+        done
+        printf '%s\n' "$count"
+    }
+
+    # Find umr — prefer conf value, then search standard paths
+    _umr=""
+    [ -n "$CU_UMR" ] && [ -x "$CU_UMR" ] && _umr="$CU_UMR"
+    if [ -z "$_umr" ]; then
+        for _p in /usr/bin/umr /usr/local/bin/umr /opt/umr/build/src/app/umr; do
+            [ -x "$_p" ] && { _umr="$_p"; break; }
+        done
+    fi
+    [ -n "$_umr" ] || cu_die "umr not installed — cannot apply boot profile"
+    CU_UMR="$_umr"
+
+    # Set instance args
+    if [ -n "$CU_UMR_INSTANCE" ]; then
+        CU_UMR_INSTANCE_ARGS=(-i "$CU_UMR_INSTANCE")
+    fi
+
+    # Load saved masks from conf
+    _csv=""
+    [ -f "$CU_SERVICE_CONF" ] || cu_die "no boot profile found at $CU_SERVICE_CONF"
+    while IFS= read -r _line; do
+        case "$_line" in BC250_WGP_MASKS=*) _csv="${_line#BC250_WGP_MASKS=}"; break;; esac
+    done <"$CU_SERVICE_CONF"
+    [ -n "$_csv" ] || cu_die "BC250_WGP_MASKS not found in $CU_SERVICE_CONF"
+
+    IFS=',' read -ra _items <<<"$_csv"
+    [ "${#_items[@]}" -eq 4 ] || cu_die "invalid mask count in $CU_SERVICE_CONF"
+    declare -a service_masks=()
+    for _i in 0 1 2 3; do
+        _v=$(( ${_items[$_i]} ))
+        [ "$_v" -ge 0 ] && [ "$_v" -le 31 ] || cu_die "mask out of range: ${_items[$_i]}"
+        service_masks[$_i]="$_v"
+    done
+
+    # Verify ASIC is reachable
+    _out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -r "$CU_ASIC.$CU_REG_SPI" 2>&1 || true)"
+    _val="$(printf '%s\n' "$_out" | cu_parse_hex)"
+    [ -n "$_val" ] || cu_die "umr could not read $CU_ASIC.$CU_REG_SPI — GPU not ready"
+
+    # Apply masks
+    declare -a target_masks=("${service_masks[@]}")
+
+    cu_try_write_reg_global() {
+        local reg="$1" value="$2" candidate out
+        while IFS= read -r candidate; do
+            CU_LAST_REG_PATH="$CU_ASIC.$candidate"
+            out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -w "$CU_LAST_REG_PATH" "$value" 2>&1 || true)"
+            cu_umr_output_failed "$out" || return 0
+        done < <(cu_reg_candidates "$reg")
+        return 1
+    }
+    cu_write_reg_bank() {
+        local reg="$1" value="$2" se="$3" sh="$4" candidate out
+        while IFS= read -r candidate; do
+            CU_LAST_REG_PATH="$CU_ASIC.$candidate"
+            out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -w "$CU_LAST_REG_PATH" "$value" -b "$se" "$sh" 0xffffffff 2>&1 || true)"
+            cu_umr_output_failed "$out" || return 0
+        done < <(cu_reg_candidates "$reg")
+        cu_die "failed to write $reg=$value for SE$se SH$sh"
+    }
+
+    cu_try_write_reg_global "$CU_REG_CC" "0x0" || cu_warn "could not write global $CU_REG_CC"
+    _union=0
+    for _idx in 0 1 2 3; do
+        read -r _se _sh <<<"$(cu_row_coords "$_idx")"
+        cu_write_reg_bank "$CU_REG_CC" 0x0 "$_se" "$_sh"
+        cu_write_reg_bank "$CU_REG_SPI" "$(cu_hex_mask "${target_masks[$_idx]}")" "$_se" "$_sh"
+        _union=$((_union | target_masks[_idx]))
+    done
+    cu_try_write_reg_global "$CU_REG_RLC" "$(cu_hex_mask "$_union")" || \
+        cu_warn "could not write $CU_REG_RLC"
+
+    _total=0
+    for _idx in 0 1 2 3; do
+        _total=$((_total + $(cu_wgp_mask_cu_count "${target_masks[$_idx]}")))
+    done
+    cu_info "BC-250 boot profile applied: ${_total}/40 CUs active"
+    exit 0
+fi
+
 # Re-launch with sudo if not already root
 if [[ $EUID -ne 0 ]]; then
     exec sudo "$0" "$@"
@@ -1823,7 +1948,7 @@ run_all() {
 #   WGP (Work Group Processor) → Compute Pair  (always 2 CUs)
 #   SE/SH rows                 → Row           (SE0.SH0 etc.)
 #   SPI dispatch               → Routing
-#   D+ / S+ / D!               → Active / Routed / Blocked
+#   D+ / S+ / D!               → Default / Enabled / Blocked
 #   stock-dispatch             → Reset to Driver Default
 #   write-service-table        → Save Boot Profile
 #   apply-service              → Apply Saved Boot Profile
@@ -2017,7 +2142,7 @@ cu_hex_to_dec()     { printf '%d' "$(( $1 ))"; }
 cu_wgp_mask_cu_count() {
     local mask="$1" wgp count=0
     for wgp in 0 1 2 3 4; do
-        [ $((mask & (1 << wgp))) -ne 0 ] && count=$((count + 2))
+        if [ $((mask & (1 << wgp))) -ne 0 ]; then count=$((count + 2)); fi
     done
     printf '%s\n' "$count"
 }
@@ -2065,10 +2190,10 @@ cu_mask_tokens() {
     local mask="$1" driver_mask="${2:-0}" wgp bit token out=""
     for wgp in 0 1 2 3 4; do
         bit=$((1 << wgp))
-        if   [ $((driver_mask & bit)) -ne 0 ] && [ $((mask & bit)) -ne 0 ]; then token="Active"
+        if   [ $((driver_mask & bit)) -ne 0 ] && [ $((mask & bit)) -ne 0 ]; then token="Default"
         elif [ $((driver_mask & bit)) -ne 0 ];                               then token="Blocked"
-        elif [ $((mask & bit)) -ne 0 ];                                      then token="Routed"
-        else                                                                       token="--"
+        elif [ $((mask & bit)) -ne 0 ];                                      then token="Enabled"
+        else                                                                       token="Disabled"
         fi
         out="${out}${out:+ }$token"
     done
@@ -2215,7 +2340,7 @@ cu_confirm_dispatch_plan() {
     [ "$CU_DISCLAIMER_ACCEPTED" -eq 1 ] || return 1
     echo ""
     print_section "$title"
-    echo -e "  ${DIM}Legend: Active = driver+routed, Routed = routing only, -- = off, Blocked = driver conflict${RESET}\n"
+    echo -e "  ${DIM}Legend: Default = driver default CUs, Enabled = additionally unlocked, Disabled = not active, Blocked = driver conflict${RESET}\n"
     printf "  %-9s %-30s %-30s %-20s\n" "Row" "Current" "Target" "Change"
     echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────────────${RESET}"
     for idx in 0 1 2 3; do
@@ -2255,10 +2380,10 @@ cu_live_table_header() {
 
 cu_live_cell() {
     local spi_on="$1" driver_on="${2:-0}"
-    if   [ "$driver_on" -ne 0 ] && [ "$spi_on" -ne 0 ]; then printf "${GREEN}${BOLD}Active  ${RESET}"
-    elif [ "$driver_on" -ne 0 ];                          then printf "${RED}${BOLD}Blocked ${RESET}"
-    elif [ "$spi_on" -ne 0 ];                             then printf "${CYAN}Routed  ${RESET}"
-    else                                                       printf "${DIM}--      ${RESET}"
+    if   [ "$driver_on" -ne 0 ] && [ "$spi_on" -ne 0 ]; then printf "${GREEN}${BOLD}Default  ${RESET}"
+    elif [ "$driver_on" -ne 0 ];                          then printf "${RED}${BOLD}Blocked  ${RESET}"
+    elif [ "$spi_on" -ne 0 ];                             then printf "${CYAN}Enabled  ${RESET}"
+    else                                                       printf "${DIM}Disabled ${RESET}"
     fi
 }
 
@@ -2300,9 +2425,9 @@ cu_register_status() {
     fi
     echo ""
     if [ "$driver_ok" -eq 1 ]; then
-        echo -e "  ${GREEN}${BOLD}Active${RESET}  = driver + routed   ${CYAN}Routed${RESET}  = routing only   ${DIM}--${RESET}  = off   ${RED}${BOLD}Blocked${RESET} = driver conflict"
+        echo -e "  ${GREEN}${BOLD}Default${RESET}  = driver default CUs   ${CYAN}Enabled${RESET}  = additionally unlocked CUs   ${DIM}Disabled${RESET}  = not active   ${RED}${BOLD}Blocked${RESET} = driver conflict"
     else
-        echo -e "  ${CYAN}Routed${RESET}  = routing active   ${DIM}--${RESET}  = off   ${YELLOW}(driver lock state unavailable)${RESET}"
+        echo -e "  ${CYAN}Enabled${RESET}  = routing active   ${DIM}Disabled${RESET}  = not active   ${YELLOW}(driver lock state unavailable)${RESET}"
     fi
     echo ""
     cu_live_table_header
@@ -2333,7 +2458,7 @@ cu_register_status() {
     echo -e "  ${BOLD}${WHITE}Routing total : ${total}/40 CUs${RESET}"
     [ "$service_has_config" -eq 1 ] && printf "  %-14s: %s\n" "Boot profile" "$(cu_mask_summary service_masks)"
     if [ "$driver_ok" -eq 1 ]; then
-        echo -e "  ${BOLD}Driver lock   : ${driver_total}/40 CUs active — active pairs cannot be disabled live${RESET}"
+        echo -e "  ${BOLD}Driver lock   : ${driver_total}/40 CUs active — default pairs cannot be disabled live${RESET}"
         if [ "$blocked_total" -gt 0 ]; then
             cu_warn "${blocked_total} driver-active CUs are not routed (shown as Blocked)"
         fi
@@ -2348,7 +2473,7 @@ cu_draw_table_editor() {
     print_banner
     print_section "Edit Compute Pair Routing"
     echo -e "  ${DIM}Arrows/hjkl${RESET} move   ${DIM}Space${RESET} toggle   ${DIM}Enter/a${RESET} apply   ${DIM}q${RESET} cancel\n"
-    echo -e "  ${GREEN}${BOLD}Active${RESET} = driver+routed (locked)   ${CYAN}Routed${RESET} = routing only   ${DIM}--${RESET} = off\n"
+    echo -e "  ${GREEN}${BOLD}Default${RESET} = driver default CUs (locked)   ${CYAN}Enabled${RESET} = additionally unlocked   ${DIM}Disabled${RESET} = not active\n"
     printf "  %-9s %-8s %-8s %-8s %-8s %-8s\n" "Row" "Pair0" "Pair1" "Pair2" "Pair3" "Pair4"
     printf "  %-9s %-8s %-8s %-8s %-8s %-8s\n" "" "CU0-1" "CU2-3" "CU4-5" "CU6-7" "CU8-9"
     echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
@@ -2359,11 +2484,11 @@ cu_draw_table_editor() {
             driver_on=0
             if [ "${driver_lock_ok:-0}" -eq 1 ] && [ $((driver_masks[idx] & bit)) -ne 0 ]; then driver_on=1; fi
             if [ $((masks[idx] & bit)) -ne 0 ]; then
-                if [ "$driver_on" -eq 1 ]; then cell="Active  "; style="${GREEN}${BOLD}"
-                else                            cell="Routed  "; style="${CYAN}"
+                if [ "$driver_on" -eq 1 ]; then cell="Default  "; style="${GREEN}${BOLD}"
+                else                            cell="Enabled  "; style="${CYAN}"
                 fi
             else
-                cell="--      "; style="${DIM}"
+                cell="Disabled "; style="${DIM}"
             fi
             endstyle="${RESET}"
             if [ "$idx" -eq "$cursor_row" ] && [ "$wgp" -eq "$cursor_wgp" ]; then
@@ -2406,7 +2531,7 @@ cu_table_editor() {
                 if [ "$driver_lock_ok" -ne 1 ]; then
                     cu_warn "driver topology unavailable — toggles are locked"; sleep 1
                 elif [ $((driver_masks[row] & bit)) -ne 0 ] && [ $((masks[row] & bit)) -ne 0 ]; then
-                    cu_warn "$(cu_row_label "$row") Pair${wgp} is Active (driver-locked) and cannot be disabled live"; sleep 1
+                    cu_warn "$(cu_row_label "$row") Pair${wgp} is a Default (driver-locked) CU and cannot be disabled live"; sleep 1
                 else
                     masks[$row]=$((masks[row] ^ bit))
                 fi ;;
@@ -2564,10 +2689,10 @@ dz_warn() {
     echo ""
     echo -e "  You are fully responsible for any outcomes.${RESET}"
     echo ""
-    echo -e "  ${DIM}Type ${RESET}${BOLD}${YELLOW}DANGER${RESET}${DIM} to acknowledge and enter, or press Enter to go back.${RESET}"
+    echo -e "  ${DIM}Type ${RESET}${BOLD}${YELLOW}unlock${RESET}${DIM} to acknowledge and enter, or press Enter to go back.${RESET}"
     echo ""
     read -rp "  → " dz_ack
-    if [[ "$dz_ack" == "DANGER" ]]; then
+    if [[ "${dz_ack,,}" == "unlock" ]]; then
         CU_DISCLAIMER_ACCEPTED=1
         return 0
     else
