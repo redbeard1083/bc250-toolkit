@@ -79,5 +79,37 @@ curl -sSLO https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main/bc2
   Enter selection: 
 ...
 
+  ╔══════════════════════════════════════════════════════════════╗
+  ║                                                              ║
+  ║              CachyOS BC250 Toolkit                           ║
+  ║           System Setup & Configuration                       ║
+  ║                                                              ║
+  ╚══════════════════════════════════════════════════════════════╝
+
+  Performance Profile Menu
+  ──────────────────────────────────────────────────────────────
+  Active: Aggressive — CPU 3500MHz / GPU 2000MHz / max 80°C
+
+  Standard Profiles
+  ──────────────────────────────────────────────────────────────
+  [ 1]  Stock               CPU 3.5GHz, GPU 1500MHz — 80°C
+  [ 2]  Mild                CPU 3.5GHz, GPU 1600MHz — 80°C
+  [ 3]  Moderate            CPU 3.5GHz, GPU 1750MHz — 80°C
+  [ 4]  Strong              CPU 3.5GHz, GPU 1850MHz — 80°C
+  [ 5]  Aggressive          CPU 3.5GHz, GPU 2000MHz — 80°C
+
+  High-Risk Profiles  ⚠  Requires OC acknowledgement
+  ──────────────────────────────────────────────────────────────
+  [ 6]  Extreme I ⚠       CPU 3.5GHz, GPU 2100MHz — 80°C  [HIGH RISK]
+  [ 7]  Extreme II ⚠      CPU 3.85GHz, GPU 2100MHz — 80°C  [HIGH RISK]
+  [ 8]  Extreme III ⚠     CPU 4GHz, GPU 2350MHz — 90°C  [HIGH RISK]
+
+  [ C]  Custom              Mix & match CPU and GPU profiles
+  [ E]  Edit with Kate      Manually edit GPU config
+  [ 0]  Back to Main Menu   
+
+  ══════════════════════════════════════════════════════════════
+  Enter selection: 
+
 ...
 
