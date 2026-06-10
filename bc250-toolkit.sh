@@ -2788,7 +2788,8 @@ show_experimental_menu() {
 }
 
 run_update_toolkit() {
-    local target="/home/$REAL_USER/bc250-toolkit.sh"
+    local target
+    target="$(readlink -f "$0")"
     local url="https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main/bc250-toolkit.sh"
 
     print_section "Update Toolkit"
