@@ -1882,8 +1882,8 @@ run_revert_mitigations() {
 }
 
 run_all() {
-    print_step "★" "Running All Setup Tasks (2–7)"
-    echo -e "  ${DIM}This will run: CPU Governor, GPU Governor, Enable Swap,"
+    print_step "★" "Running All Setup Tasks (1–7)"
+    echo -e "  ${DIM}This will run: CachyOS Kernel, CPU Governor, GPU Governor, Enable Swap,"
     echo -e "  Disable ZRAM / Enable ZSWAP, Hide RDSEED Warning, and Disable Mitigations.${RESET}"
 
     if ! confirm "Proceed with all tasks?"; then
@@ -1896,6 +1896,7 @@ run_all() {
 
     # Define the list of tasks to run
     local tasks=(
+        run_switch_to_default_kernel
         run_cpu_governor
         run_gpu_governor
         run_enable_swap
@@ -2773,71 +2774,6 @@ EOF
     print_success "DolphinBar udev rules installed! Reconnect your device."
 }
 
-show_experimental_menu() {
-    print_banner
-    print_section "Additional Tools"
-    echo -e "  ${DIM}Additional system utilities and hardware support.${RESET}\n"
-    print_item  "1"  "CachyOS Kernel"    "Replace Deckify kernel with standard CachyOS"
-    print_item  "2"  "Toggle Boot Mode"  "Switch between Game Mode & Desktop"
-    print_item  "3"  "DolphinBar Setup"  "Install udev rules for Wiimote support via DolphinBar"
-    print_item  "4"  "Update Toolkit"    "Download and install the latest version from GitHub"
-    echo ""
-    print_item  "0"  "Back"             "Return to main menu"
-    echo ""
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
-}
-
-run_update_toolkit() {
-    local target
-    target="$(readlink -f "$0")"
-    local url="https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main/bc250-toolkit.sh"
-
-    print_section "Update Toolkit"
-    print_info "Downloading latest version from GitHub..."
-
-    if ! curl -sSL "$url" -o "${target}.tmp"; then
-        print_error "Download failed. Check your internet connection."
-        rm -f "${target}.tmp"
-        return 1
-    fi
-
-    # Basic sanity check — make sure we got a shell script
-    if ! head -1 "${target}.tmp" | grep -q "^#!"; then
-        print_error "Downloaded file does not look like a valid script. Aborting."
-        rm -f "${target}.tmp"
-        return 1
-    fi
-
-    mv "${target}.tmp" "$target"
-    chmod +x "$target"
-    print_success "Toolkit updated successfully. Restarting..."
-    sleep 1
-    exec bash "$target"
-}
-
-run_experimental_menu() {
-    while true; do
-        show_experimental_menu
-        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" exp_choice
-
-        case "${exp_choice^^}" in
-            1) run_switch_to_default_kernel; press_enter ;;
-            2) run_toggle_boot_mode;         press_enter ;;
-            3) run_dolphinbar_udev;          press_enter ;;
-            4) run_update_toolkit ;;
-            0)  return ;;
-            *)
-                print_error "Invalid selection: '$exp_choice'"
-                sleep 1
-                ;;
-        esac
-    done
-}
-
-# ==============================================================================
-# MAIN MENU LOOP
-# ==============================================================================
-
 run_revert_dolphinbar() {
     local RULES_FILE="/etc/udev/rules.d/51-dolphinbar.rules"
     print_step "R-7" "Reverting DolphinBar udev Rules"
@@ -2910,7 +2846,6 @@ run_revert_gpu_governor() {
     print_success "GPU governor removed successfully."
 }
 
-
 show_revert_menu() {
     print_banner
     print_section "Revert / Undo"
@@ -2950,32 +2885,121 @@ run_revert_menu() {
     done
 }
 
-show_menu() {
+run_update_toolkit() {
+    local target
+    target="$(readlink -f "$0")"
+    local url="https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main/bc250-toolkit.sh"
+
+    print_section "Update Toolkit"
+    print_info "Downloading latest version from GitHub..."
+
+    if ! curl -sSL "$url" -o "${target}.tmp"; then
+        print_error "Download failed. Check your internet connection."
+        rm -f "${target}.tmp"
+        return 1
+    fi
+
+    if ! head -1 "${target}.tmp" | grep -q "^#!"; then
+        print_error "Downloaded file does not look like a valid script. Aborting."
+        rm -f "${target}.tmp"
+        return 1
+    fi
+
+    mv "${target}.tmp" "$target"
+    chmod +x "$target"
+    print_success "Toolkit updated successfully. Restarting..."
+    sleep 1
+    exec bash "$target"
+}
+
+show_initial_setup_menu() {
     print_banner
-    print_section "Performance"
-    print_item  "1"  "Overclock Menu"      "CPU & GPU performance profiles"
-    echo ""
-    print_section "Setup Tasks"
+    print_section "Initial Setup"
+    echo -e "  ${DIM}Run these tasks to configure your BC-250 system.${RESET}\n"
+    print_item  "1"  "CachyOS Kernel"      "Replace Deckify kernel with standard CachyOS"
     print_item  "2"  "CPU Governor"        "bc250-smu-oc CPU overclock service"
     print_item  "3"  "GPU Governor"        "cyan-skillfish GPU governor service"
     print_item  "4"  "Enable Swap"         "16G Btrfs swapfile, swappiness=180"
     print_item  "5"  "ZRAM -> ZSWAP"       "Disable ZRAM, enable ZSWAP w/ lz4"
     print_item  "6"  "Hide RDSEED Warning" "Set loglevel=0 in /boot/limine.conf"
     print_item  "7"  "Disable Mitigations" "Add mitigations=off to limine.conf"
-    print_item  "A"  "Run All (2-7)"       "Run all setup tasks in sequence"
+    print_item  "A"  "Run All (1-7)"       "Run all setup tasks in sequence"
     echo ""
-    print_section "Revert / Undo"
-    print_item  "R"  "Revert Menu"         "Undo previously applied settings"
+    print_section "⚠  Manual Steps — not included in Run All"
+    print_item  "8"  "Compute Units Unlock" ""
     echo ""
+    print_item  "0"  "Back"                ""
+    echo ""
+    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_initial_setup_menu() {
+    while true; do
+        show_initial_setup_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" is_choice
+
+        case "${is_choice^^}" in
+            1) run_switch_to_default_kernel;  press_enter ;;
+            2) run_cpu_governor;              press_enter ;;
+            3) run_gpu_governor;              press_enter ;;
+            4) run_enable_swap;               press_enter ;;
+            5) run_disable_zram_enable_zswap; press_enter ;;
+            6) run_set_loglevel;              press_enter ;;
+            7) run_disable_mitigations;       press_enter ;;
+            A) run_all;                       press_enter ;;
+            8) run_danger_zone_menu ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$is_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+show_experimental_menu() {
+    print_banner
     print_section "Additional Tools"
-    print_item  "E"  "Additional Tools"    "Additional system utilities"
+    echo -e "  ${DIM}Additional system utilities and hardware support.${RESET}\n"
+    print_item  "1"  "Toggle Boot Mode"  "Switch between Game Mode & Desktop"
+    print_item  "2"  "DolphinBar Setup"  "Install udev rules for Wiimote support via DolphinBar"
     echo ""
-    print_section "⚠  Experimental/Danger Zone"
-    print_item  "X"  "Compute Units Unlock" ""
+    print_item  "0"  "Back"             "Return to main menu"
+    echo ""
+    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_experimental_menu() {
+    while true; do
+        show_experimental_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" exp_choice
+
+        case "${exp_choice^^}" in
+            1) run_toggle_boot_mode;  press_enter ;;
+            2) run_dolphinbar_udev;   press_enter ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$exp_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+show_menu() {
+    print_banner
+    print_section "Performance"
+    print_item  "1"  "Performance Profiles" "CPU & GPU performance profiles"
+    echo ""
+    print_section "Setup"
+    print_item  "2"  "Initial Setup"        "System configuration tasks"
+    print_item  "3"  "Additional Tools"     "Additional system utilities"
+    print_item  "4"  "Revert Menu"          "Undo previously applied settings"
     echo ""
     print_section "System"
-    print_item  "S"  "Status"              "Current system summary"
-    print_item  "0"  "Exit"                ""
+    print_item  "S"  "Status"               "Current system summary"
+    print_item  "U"  "Update Toolkit"       "Download and install the latest version from GitHub"
+    print_item  "0"  "Exit"                 ""
     echo ""
     echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
 }
@@ -2986,17 +3010,11 @@ while true; do
 
     case "${choice^^}" in
         1) run_overclock_menu ;;
-        2) run_cpu_governor;              press_enter ;;
-        3) run_gpu_governor;              press_enter ;;
-        4) run_enable_swap;               press_enter ;;
-        5) run_disable_zram_enable_zswap; press_enter ;;
-        6) run_set_loglevel;              press_enter ;;
-        7) run_disable_mitigations;       press_enter ;;
-        A) run_all;                       press_enter ;;
-        R) run_revert_menu ;;
-        E) run_experimental_menu ;;
-        X) run_danger_zone_menu ;;
-        S) run_status;                    press_enter ;;
+        2) run_initial_setup_menu ;;
+        3) run_experimental_menu ;;
+        4) run_revert_menu ;;
+        S) run_status;        press_enter ;;
+        U) run_update_toolkit ;;
         0)
             echo -e "\n  ${DIM}Goodbye.${RESET}\n"
             exit 0
