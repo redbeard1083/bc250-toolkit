@@ -32,36 +32,52 @@ curl -sSLO https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main/bc2
 
   Performance
   ──────────────────────────────────────────────────────────────
-  [ 1]  Overclock Menu      CPU & GPU performance profiles
+  [ 1]  Performance Profiles CPU & GPU performance profiles
 
-  Setup Tasks
+  Setup
   ──────────────────────────────────────────────────────────────
+  [ 2]  Initial Setup       System configuration tasks
+  [ 3]  Additional Tools    Additional system utilities
+  [ 4]  Revert Menu         Undo previously applied settings
+
+  System
+  ──────────────────────────────────────────────────────────────
+  [ S]  Status              Current system summary
+  [ U]  Update Toolkit      Download and install the latest version from GitHub
+  [ 0]  Exit                
+
+  ══════════════════════════════════════════════════════════════
+  Enter selection: 
+...
+  ╔══════════════════════════════════════════════════════════════╗
+  ║                                                              ║
+  ║              CachyOS BC250 Toolkit                           ║
+  ║           System Setup & Configuration                       ║
+  ║                                                              ║
+  ╚══════════════════════════════════════════════════════════════╝
+
+  Initial Setup
+  ──────────────────────────────────────────────────────────────
+  Run these tasks to configure your BC-250 system.
+
+  [ 1]  CachyOS Kernel      Replace Deckify kernel with standard CachyOS
   [ 2]  CPU Governor        bc250-smu-oc CPU overclock service
   [ 3]  GPU Governor        cyan-skillfish GPU governor service
   [ 4]  Enable Swap         16G Btrfs swapfile, swappiness=180
   [ 5]  ZRAM -> ZSWAP       Disable ZRAM, enable ZSWAP w/ lz4
   [ 6]  Hide RDSEED Warning Set loglevel=0 in /boot/limine.conf
   [ 7]  Disable Mitigations Add mitigations=off to limine.conf
-  [ A]  Run All (2-7)       Run all setup tasks in sequence
+  [ A]  Run All (1-7)       Run all setup tasks in sequence
 
-  Revert / Undo
+  ⚠  Manual Steps — not included in Run All
   ──────────────────────────────────────────────────────────────
-  [ R]  Revert Menu         Undo previously applied settings
+  [ 8]  Compute Units Unlock 
 
-  Additional Tools
-  ──────────────────────────────────────────────────────────────
-  [ E]  Additional Tools    Additional system utilities
-
-  ⚠  Experimental/Danger Zone
-  ──────────────────────────────────────────────────────────────
-  [ X]  Compute Units Unlock 
-
-  System
-  ──────────────────────────────────────────────────────────────
-  [ S]  Status              Current system summary
-  [ 0]  Exit                
+  [ 0]  Back                
 
   ══════════════════════════════════════════════════════════════
+  Enter selection: 
 ...
+
 ...
 
