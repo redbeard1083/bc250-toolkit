@@ -2780,10 +2780,38 @@ show_experimental_menu() {
     print_item  "1"  "CachyOS Kernel"    "Replace Deckify kernel with standard CachyOS"
     print_item  "2"  "Toggle Boot Mode"  "Switch between Game Mode & Desktop"
     print_item  "3"  "DolphinBar Setup"  "Install udev rules for Wiimote support via DolphinBar"
+    print_item  "4"  "Update Toolkit"    "Download and install the latest version from GitHub"
     echo ""
     print_item  "0"  "Back"             "Return to main menu"
     echo ""
     echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_update_toolkit() {
+    local target="/home/$REAL_USER/bc250-toolkit.sh"
+    local url="https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main/bc250-toolkit.sh"
+
+    print_section "Update Toolkit"
+    print_info "Downloading latest version from GitHub..."
+
+    if ! curl -sSL "$url" -o "${target}.tmp"; then
+        print_error "Download failed. Check your internet connection."
+        rm -f "${target}.tmp"
+        return 1
+    fi
+
+    # Basic sanity check — make sure we got a shell script
+    if ! head -1 "${target}.tmp" | grep -q "^#!"; then
+        print_error "Downloaded file does not look like a valid script. Aborting."
+        rm -f "${target}.tmp"
+        return 1
+    fi
+
+    mv "${target}.tmp" "$target"
+    chmod +x "$target"
+    print_success "Toolkit updated successfully. Restarting..."
+    sleep 1
+    exec bash "$target"
 }
 
 run_experimental_menu() {
@@ -2795,6 +2823,7 @@ run_experimental_menu() {
             1) run_switch_to_default_kernel; press_enter ;;
             2) run_toggle_boot_mode;         press_enter ;;
             3) run_dolphinbar_udev;          press_enter ;;
+            4) run_update_toolkit ;;
             0)  return ;;
             *)
                 print_error "Invalid selection: '$exp_choice'"
