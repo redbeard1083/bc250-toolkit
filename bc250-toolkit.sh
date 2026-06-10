@@ -2893,7 +2893,10 @@ run_update_toolkit() {
     print_section "Update Toolkit"
     print_info "Downloading latest version from GitHub..."
 
-    if ! curl -sSL "$url" -o "${target}.tmp"; then
+    if ! curl -sSL \
+        -H "Cache-Control: no-cache" \
+        -H "Pragma: no-cache" \
+        "$url" -o "${target}.tmp"; then
         print_error "Download failed. Check your internet connection."
         rm -f "${target}.tmp"
         return 1
