@@ -2960,12 +2960,34 @@ run_initial_setup_menu() {
     done
 }
 
+run_install_decky() {
+    print_section "Install Decky"
+    print_info "Downloading and running Decky installer..."
+    echo ""
+    rm -f /tmp/user_install_script.sh
+    if curl -S -s -L -O --output-dir /tmp/ --connect-timeout 60 \
+        https://github.com/SteamDeckHomebrew/decky-installer/releases/latest/download/user_install_script.sh; then
+        bash /tmp/user_install_script.sh
+    else
+        print_error "Download failed. Check your internet connection and try again."
+    fi
+}
+
+run_install_emudeck() {
+    print_section "Install EmuDeck"
+    print_info "Downloading and running EmuDeck installer as $REAL_USER..."
+    echo ""
+    sudo -u "$REAL_USER" bash -c 'curl -L https://raw.githubusercontent.com/dragoonDorise/EmuDeck/main/install.sh | bash'
+}
+
 show_experimental_menu() {
     print_banner
     print_section "Additional Tools"
     echo -e "  ${DIM}Additional system utilities and hardware support.${RESET}\n"
     print_item  "1"  "Toggle Boot Mode"  "Switch between Game Mode & Desktop"
     print_item  "2"  "DolphinBar Setup"  "Install udev rules for Wiimote support via DolphinBar"
+    print_item  "3"  "Install Decky"     "Install the Decky plugin loader"
+    print_item  "4"  "Install EmuDeck"   "Install the EmuDeck emulation suite"
     echo ""
     print_item  "0"  "Back"             "Return to main menu"
     echo ""
@@ -2978,8 +3000,10 @@ run_experimental_menu() {
         read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" exp_choice
 
         case "${exp_choice^^}" in
-            1) run_toggle_boot_mode;  press_enter ;;
-            2) run_dolphinbar_udev;   press_enter ;;
+            1) run_toggle_boot_mode;   press_enter ;;
+            2) run_dolphinbar_udev;    press_enter ;;
+            3) run_install_decky;      press_enter ;;
+            4) run_install_emudeck;    press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$exp_choice'"
