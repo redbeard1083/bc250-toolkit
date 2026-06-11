@@ -2980,16 +2980,28 @@ run_install_emudeck() {
     sudo -u "$REAL_USER" bash -c 'curl -L https://raw.githubusercontent.com/dragoonDorise/EmuDeck/main/install.sh | bash'
 }
 
+run_install_protonup_qt() {
+    print_section "Install ProtonUp-Qt"
+    print_info "Installing ProtonUp-Qt as $REAL_USER via paru..."
+    echo ""
+    if sudo -u "$REAL_USER" paru -S --noconfirm protonup-qt; then
+        print_success "ProtonUp-Qt installed successfully."
+    else
+        print_error "Installation failed. Make sure paru is installed and try again."
+    fi
+}
+
 show_experimental_menu() {
     print_banner
     print_section "Additional Tools"
     echo -e "  ${DIM}Additional system utilities and hardware support.${RESET}\n"
-    print_item  "1"  "Toggle Boot Mode"  "Switch between Game Mode & Desktop"
-    print_item  "2"  "DolphinBar Setup"  "Install udev rules for Wiimote support via DolphinBar"
-    print_item  "3"  "Install Decky"     "Install the Decky plugin loader"
-    print_item  "4"  "Install EmuDeck"   "Install the EmuDeck emulation suite"
+    print_item  "1"  "Toggle Boot Mode"   "Switch between Game Mode & Desktop"
+    print_item  "2"  "DolphinBar Setup"   "Install udev rules for Wiimote support via DolphinBar"
+    print_item  "3"  "Install Decky"      "Install the Decky plugin loader"
+    print_item  "4"  "Install EmuDeck"    "Install the EmuDeck emulation suite"
+    print_item  "5"  "Install ProtonUp-Qt" "Manage Proton and Wine versions"
     echo ""
-    print_item  "0"  "Back"             "Return to main menu"
+    print_item  "0"  "Back"              "Return to main menu"
     echo ""
     echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
 }
@@ -3000,10 +3012,11 @@ run_experimental_menu() {
         read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" exp_choice
 
         case "${exp_choice^^}" in
-            1) run_toggle_boot_mode;   press_enter ;;
-            2) run_dolphinbar_udev;    press_enter ;;
-            3) run_install_decky;      press_enter ;;
-            4) run_install_emudeck;    press_enter ;;
+            1) run_toggle_boot_mode;      press_enter ;;
+            2) run_dolphinbar_udev;       press_enter ;;
+            3) run_install_decky;         press_enter ;;
+            4) run_install_emudeck;       press_enter ;;
+            5) run_install_protonup_qt;   press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$exp_choice'"
