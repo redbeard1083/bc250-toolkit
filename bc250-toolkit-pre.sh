@@ -2933,10 +2933,27 @@ run_revert_menu() {
 run_update_toolkit() {
     local target
     target="$(readlink -f "$0")"
-    local url="https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main/bc250-toolkit.sh"
+    local base_url="https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main"
 
     print_section "Update Toolkit"
-    print_info "Downloading latest version from GitHub..."
+    echo ""
+    print_item "1" "Stable"      "bc250-toolkit.sh"
+    print_item "2" "Pre-Release" "bc250-toolkit-pre.sh  (may contain bugs)"
+    echo ""
+    print_item "0" "Cancel" ""
+    echo ""
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Select version:${RESET} ")" ver_choice
+
+    local url
+    case "$ver_choice" in
+        1) url="$base_url/bc250-toolkit.sh" ;;
+        2) url="$base_url/bc250-toolkit-pre.sh" ;;
+        0) print_info "Cancelled."; return 0 ;;
+        *) print_error "Invalid selection."; return 1 ;;
+    esac
+
+    echo ""
+    print_info "Downloading from GitHub..."
 
     if ! curl -sSL \
         -H "Cache-Control: no-cache" \
