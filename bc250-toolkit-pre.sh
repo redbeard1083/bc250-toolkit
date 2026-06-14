@@ -285,14 +285,14 @@ run_enable_swap() {
     fi
 
     # Prompt for swappiness
-    read -rp "$(echo -e "  ${BOLD}${WHITE}Swappiness value (default: 180):${RESET} ")" swappiness_input
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Swappiness value (default: 60):${RESET} ")" swappiness_input
     if [[ -z "$swappiness_input" ]]; then
-        swappiness="180"
+        swappiness="60"
     elif [[ "$swappiness_input" =~ ^[0-9]+$ ]]; then
         swappiness="$swappiness_input"
     else
-        print_error "Invalid swappiness '$swappiness_input' — must be a number. Using default 180."
-        swappiness="180"
+        print_error "Invalid swappiness '$swappiness_input' — must be a number. Using default 60."
+        swappiness="60"
     fi
 
     echo ""
