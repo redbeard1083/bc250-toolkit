@@ -1227,10 +1227,16 @@ oc_edit_cpu_config_kate() {
         return 1
     fi
 
-    print_info "Launching Kate as $REAL_USER..."
-    sudo -u "$REAL_USER" kate "$CPU_DEST" &>/dev/null &
+    print_info "Temporarily granting $REAL_USER access to $CPU_DEST..."
+    chown "$REAL_USER" "$CPU_DEST"
 
-    print_success "Kate opened. Make your changes and save the file."
+    print_info "Launching Kate as $REAL_USER — waiting for Kate to close..."
+    sudo -u "$REAL_USER" kate "$CPU_DEST" &>/dev/null
+
+    print_info "Restoring root ownership of $CPU_DEST..."
+    chown root "$CPU_DEST"
+
+    print_success "Kate closed. Changes saved."
 
     if confirm "Would you like to restart the CPU service to apply manual changes?"; then
         install_cpu
@@ -1245,11 +1251,16 @@ oc_edit_gpu_config_kate() {
         return 1
     fi
 
-    print_info "Launching Kate as $REAL_USER..."
-    # Launching as the real user prevents permission issues and root-execution blocks
-    sudo -u "$REAL_USER" kate "$GPU_DEST" &>/dev/null &
+    print_info "Temporarily granting $REAL_USER access to $GPU_DEST..."
+    chown "$REAL_USER" "$GPU_DEST"
 
-    print_success "Kate opened. Make your changes and save the file."
+    print_info "Launching Kate as $REAL_USER — waiting for Kate to close..."
+    sudo -u "$REAL_USER" kate "$GPU_DEST" &>/dev/null
+
+    print_info "Restoring root ownership of $GPU_DEST..."
+    chown root "$GPU_DEST"
+
+    print_success "Kate closed. Changes saved."
 
     if confirm "Would you like to restart the GPU service to apply manual changes?"; then
         install_gpu
@@ -3057,13 +3068,13 @@ show_experimental_menu() {
     print_banner
     print_section "Additional Tools"
     echo -e "  ${DIM}Additional system utilities and hardware support.${RESET}\n"
-    print_item  "1"  "Toggle Boot Mode"   "Switch between Game Mode & Desktop"
-    print_item  "2"  "DolphinBar Setup"   "Install udev rules for Wiimote support via DolphinBar"
-    print_item  "3"  "Install Decky"      "Install the Decky plugin loader"
-    print_item  "4"  "Install EmuDeck"    "Install the EmuDeck emulation suite"
+    print_item  "1"  "Toggle Boot Mode"    "Switch between Game Mode & Desktop"
+    print_item  "2"  "DolphinBar Setup"    "Install udev rules for Wiimote support via DolphinBar"
+    print_item  "3"  "Install Decky"       "Install the Decky plugin loader"
+    print_item  "4"  "Install EmuDeck"     "Install the EmuDeck emulation suite"
     print_item  "5"  "Install ProtonUp-Qt" "Manage Proton and Wine versions"
     echo ""
-    print_item  "0"  "Back"              "Return to main menu"
+    print_item  "0"  "Back"               "Return to main menu"
     echo ""
     echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
 }
