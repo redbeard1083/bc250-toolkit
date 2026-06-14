@@ -497,7 +497,7 @@ EOF
 }
 
 run_switch_to_default_kernel() {
-    print_step "14" "Migrating to Default CachyOS Kernel"
+    print_step "01" "Migrating to Default CachyOS Kernel"
 
     # 1. Check if we are already on the standard kernel
     if pacman -Qq linux-cachyos &>/dev/null; then
