@@ -6,6 +6,131 @@
 
 set -euo pipefail
 
+# ==============================================================================
+# SERVICE MODE — must run before interactive code, sudo check, or UI setup
+# Invoked by the systemd boot service as: bc250-toolkit --yes apply-service
+# ==============================================================================
+if [[ "${1:-}" == "apply-service" ]] || [[ "${2:-}" == "apply-service" ]]; then
+    # Minimal color codes needed for cu_info/cu_warn output to journal
+    BOLD=""; DIM=""; RESET=""; RED=""; GREEN=""; YELLOW=""; CYAN=""; WHITE=""
+
+    CU_ASIC="${UMR_ASIC:-cyan_skillfish.gfx1013}"
+    CU_REG_CC="mmCC_GC_SHADER_ARRAY_CONFIG"
+    CU_REG_SPI="mmSPI_PG_ENABLE_STATIC_WGP_MASK"
+    CU_REG_RLC="mmRLC_PG_ALWAYS_ON_WGP_MASK"
+    CU_SERVICE_CONF="/etc/bc250-cu-live-manager.conf"
+    CU_WGP_FULL_MASK=0x1f
+    CU_UMR="${UMR:-}"
+    CU_UMR_INSTANCE="${UMR_INSTANCE:-}"
+    CU_UMR_INSTANCE_ARGS=()
+    CU_LAST_REG_PATH=""
+    CU_DRY_RUN=0
+    CU_DISCLAIMER_ACCEPTED=1
+
+    cu_info() { echo "  ✔  $*"; }
+    cu_warn() { echo "  ⚠  $*" >&2; }
+    cu_err()  { echo "  ✘  $*" >&2; }
+    cu_die()  { cu_err "$@"; exit 1; }
+
+    cu_parse_hex() {
+        awk '{for(i=NF;i>=1;i--){if($i~/^0x[0-9a-fA-F]+$/){print $i;exit}}}'
+    }
+    cu_umr_output_failed() {
+        printf '%s\n' "$1" | grep -Eqi '(\[ERROR\]|error|failed|invalid|unknown|cannot|no such)'
+    }
+    cu_reg_candidates() { printf '%s\n' "$1"; }
+    cu_hex_mask()   { printf '0x%02x' "$(( $1 & 31 ))"; }
+    cu_hex_to_dec() { printf '%d' "$(( $1 ))"; }
+    cu_row_coords() {
+        case "$1" in 0) printf '0 0';; 1) printf '0 1';; 2) printf '1 0';; 3) printf '1 1';; esac
+    }
+    cu_wgp_mask_cu_count() {
+        local mask="$1" wgp count=0
+        for wgp in 0 1 2 3 4; do
+            if [ $((mask & (1 << wgp))) -ne 0 ]; then count=$((count + 2)); fi
+        done
+        printf '%s\n' "$count"
+    }
+
+    # Find umr — prefer conf value, then search standard paths
+    _umr=""
+    [ -n "$CU_UMR" ] && [ -x "$CU_UMR" ] && _umr="$CU_UMR"
+    if [ -z "$_umr" ]; then
+        for _p in /usr/bin/umr /usr/local/bin/umr /opt/umr/build/src/app/umr; do
+            [ -x "$_p" ] && { _umr="$_p"; break; }
+        done
+    fi
+    [ -n "$_umr" ] || cu_die "umr not installed — cannot apply boot profile"
+    CU_UMR="$_umr"
+
+    # Set instance args
+    if [ -n "$CU_UMR_INSTANCE" ]; then
+        CU_UMR_INSTANCE_ARGS=(-i "$CU_UMR_INSTANCE")
+    fi
+
+    # Load saved masks from conf
+    _csv=""
+    [ -f "$CU_SERVICE_CONF" ] || cu_die "no boot profile found at $CU_SERVICE_CONF"
+    while IFS= read -r _line; do
+        case "$_line" in BC250_WGP_MASKS=*) _csv="${_line#BC250_WGP_MASKS=}"; break;; esac
+    done <"$CU_SERVICE_CONF"
+    [ -n "$_csv" ] || cu_die "BC250_WGP_MASKS not found in $CU_SERVICE_CONF"
+
+    IFS=',' read -ra _items <<<"$_csv"
+    [ "${#_items[@]}" -eq 4 ] || cu_die "invalid mask count in $CU_SERVICE_CONF"
+    declare -a service_masks=()
+    for _i in 0 1 2 3; do
+        _v=$(( ${_items[$_i]} ))
+        [ "$_v" -ge 0 ] && [ "$_v" -le 31 ] || cu_die "mask out of range: ${_items[$_i]}"
+        service_masks[$_i]="$_v"
+    done
+
+    # Verify ASIC is reachable
+    _out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -r "$CU_ASIC.$CU_REG_SPI" 2>&1 || true)"
+    _val="$(printf '%s\n' "$_out" | cu_parse_hex)"
+    [ -n "$_val" ] || cu_die "umr could not read $CU_ASIC.$CU_REG_SPI — GPU not ready"
+
+    # Apply masks
+    declare -a target_masks=("${service_masks[@]}")
+
+    cu_try_write_reg_global() {
+        local reg="$1" value="$2" candidate out
+        while IFS= read -r candidate; do
+            CU_LAST_REG_PATH="$CU_ASIC.$candidate"
+            out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -w "$CU_LAST_REG_PATH" "$value" 2>&1 || true)"
+            cu_umr_output_failed "$out" || return 0
+        done < <(cu_reg_candidates "$reg")
+        return 1
+    }
+    cu_write_reg_bank() {
+        local reg="$1" value="$2" se="$3" sh="$4" candidate out
+        while IFS= read -r candidate; do
+            CU_LAST_REG_PATH="$CU_ASIC.$candidate"
+            out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -w "$CU_LAST_REG_PATH" "$value" -b "$se" "$sh" 0xffffffff 2>&1 || true)"
+            cu_umr_output_failed "$out" || return 0
+        done < <(cu_reg_candidates "$reg")
+        cu_die "failed to write $reg=$value for SE$se SH$sh"
+    }
+
+    cu_try_write_reg_global "$CU_REG_CC" "0x0" || cu_warn "could not write global $CU_REG_CC"
+    _union=0
+    for _idx in 0 1 2 3; do
+        read -r _se _sh <<<"$(cu_row_coords "$_idx")"
+        cu_write_reg_bank "$CU_REG_CC" 0x0 "$_se" "$_sh"
+        cu_write_reg_bank "$CU_REG_SPI" "$(cu_hex_mask "${target_masks[$_idx]}")" "$_se" "$_sh"
+        _union=$((_union | target_masks[_idx]))
+    done
+    cu_try_write_reg_global "$CU_REG_RLC" "$(cu_hex_mask "$_union")" || \
+        cu_warn "could not write $CU_REG_RLC"
+
+    _total=0
+    for _idx in 0 1 2 3; do
+        _total=$((_total + $(cu_wgp_mask_cu_count "${target_masks[$_idx]}")))
+    done
+    cu_info "BC-250 boot profile applied: ${_total}/40 CUs active"
+    exit 0
+fi
+
 # Re-launch with sudo if not already root
 if [[ $EUID -ne 0 ]]; then
     exec sudo "$0" "$@"
@@ -146,27 +271,52 @@ run_gpu_governor() {
 
 run_enable_swap() {
     print_step "04" "Configuring Swap"
+
+    # Prompt for swap size
+    echo ""
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Swap size in GB (default: 16):${RESET} ")" swap_size_input
+    if [[ -z "$swap_size_input" ]]; then
+        swap_size="16"
+    elif [[ "$swap_size_input" =~ ^[0-9]+$ ]] && (( swap_size_input > 0 )); then
+        swap_size="$swap_size_input"
+    else
+        print_error "Invalid size '$swap_size_input' — must be a positive integer. Using default 16G."
+        swap_size="16"
+    fi
+
+    # Prompt for swappiness
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Swappiness value (default: 180):${RESET} ")" swappiness_input
+    if [[ -z "$swappiness_input" ]]; then
+        swappiness="180"
+    elif [[ "$swappiness_input" =~ ^[0-9]+$ ]]; then
+        swappiness="$swappiness_input"
+    else
+        print_error "Invalid swappiness '$swappiness_input' — must be a number. Using default 180."
+        swappiness="180"
+    fi
+
+    echo ""
     print_info "Disabling and removing existing swapfile..."
-    sudo swapoff /var/swap/swapfile 2>/dev/null || true
-    sudo rm -f /var/swap/swapfile 2>/dev/null || true
+    swapoff /var/swap/swapfile 2>/dev/null || true
+    rm -f /var/swap/swapfile 2>/dev/null || true
 
     print_info "Recreating Btrfs subvolume..."
-    sudo btrfs subvolume delete /var/swap 2>/dev/null || true
-    sudo btrfs subvolume create /var/swap
+    btrfs subvolume delete /var/swap 2>/dev/null || true
+    btrfs subvolume create /var/swap
 
-    print_info "Creating 16G swapfile..."
-    sudo btrfs filesystem mkswapfile --size 16G /var/swap/swapfile
+    print_info "Creating ${swap_size}G swapfile..."
+    btrfs filesystem mkswapfile --size "${swap_size}G" /var/swap/swapfile
 
     print_info "Updating /etc/fstab..."
-    sudo sed -i '/\/var\/swap\/swapfile/d' /etc/fstab
-    echo '/var/swap/swapfile none swap defaults,nofail 0 0' | sudo tee -a /etc/fstab > /dev/null
+    sed -i '/\/var\/swap\/swapfile/d' /etc/fstab
+    echo '/var/swap/swapfile none swap defaults,nofail 0 0' | tee -a /etc/fstab > /dev/null
 
-    print_info "Setting swappiness to 180..."
-    echo 'vm.swappiness = 180' | sudo tee /etc/sysctl.d/99-swappiness.conf > /dev/null
-    sudo sysctl vm.swappiness=180 > /dev/null
+    print_info "Setting swappiness to ${swappiness}..."
+    echo "vm.swappiness = ${swappiness}" | tee /etc/sysctl.d/99-swappiness.conf > /dev/null
+    sysctl vm.swappiness="${swappiness}" > /dev/null
 
     print_info "Enabling swapfile..."
-    sudo swapon /var/swap/swapfile
+    swapon /var/swap/swapfile
 
     print_success "Swap configured! Current swap:"
     echo ""
@@ -1069,6 +1219,24 @@ install_gpu() {
     fi
 }
 
+oc_edit_cpu_config_kate() {
+    print_step "07-E" "Opening CPU Config in Kate"
+
+    if [[ ! -f "$CPU_DEST" ]]; then
+        print_error "Configuration file not found at $CPU_DEST"
+        return 1
+    fi
+
+    print_info "Launching Kate as $REAL_USER..."
+    sudo -u "$REAL_USER" kate "$CPU_DEST" &>/dev/null &
+
+    print_success "Kate opened. Make your changes and save the file."
+
+    if confirm "Would you like to restart the CPU service to apply manual changes?"; then
+        install_cpu
+    fi
+}
+
 oc_edit_gpu_config_kate() {
     print_step "07-E" "Opening GPU Config in Kate"
 
@@ -1347,7 +1515,8 @@ run_overclock_menu() {
         done
         echo ""
         print_item "C" "Custom"            "Mix & match CPU and GPU profiles"
-        print_item "E" "Edit with Kate"    "Manually edit GPU config"
+        print_item "E" "Edit GPU Config"   "Manually edit GPU config with Kate"
+        print_item "F" "Edit CPU Config"   "Manually edit CPU config with Kate"
         print_item "0" "Back to Main Menu" ""
         echo ""
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
@@ -1356,6 +1525,7 @@ run_overclock_menu() {
         case "${oc_choice^^}" in
             C) oc_apply_custom;         press_enter ;;
             E) oc_edit_gpu_config_kate; press_enter ;;
+            F) oc_edit_cpu_config_kate; press_enter ;;
             0) return 0 ;;
             *)
                 if [[ "$oc_choice" =~ ^[0-9]+$ ]] && (( oc_choice >= 1 && oc_choice <= ${#PRESET_NAMES[@]} )); then
@@ -1578,6 +1748,44 @@ run_status() {
     echo -e "  ${CYAN}GPU Service${RESET}       ${gpu_color}${gpu_svc_state}${RESET}"
     echo ""
 
+    # --- Compute Units ---
+    echo -e "  ${BOLD}${YELLOW}Compute Units${RESET}"
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    if cu_find_umr; then
+        cu_select_umr_instance
+        local cu_total=0 cu_idx cu_se cu_sh cu_spi_hex cu_spi_val cu_wgp cu_bit
+        local -a cu_masks
+        if cu_select_asic 2>/dev/null; then
+            for cu_idx in 0 1 2 3; do
+                read -r cu_se cu_sh <<<"$(cu_row_coords "$cu_idx")"
+                cu_spi_hex="$(cu_read_reg_bank "$CU_REG_SPI" "$cu_se" "$cu_sh" 2>/dev/null || echo "0x0")"
+                cu_spi_val=$(( $(cu_hex_to_dec "$cu_spi_hex") & 31 ))
+                cu_masks[$cu_idx]=$cu_spi_val
+                for cu_wgp in 0 1 2 3 4; do
+                    cu_bit=$((1 << cu_wgp))
+                    if [ $((cu_spi_val & cu_bit)) -ne 0 ]; then
+                        cu_total=$((cu_total + 2))
+                    fi
+                done
+            done
+            local cu_color
+            if [ "$cu_total" -gt 24 ]; then
+                cu_color="$YELLOW"
+            else
+                cu_color="$GREEN"
+            fi
+            echo -e "  ${CYAN}Active CUs${RESET}        ${cu_color}${BOLD}${cu_total}/40${RESET}  ${DIM}(default 24, max 40)${RESET}"
+            if [ "$cu_total" -gt 24 ]; then
+                echo -e "  ${YELLOW}Additional compute units are unlocked — ensure adequate power and cooling${RESET}"
+            fi
+        else
+            echo -e "  ${CYAN}Active CUs${RESET}        ${DIM}unavailable (umr could not read registers)${RESET}"
+        fi
+    else
+        echo -e "  ${CYAN}Active CUs${RESET}        ${DIM}umr not installed${RESET}"
+    fi
+    echo ""
+
     # --- Memory / Swap ---
     echo -e "  ${BOLD}${YELLOW}Memory & Swap${RESET}"
     echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
@@ -1719,8 +1927,8 @@ run_revert_mitigations() {
 }
 
 run_all() {
-    print_step "★" "Running All Setup Tasks (2–7)"
-    echo -e "  ${DIM}This will run: CPU Governor, GPU Governor, Enable Swap,"
+    print_step "★" "Running All Setup Tasks (1–7)"
+    echo -e "  ${DIM}This will run: CachyOS Kernel, CPU Governor, GPU Governor, Enable Swap,"
     echo -e "  Disable ZRAM / Enable ZSWAP, Hide RDSEED Warning, and Disable Mitigations.${RESET}"
 
     if ! confirm "Proceed with all tasks?"; then
@@ -1733,6 +1941,7 @@ run_all() {
 
     # Define the list of tasks to run
     local tasks=(
+        run_switch_to_default_kernel
         run_cpu_governor
         run_gpu_governor
         run_enable_swap
@@ -1777,6 +1986,815 @@ run_all() {
     fi
 }
 # ==============================================================================
+# EXPERIMENTAL / DANGER ZONE — CU LIVE MANAGER
+# ==============================================================================
+#
+# Integrates bc250-cu-live-manager functionality with toolkit formatting.
+# Terminology mapping:
+#   WGP (Work Group Processor) → Compute Pair  (always 2 CUs)
+#   SE/SH rows                 → Row           (SE0.SH0 etc.)
+#   SPI dispatch               → Routing
+#   D+ / S+ / D!               → Default / Enabled / Blocked
+#   stock-dispatch             → Reset to Driver Default
+#   write-service-table        → Save Boot Profile
+#   apply-service              → Apply Saved Boot Profile
+# ==============================================================================
+
+CU_BC250_PCI_ID="13fe"
+CU_ASIC="${UMR_ASIC:-cyan_skillfish.gfx1013}"
+CU_REG_CC="mmCC_GC_SHADER_ARRAY_CONFIG"
+CU_REG_SPI="mmSPI_PG_ENABLE_STATIC_WGP_MASK"
+CU_REG_RLC="mmRLC_PG_ALWAYS_ON_WGP_MASK"
+CU_SERVICE_NAME="bc250-cu-live-manager.service"
+CU_SERVICE_PATH="/etc/systemd/system/$CU_SERVICE_NAME"
+CU_SERVICE_BIN="/usr/local/bin/bc250-cu-live-manager"
+CU_SERVICE_CONF="/etc/bc250-cu-live-manager.conf"
+CU_OLD_UDEV_RULE="/etc/udev/rules.d/99-bc250-cu-live-manager.rules"
+CU_LAST_REG_PATH=""
+CU_WGP_FULL_MASK=0x1f
+CU_UMR="${UMR:-}"
+CU_UMR_INSTANCE="${UMR_INSTANCE:-}"
+CU_UMR_INSTANCE_SOURCE="${UMR_INSTANCE:+env}"
+CU_DRY_RUN=0
+CU_FORCE=0
+CU_SERVICE_TABLE_PENDING=0
+CU_DISCLAIMER_ACCEPTED=0
+CU_UMR_INSTALL_OFFERED=0
+CU_UMR_INSTANCE_ARGS=()
+
+cu_info() { echo -e "  ${BOLD}${GREEN}✔${RESET}  $*"; }
+cu_warn() { echo -e "  ${BOLD}${YELLOW}⚠${RESET}  $*"; }
+cu_err()  { echo -e "  ${BOLD}${RED}✘${RESET}  $*" >&2; }
+cu_die()  { cu_err "$@"; return 1; }
+
+cu_hr() {
+    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+}
+
+cu_find_umr() {
+    local p
+    if [ -n "$CU_UMR" ] && [ -x "$CU_UMR" ]; then return 0; fi
+    for p in /usr/bin/umr /usr/local/bin/umr /opt/umr/build/src/app/umr; do
+        if [ -x "$p" ]; then CU_UMR="$p"; return 0; fi
+    done
+    return 1
+}
+
+cu_need_umr() {
+    cu_find_umr || cu_die "umr not found. Use 'Install umr' from this menu." || return 1
+    cu_select_umr_instance
+}
+
+cu_validate_umr_instance() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+cu_init_umr_instance_args() {
+    CU_UMR_INSTANCE_ARGS=()
+    if [ -n "$CU_UMR_INSTANCE" ]; then
+        CU_UMR_INSTANCE_ARGS=(-i "$CU_UMR_INSTANCE")
+    fi
+}
+
+cu_detect_umr_instance() {
+    local debug_root="/sys/kernel/debug/dri" line bdf dir inst
+    local -a seen=()
+    [ -d "$debug_root" ] || return 1
+    while IFS= read -r line; do
+        bdf="${line%% *}"
+        [ -n "$bdf" ] || continue
+        for dir in "$debug_root"/[0-9]*; do
+            [ -e "$dir/name" ] || continue
+            inst="${dir##*/}"
+            [[ "$inst" =~ ^[0-9]+$ ]] || continue
+            [ "$inst" -lt 128 ] || continue
+            if grep -Fqi "$bdf" "$dir/name" 2>/dev/null; then
+                printf '%s\n' "$inst"; return 0
+            fi
+        done
+    done < <(lspci -Dnn 2>/dev/null | grep -i '\[1002:13fe\]' || true)
+    for dir in "$debug_root"/[0-9]*; do
+        [ -e "$dir/name" ] || continue
+        inst="${dir##*/}"
+        [[ "$inst" =~ ^[0-9]+$ ]] || continue
+        [ "$inst" -lt 128 ] || continue
+        seen+=("$inst")
+    done
+    [ "${#seen[@]}" -eq 1 ] || return 1
+    printf '%s\n' "${seen[0]}"
+}
+
+cu_select_umr_instance() {
+    local detected
+    if [ -n "$CU_UMR_INSTANCE" ]; then
+        cu_validate_umr_instance "$CU_UMR_INSTANCE" || { cu_die "invalid UMR instance '$CU_UMR_INSTANCE'"; return 1; }
+        CU_UMR_INSTANCE_SOURCE="${CU_UMR_INSTANCE_SOURCE:-env}"
+        cu_init_umr_instance_args; return 0
+    fi
+    detected="$(cu_detect_umr_instance || true)"
+    if [ -n "$detected" ]; then
+        CU_UMR_INSTANCE="$detected"; CU_UMR_INSTANCE_SOURCE="auto"
+    else
+        CU_UMR_INSTANCE_SOURCE="default"
+    fi
+    cu_init_umr_instance_args
+}
+
+cu_umr_cmd_string() {
+    printf '%s' "$CU_UMR"
+    if [ -n "$CU_UMR_INSTANCE" ]; then printf ' -i %s' "$CU_UMR_INSTANCE"; fi
+}
+
+cu_check_bc250() {
+    if command -v lspci >/dev/null 2>&1 && lspci -nn 2>/dev/null | grep -qi "$CU_BC250_PCI_ID"; then
+        return 0
+    fi
+    cu_warn "BC-250 PCI ID 13fe was not detected by lspci."
+    return 1
+}
+
+cu_require_bc250_for_write() {
+    cu_check_bc250 && return 0
+    [ "$CU_FORCE" -eq 1 ] || { cu_die "refusing register writes on unknown hardware"; return 1; }
+    cu_warn "forcing register writes despite failed BC-250 PCI detection"
+}
+
+cu_parse_hex() {
+    awk '{for(i=NF;i>=1;i--){if($i~/^0x[0-9a-fA-F]+$/){print $i;exit}}}'
+}
+
+cu_umr_output_failed() {
+    printf '%s\n' "$1" | grep -Eqi '(\[ERROR\]|error|failed|invalid|unknown|cannot|no such)'
+}
+
+cu_reg_candidates() { printf '%s\n' "$1"; }
+
+cu_try_read_reg_bank() {
+    local reg="$1" se="$2" sh="$3" candidate out value
+    CU_LAST_REG_PATH=""
+    while IFS= read -r candidate; do
+        out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -r "$CU_ASIC.$candidate" -b "$se" "$sh" 0xffffffff 2>&1 || true)"
+        value="$(printf '%s\n' "$out" | cu_parse_hex)"
+        if [ -z "$value" ]; then
+            out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -r "$CU_ASIC.$candidate" -b "$se" "$sh" 2>&1 || true)"
+            value="$(printf '%s\n' "$out" | cu_parse_hex)"
+        fi
+        if [ -n "$value" ]; then
+            CU_LAST_REG_PATH="$CU_ASIC.$candidate"; printf '%s\n' "$value"; return 0
+        fi
+    done < <(cu_reg_candidates "$reg")
+    return 1
+}
+
+cu_read_reg_bank() {
+    local reg="$1" se="$2" sh="$3" value
+    if value="$(cu_try_read_reg_bank "$reg" "$se" "$sh")"; then
+        printf '%s\n' "$value"; return 0
+    fi
+    cu_die "failed to read $reg for SE$se SH$sh with umr"; return 1
+}
+
+cu_try_write_reg_global() {
+    local reg="$1" value="$2" candidate out
+    CU_LAST_REG_PATH=""
+    while IFS= read -r candidate; do
+        CU_LAST_REG_PATH="$CU_ASIC.$candidate"
+        if [ "$CU_DRY_RUN" -eq 1 ]; then
+            printf 'dry-run: %s -w %s %s\n' "$(cu_umr_cmd_string)" "$CU_LAST_REG_PATH" "$value"; return 0
+        fi
+        out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -w "$CU_LAST_REG_PATH" "$value" 2>&1 || true)"
+        cu_umr_output_failed "$out" || return 0
+    done < <(cu_reg_candidates "$reg")
+    return 1
+}
+
+cu_write_reg_bank() {
+    local reg="$1" value="$2" se="$3" sh="$4" candidate out
+    CU_LAST_REG_PATH=""
+    while IFS= read -r candidate; do
+        CU_LAST_REG_PATH="$CU_ASIC.$candidate"
+        if [ "$CU_DRY_RUN" -eq 1 ]; then
+            printf 'dry-run: %s -w %s %s -b %s %s 0xffffffff\n' \
+                "$(cu_umr_cmd_string)" "$CU_LAST_REG_PATH" "$value" "$se" "$sh"
+            return 0
+        fi
+        out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -w "$CU_LAST_REG_PATH" "$value" -b "$se" "$sh" 0xffffffff 2>&1 || true)"
+        cu_umr_output_failed "$out" || return 0
+    done < <(cu_reg_candidates "$reg")
+    cu_die "failed to write $reg=$value for SE$se SH$sh"; return 1
+}
+
+cu_hex_mask()       { printf '0x%02x' "$(( $1 & 31 ))"; }
+cu_hex_to_dec()     { printf '%d' "$(( $1 ))"; }
+
+cu_wgp_mask_cu_count() {
+    local mask="$1" wgp count=0
+    for wgp in 0 1 2 3 4; do
+        if [ $((mask & (1 << wgp))) -ne 0 ]; then count=$((count + 2)); fi
+    done
+    printf '%s\n' "$count"
+}
+
+cu_row_label() {
+    case "$1" in 0) printf 'SE0.SH0';; 1) printf 'SE0.SH1';; 2) printf 'SE1.SH0';; 3) printf 'SE1.SH1';; esac
+}
+
+cu_row_coords() {
+    case "$1" in 0) printf '0 0';; 1) printf '0 1';; 2) printf '1 0';; 3) printf '1 1';; esac
+}
+
+cu_read_spi_masks() {
+    local idx se sh spi_hex
+    for idx in 0 1 2 3; do
+        read -r se sh <<<"$(cu_row_coords "$idx")"
+        spi_hex="$(cu_read_reg_bank "$CU_REG_SPI" "$se" "$sh")"
+        masks[$idx]=$(( $(cu_hex_to_dec "$spi_hex") & 31 ))
+    done
+}
+
+cu_read_current_masks() {
+    local -a masks
+    cu_read_spi_masks
+    current_masks=("${masks[@]}")
+}
+
+cu_mask_csv() {
+    local -n ref="$1"
+    printf '%s,%s,%s,%s\n' \
+        "$(cu_hex_mask "${ref[0]}")" "$(cu_hex_mask "${ref[1]}")" \
+        "$(cu_hex_mask "${ref[2]}")" "$(cu_hex_mask "${ref[3]}")"
+}
+
+cu_mask_summary() {
+    local -n ref="$1"
+    printf '%s=%s %s=%s %s=%s %s=%s\n' \
+        "$(cu_row_label 0)" "$(cu_hex_mask "${ref[0]}")" \
+        "$(cu_row_label 1)" "$(cu_hex_mask "${ref[1]}")" \
+        "$(cu_row_label 2)" "$(cu_hex_mask "${ref[2]}")" \
+        "$(cu_row_label 3)" "$(cu_hex_mask "${ref[3]}")"
+}
+
+cu_mask_tokens() {
+    local mask="$1" driver_mask="${2:-0}" wgp bit token out=""
+    for wgp in 0 1 2 3 4; do
+        bit=$((1 << wgp))
+        if   [ $((driver_mask & bit)) -ne 0 ] && [ $((mask & bit)) -ne 0 ]; then token="Default"
+        elif [ $((driver_mask & bit)) -ne 0 ];                               then token="Blocked"
+        elif [ $((mask & bit)) -ne 0 ];                                      then token="Enabled"
+        else                                                                       token="Disabled"
+        fi
+        out="${out}${out:+ }$token"
+    done
+    printf '%s\n' "$out"
+}
+
+cu_mask_change_label() {
+    local old="$1" new="$2" wgp bit out=""
+    for wgp in 0 1 2 3 4; do
+        bit=$((1 << wgp))
+        if   [ $((old & bit)) -eq 0 ] && [ $((new & bit)) -ne 0 ]; then out="${out}${out:+,}P${wgp}+"
+        elif [ $((old & bit)) -ne 0 ] && [ $((new & bit)) -eq 0 ]; then out="${out}${out:+,}P${wgp}-"
+        fi
+    done
+    printf '%s\n' "${out:-none}"
+}
+
+cu_dispatch_total() {
+    local idx total=0
+    for idx in 0 1 2 3; do
+        total=$((total + $(cu_wgp_mask_cu_count "${target_masks[$idx]}")))
+    done
+    printf '%s\n' "$total"
+}
+
+cu_load_service_masks() {
+    local line csv item idx value
+    local -a _items
+    service_masks=()
+    [ -f "$CU_SERVICE_CONF" ] || return 1
+    while IFS= read -r line; do
+        case "$line" in BC250_WGP_MASKS=*) csv="${line#BC250_WGP_MASKS=}"; break;; esac
+    done <"$CU_SERVICE_CONF"
+    [ -n "${csv:-}" ] || return 1
+    IFS=',' read -ra _items <<<"$csv"
+    [ "${#_items[@]}" -eq 4 ] || return 1
+    for idx in 0 1 2 3; do
+        item="${_items[$idx]}"
+        [[ "$item" =~ ^(0x[0-9a-fA-F]+|[0-9]+)$ ]] || return 1
+        value=$((item))
+        [ "$value" -ge 0 ] && [ "$value" -le 31 ] || return 1
+        service_masks[$idx]="$value"
+    done
+    return 0
+}
+
+cu_service_masks_match_current() {
+    local idx
+    [ "${#service_masks[@]}" -eq 4 ] || return 1
+    [ "${#current_masks[@]}" -eq 4 ] || return 1
+    for idx in 0 1 2 3; do
+        [ "$((service_masks[idx] & 31))" -eq "$((current_masks[idx] & 31))" ] || return 1
+    done
+    return 0
+}
+
+cu_read_driver_wgp_masks() {
+    local line idx mask
+    local -a out=()
+    while IFS= read -r line; do out+=("$line"); done < <(python3 <<'PYEOF'
+import ctypes, os, struct, sys
+def open_render_node():
+    candidates = ["/dev/dri/renderD128"]
+    dri = "/dev/dri"
+    if os.path.isdir(dri):
+        for name in sorted(os.listdir(dri)):
+            if name.startswith("renderD"):
+                path = os.path.join(dri, name)
+                if path not in candidates:
+                    candidates.append(path)
+    last = None
+    for path in candidates:
+        try: return os.open(path, os.O_RDWR)
+        except OSError as exc: last = exc
+    raise RuntimeError(f"no DRM render node could be opened: {last}")
+try:
+    libdrm = ctypes.CDLL("libdrm_amdgpu.so.1")
+    fd = open_render_node()
+    dev = ctypes.c_void_p()
+    maj, min_ = ctypes.c_uint32(), ctypes.c_uint32()
+    rc = libdrm.amdgpu_device_initialize(fd, ctypes.byref(maj), ctypes.byref(min_), ctypes.byref(dev))
+    if rc != 0: raise RuntimeError(f"amdgpu_device_initialize failed: {rc}")
+    buf = (ctypes.c_uint8 * 1024)()
+    rc = libdrm.amdgpu_query_info(dev, 0x16, 1024, ctypes.byref(buf))
+    if rc != 0: raise RuntimeError(f"amdgpu_query_info(CU_INFO) failed: {rc}")
+    raw = bytes(buf)
+    num_se = struct.unpack_from("<I", raw, 20)[0]
+    num_sh = struct.unpack_from("<I", raw, 24)[0]
+    rows = []
+    for se in range(min(num_se, 2)):
+        for sh in range(min(num_sh, 2)):
+            bm = struct.unpack_from("<I", raw, 56 + (se * 4 + sh) * 4)[0]
+            wgp_mask = 0
+            for wgp in range(5):
+                if bm & (0x3 << (wgp * 2)): wgp_mask |= 1 << wgp
+            rows.append((se * 2 + sh, wgp_mask))
+    for idx, mask in rows: print(f"{idx} {mask}")
+except Exception: sys.exit(1)
+finally:
+    try:
+        if 'dev' in locals() and dev: libdrm.amdgpu_device_deinitialize(dev)
+    except Exception: pass
+    try:
+        if 'fd' in locals() and fd >= 0: os.close(fd)
+    except Exception: pass
+PYEOF
+    )
+    [ "${#out[@]}" -gt 0 ] || return 1
+    for idx in 0 1 2 3; do driver_masks[$idx]=0; done
+    for line in "${out[@]}"; do
+        read -r idx mask <<<"$line"
+        [[ "$idx" =~ ^[0-3]$ ]] || continue
+        driver_masks[$idx]="$mask"
+    done
+    return 0
+}
+
+cu_select_asic() {
+    local out value
+    out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -r "$CU_ASIC.$CU_REG_SPI" 2>&1 || true)"
+    value="$(printf '%s\n' "$out" | cu_parse_hex)"
+    [ -n "$value" ] || { cu_die "failed to read $CU_ASIC.$CU_REG_SPI with umr"; return 1; }
+}
+
+cu_apply_target_masks() {
+    local idx se sh union=0
+    if ! cu_try_write_reg_global "$CU_REG_CC" "0x0"; then
+        cu_warn "could not write global $CU_REG_CC; trying per-row CC clears"
+    fi
+    for idx in 0 1 2 3; do
+        read -r se sh <<<"$(cu_row_coords "$idx")"
+        cu_write_reg_bank "$CU_REG_CC" 0x0 "$se" "$sh"
+        cu_write_reg_bank "$CU_REG_SPI" "$(cu_hex_mask "${target_masks[$idx]}")" "$se" "$sh"
+        union=$((union | target_masks[idx]))
+    done
+    if ! cu_try_write_reg_global "$CU_REG_RLC" "$(cu_hex_mask "$union")"; then
+        cu_warn "could not write $CU_REG_RLC; continuing with routing masks applied"
+    fi
+    cu_info "Compute pair routing updated ($(cu_dispatch_total)/40 CUs active)"
+}
+
+cu_confirm_dispatch_plan() {
+    local title="$1" idx ans current target driver
+    [ "$CU_DISCLAIMER_ACCEPTED" -eq 1 ] || return 1
+    echo ""
+    print_section "$title"
+    echo -e "  ${DIM}Legend: Default = driver default CUs, Enabled = additionally unlocked, Disabled = not active, Blocked = driver conflict${RESET}\n"
+    printf "  %-9s %-30s %-30s %-20s\n" "Row" "Current" "Target" "Change"
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────────────${RESET}"
+    for idx in 0 1 2 3; do
+        current="${current_masks[$idx]}"
+        target="${target_masks[$idx]}"
+        driver="${driver_masks[$idx]:-0}"
+        printf "  %-9s %-30s %-30s %-20s\n" \
+            "$(cu_row_label "$idx")" \
+            "$(cu_mask_tokens "$current" "$driver")" \
+            "$(cu_mask_tokens "$target" "$driver")" \
+            "$(cu_mask_change_label "$current" "$target")"
+    done
+    echo ""
+    echo -e "  ${BOLD}${WHITE}Target total: $(cu_dispatch_total)/40 CUs${RESET}"
+    echo ""
+    if ! confirm "Apply these changes?"; then
+        print_info "Cancelled."; return 1
+    fi
+}
+
+cu_module_status() {
+    local mode enum
+    mode="$(cat /sys/module/amdgpu/parameters/bc250_cc_write_mode 2>/dev/null || true)"
+    enum="$(dmesg 2>/dev/null | grep -o 'active_cu_number [0-9]*' | tail -1 | awk '{print $2}' || true)"
+    printf "  %-14s: bc250_cc_write_mode=%s, active_cu_number=%s\n" \
+        "amdgpu" "${mode:-not exposed}" "${enum:-unknown}"
+}
+
+cu_live_table_header() {
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────────────${RESET}"
+    printf "  %-9s %-8s %-8s %-8s %-8s %-8s %-8s %-12s %-8s\n" \
+        "Row" "Pair0" "Pair1" "Pair2" "Pair3" "Pair4" "Routing" "CC Reg" "CUs"
+    printf "  %-9s %-8s %-8s %-8s %-8s %-8s\n" \
+        "" "CU0-1" "CU2-3" "CU4-5" "CU6-7" "CU8-9"
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────────────${RESET}"
+}
+
+cu_live_cell() {
+    local spi_on="$1" driver_on="${2:-0}"
+    if   [ "$driver_on" -ne 0 ] && [ "$spi_on" -ne 0 ]; then printf "${GREEN}${BOLD}Default  ${RESET}"
+    elif [ "$driver_on" -ne 0 ];                          then printf "${RED}${BOLD}Blocked  ${RESET}"
+    elif [ "$spi_on" -ne 0 ];                             then printf "${CYAN}Enabled  ${RESET}"
+    else                                                       printf "${DIM}Disabled ${RESET}"
+    fi
+}
+
+cu_register_status() {
+    cu_need_umr || return 1
+    cu_select_asic || return 1
+    cu_check_bc250 || true
+    local total=0 driver_total=0 blocked_total=0 se sh spi cc_hex count idx wgp bit driver_mask spi_on driver_on
+    local -a driver_masks current_masks service_masks
+    local driver_ok=0 service_has_config=0
+    CU_SERVICE_TABLE_PENDING=0
+    if cu_read_driver_wgp_masks; then driver_ok=1; fi
+    cu_read_current_masks
+    if cu_load_service_masks; then
+        service_has_config=1
+        cu_service_masks_match_current || CU_SERVICE_TABLE_PENDING=1
+    elif [ -f "$CU_SERVICE_PATH" ]; then
+        CU_SERVICE_TABLE_PENDING=1
+    fi
+    echo ""
+    print_section "CU Live Status"
+    printf "  %-14s: %s\n" "umr" "$CU_UMR"
+    if [ -n "$CU_UMR_INSTANCE" ]; then
+        printf "  %-14s: %s (%s)\n" "UMR instance" "$CU_UMR_INSTANCE" "$CU_UMR_INSTANCE_SOURCE"
+    else
+        printf "  %-14s: default (0)\n" "UMR instance"
+    fi
+    printf "  %-14s: %s\n" "ASIC" "$CU_ASIC"
+    cu_module_status
+    if command -v systemctl >/dev/null 2>&1 && [ -f "$CU_SERVICE_PATH" ]; then
+        printf "  %-14s: %s\n" "Boot service" "$(systemctl is-enabled "$CU_SERVICE_NAME" 2>/dev/null || printf 'installed')"
+        if [ "$CU_SERVICE_TABLE_PENDING" -eq 1 ]; then
+            echo -e "  ${BOLD}${YELLOW}⚠  Boot profile pending — use 'Save Boot Profile' to sync${RESET}"
+        elif [ "$service_has_config" -eq 1 ]; then
+            printf "  %-14s: current table saved\n" "Boot profile"
+        else
+            echo -e "  ${BOLD}${YELLOW}⚠  No boot profile saved yet — use 'Save Boot Profile'${RESET}"
+        fi
+    fi
+    echo ""
+    if [ "$driver_ok" -eq 1 ]; then
+        echo -e "  ${GREEN}${BOLD}Default${RESET}  = driver default CUs   ${CYAN}Enabled${RESET}  = additionally unlocked CUs   ${DIM}Disabled${RESET}  = not active   ${RED}${BOLD}Blocked${RESET} = driver conflict"
+    else
+        echo -e "  ${CYAN}Enabled${RESET}  = routing active   ${DIM}Disabled${RESET}  = not active   ${YELLOW}(driver lock state unavailable)${RESET}"
+    fi
+    echo ""
+    cu_live_table_header
+    for se in 0 1; do
+        for sh in 0 1; do
+            idx=$((se * 2 + sh))
+            cc_hex="$(cu_read_reg_bank "$CU_REG_CC" "$se" "$sh")"
+            spi="${current_masks[$idx]}"
+            driver_mask="${driver_masks[$idx]:-0}"
+            count=0
+            printf "  %-9s " "SE${se}.SH${sh}"
+            for wgp in 0 1 2 3 4; do
+                bit=$((1 << wgp))
+                spi_on=0; driver_on=0
+                if [ $((spi & bit)) -ne 0 ]; then spi_on=1; count=$((count + 2)); fi
+                if [ "$driver_ok" -eq 1 ] && [ $((driver_mask & bit)) -ne 0 ]; then
+                    driver_on=1; driver_total=$((driver_total + 2))
+                fi
+                if [ "$driver_on" -ne 0 ] && [ "$spi_on" -eq 0 ]; then blocked_total=$((blocked_total + 2)); fi
+                cu_live_cell "$spi_on" "$driver_on"
+            done
+            total=$((total + count))
+            printf "${DIM}%s${RESET}  %s  %3s/10 CUs\n" "$(cu_hex_mask "$spi")" "$cc_hex" "$count"
+        done
+    done
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────────────${RESET}"
+    echo ""
+    echo -e "  ${BOLD}${WHITE}Routing total : ${total}/40 CUs${RESET}"
+    [ "$service_has_config" -eq 1 ] && printf "  %-14s: %s\n" "Boot profile" "$(cu_mask_summary service_masks)"
+    if [ "$driver_ok" -eq 1 ]; then
+        echo -e "  ${BOLD}Driver lock   : ${driver_total}/40 CUs active — default pairs cannot be disabled live${RESET}"
+        if [ "$blocked_total" -gt 0 ]; then
+            cu_warn "${blocked_total} driver-active CUs are not routed (shown as Blocked)"
+        fi
+    else
+        cu_warn "driver lock state unavailable — disabling routing will be refused"
+    fi
+}
+
+cu_draw_table_editor() {
+    local cursor_row="$1" cursor_wgp="$2" idx wgp bit cell style endstyle driver_on
+    clear
+    print_banner
+    print_section "Edit Compute Pair Routing"
+    echo -e "  ${DIM}Arrows/hjkl${RESET} move   ${DIM}Space${RESET} toggle   ${DIM}Enter/a${RESET} apply   ${DIM}q${RESET} cancel\n"
+    echo -e "  ${GREEN}${BOLD}Default${RESET} = driver default CUs (locked)   ${CYAN}Enabled${RESET} = additionally unlocked   ${DIM}Disabled${RESET} = not active\n"
+    printf "  %-9s %-8s %-8s %-8s %-8s %-8s\n" "Row" "Pair0" "Pair1" "Pair2" "Pair3" "Pair4"
+    printf "  %-9s %-8s %-8s %-8s %-8s %-8s\n" "" "CU0-1" "CU2-3" "CU4-5" "CU6-7" "CU8-9"
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    for idx in 0 1 2 3; do
+        printf "  %-9s" "$(cu_row_label "$idx")"
+        for wgp in 0 1 2 3 4; do
+            bit=$((1 << wgp))
+            driver_on=0
+            if [ "${driver_lock_ok:-0}" -eq 1 ] && [ $((driver_masks[idx] & bit)) -ne 0 ]; then driver_on=1; fi
+            if [ $((masks[idx] & bit)) -ne 0 ]; then
+                if [ "$driver_on" -eq 1 ]; then cell="Default  "; style="${GREEN}${BOLD}"
+                else                            cell="Enabled  "; style="${CYAN}"
+                fi
+            else
+                cell="Disabled "; style="${DIM}"
+            fi
+            endstyle="${RESET}"
+            if [ "$idx" -eq "$cursor_row" ] && [ "$wgp" -eq "$cursor_wgp" ]; then
+                style="${BOLD}${YELLOW}"; cell="[${cell:0:6}]"
+                endstyle="${RESET}"
+            fi
+            printf "${style}%-8s${endstyle}" "${cell:0:8}"
+        done
+        printf "\n"
+    done
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+}
+
+cu_table_editor() {
+    cu_need_umr || return 1
+    cu_select_asic || return 1
+    local -a masks driver_masks
+    local driver_lock_ok=0
+    local row=0 wgp=0 key rest bit
+    cu_read_spi_masks
+    cu_read_driver_wgp_masks && driver_lock_ok=1
+    while true; do
+        cu_draw_table_editor "$row" "$wgp"
+        IFS= read -rsn1 key || return 0
+        case "$key" in
+            $'\x1b')
+                IFS= read -rsn2 -t 0.1 rest || rest=""
+                case "$rest" in
+                    '[A') row=$((row > 0 ? row - 1 : 3)) ;;
+                    '[B') row=$((row < 3 ? row + 1 : 0)) ;;
+                    '[C') wgp=$((wgp < 4 ? wgp + 1 : 0)) ;;
+                    '[D') wgp=$((wgp > 0 ? wgp - 1 : 4)) ;;
+                esac ;;
+            h|H) wgp=$((wgp > 0 ? wgp - 1 : 4)) ;;
+            l|L) wgp=$((wgp < 4 ? wgp + 1 : 0)) ;;
+            k|K) row=$((row > 0 ? row - 1 : 3)) ;;
+            j|J) row=$((row < 3 ? row + 1 : 0)) ;;
+            ' ')
+                bit=$((1 << wgp))
+                if [ "$driver_lock_ok" -ne 1 ]; then
+                    cu_warn "driver topology unavailable — toggles are locked"; sleep 1
+                elif [ $((driver_masks[row] & bit)) -ne 0 ] && [ $((masks[row] & bit)) -ne 0 ]; then
+                    cu_warn "$(cu_row_label "$row") Pair${wgp} is a Default (driver-locked) CU and cannot be disabled live"; sleep 1
+                else
+                    masks[$row]=$((masks[row] ^ bit))
+                fi ;;
+            ''|$'\n'|$'\r'|a|A)
+                local -a target_masks current_masks driver_masks_confirm
+                cu_read_current_masks
+                target_masks=("${masks[@]}")
+                cu_read_driver_wgp_masks && driver_masks_confirm=("${driver_masks[@]}") || driver_masks_confirm=(0 0 0 0)
+                driver_masks=("${driver_masks_confirm[@]}")
+                cu_apply_target_masks
+                press_enter; return 0 ;;
+            q|Q) return 0 ;;
+        esac
+    done
+}
+
+cu_enable_all() {
+    cu_need_umr || return 1
+    cu_select_asic || return 1
+    cu_require_bc250_for_write || return 1
+    local -a current_masks target_masks driver_masks
+    cu_read_current_masks
+    cu_read_driver_wgp_masks || true
+    target_masks=("$CU_WGP_FULL_MASK" "$CU_WGP_FULL_MASK" "$CU_WGP_FULL_MASK" "$CU_WGP_FULL_MASK")
+    cu_confirm_dispatch_plan "Enable All Compute Pairs" || return 0
+    cu_apply_target_masks
+}
+
+cu_stock_dispatch() {
+    cu_need_umr || return 1
+    cu_select_asic || return 1
+    cu_require_bc250_for_write || return 1
+    local -a current_masks target_masks driver_masks
+    cu_read_driver_wgp_masks || { cu_die "driver topology unavailable; cannot restore driver default"; return 1; }
+    cu_read_current_masks
+    target_masks=("${driver_masks[@]}")
+    cu_confirm_dispatch_plan "Reset to Driver Default" || return 0
+    cu_apply_target_masks
+}
+
+cu_write_service_table() {
+    cu_need_umr || return 1
+    cu_select_asic || return 1
+    cu_require_bc250_for_write || return 1
+    local -a current_masks
+    cu_read_current_masks
+    if ! confirm "Save current compute pair routing as the boot profile?"; then
+        print_info "Cancelled."; return 0
+    fi
+    cat > "$CU_SERVICE_CONF" <<EOF
+# BC-250 live manager boot profile.
+# Generated by bc250-toolkit on $(date -Iseconds).
+# Format: SE0.SH0,SE0.SH1,SE1.SH0,SE1.SH1 SPI routing masks.
+BC250_WGP_MASKS=$(cu_mask_csv current_masks)
+UMR_ASIC=$CU_ASIC
+UMR_INSTANCE=$CU_UMR_INSTANCE
+UMR=$CU_UMR
+EOF
+    chmod 0644 "$CU_SERVICE_CONF"
+    cu_info "Boot profile saved: $(cu_mask_summary current_masks)"
+}
+
+cu_install_service() {
+    cu_need_umr || return 1
+    if ! confirm "Install/update the boot service to apply saved routing on startup?"; then
+        print_info "Cancelled."; return 0
+    fi
+    local source_path
+    source_path="$(readlink -f "$0")"
+    if ! install -m 0755 "$source_path" "$CU_SERVICE_BIN"; then
+        if [ -d /var/usrlocal/bin ]; then
+            CU_SERVICE_BIN="/var/usrlocal/bin/bc250-cu-live-manager"
+            install -m 0755 "$source_path" "$CU_SERVICE_BIN"
+        else
+            cu_die "failed to install service binary at $CU_SERVICE_BIN"; return 1
+        fi
+    fi
+    cat > "$CU_SERVICE_PATH" <<EOF
+[Unit]
+Description=BC-250 CU saved enumeration and dispatch
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-$CU_SERVICE_CONF
+ExecStartPre=/usr/bin/bash -c 'for _ in {1..30}; do compgen -G "/dev/dri/renderD*" >/dev/null && exit 0; sleep 1; done; exit 1'
+ExecStart=$CU_SERVICE_BIN --yes apply-service
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    rm -f "$CU_OLD_UDEV_RULE"
+    systemctl daemon-reload
+    systemctl enable "$CU_SERVICE_NAME"
+    if [ -f "$CU_SERVICE_CONF" ]; then
+        cu_info "Boot service installed and enabled"
+        cu_info "Saved boot profile will be applied on next boot"
+    else
+        cu_info "Boot service installed and enabled"
+        cu_warn "No boot profile saved yet — use 'Save Boot Profile' before rebooting"
+    fi
+}
+
+cu_uninstall_service() {
+    if ! confirm "Remove the boot service and all saved profiles?"; then
+        print_info "Cancelled."; return 0
+    fi
+    systemctl disable --now "$CU_SERVICE_NAME" >/dev/null 2>&1 || true
+    rm -f "$CU_SERVICE_PATH" "$CU_SERVICE_BIN" "/var/usrlocal/bin/bc250-cu-live-manager" \
+          "$CU_SERVICE_CONF" "$CU_OLD_UDEV_RULE"
+    systemctl daemon-reload
+    cu_info "Boot service removed"
+}
+
+cu_install_umr() {
+    if command -v pacman >/dev/null 2>&1 && pacman -Qi umr >/dev/null 2>&1; then
+        cu_info "umr is already installed."; return 0
+    fi
+    if command -v pacman >/dev/null 2>&1 && pacman -Si umr >/dev/null 2>&1; then
+        cu_info "Installing umr with pacman..."; pacman -S --needed umr; return 0
+    fi
+    if command -v paru >/dev/null 2>&1; then
+        [ -n "$REAL_USER" ] || { cu_die "paru install needs SUDO_USER set"; return 1; }
+        cu_info "Installing umr with paru as $REAL_USER..."
+        sudo -u "$REAL_USER" paru -S --needed umr; return 0
+    fi
+    if command -v rpm-ostree >/dev/null 2>&1; then
+        cu_warn "rpm-ostree layering is host-level and may affect immutable system upgrades."
+        cu_info "Installing umr with rpm-ostree (reboot required)..."
+        rpm-ostree install umr && { cu_info "umr staged. Reboot then return here."; return 0; }
+        cu_die "rpm-ostree could not install umr"; return 1
+    fi
+    if command -v dnf >/dev/null 2>&1; then
+        cu_info "Installing umr with dnf..."
+        dnf install -y umr && return 0
+        cu_die "dnf could not install umr"; return 1
+    fi
+    cu_die "could not install umr automatically — install with pacman/paru/rpm-ostree/dnf first"
+}
+
+dz_warn() {
+    echo ""
+    echo -e "  ${BOLD}${RED}⚠  EXPERIMENTAL / DANGER ZONE${RESET}"
+    echo ""
+    echo -e "  ${WHITE}This section gives direct access to low-level GPU hardware registers."
+    echo -e "  Writing incorrect values can freeze the GPU, crash the system, or"
+    echo -e "  force a hard reboot — causing loss of unsaved work."
+    echo ""
+    echo -e "  Enabling additional compute units significantly increases power draw."
+    echo -e "  Ensure your PSU, cabling, and cooling can handle the load before"
+    echo -e "  making changes. The 8-pin connector and wiring are particularly"
+    echo -e "  vulnerable to overload damage."
+    echo ""
+    echo -e "  You are fully responsible for any outcomes.${RESET}"
+    echo ""
+    echo -e "  ${DIM}Type ${RESET}${BOLD}${YELLOW}unlock${RESET}${DIM} to acknowledge and enter, or press Enter to go back.${RESET}"
+    echo ""
+    read -rp "  → " dz_ack
+    if [[ "${dz_ack,,}" == "unlock" ]]; then
+        CU_DISCLAIMER_ACCEPTED=1
+        return 0
+    else
+        print_info "Returning to main menu."
+        return 1
+    fi
+}
+
+show_danger_zone_menu() {
+    print_banner
+    print_section "⚠  Experimental/Danger Zone — Compute Units Unlock"
+    echo -e "  ${DIM}Direct hardware register access. Read the status dashboard before making changes.${RESET}\n"
+    print_section "Prerequisites"
+    print_item  "1"  "Install umr"               ""
+    echo ""
+    print_section "Compute Unit Management"
+    print_item  "2"  "CU Status Dashboard"        ""
+    print_item  "3"  "Edit Compute Pairs"         ""
+    print_item  "4"  "Enable All Compute Pairs"   ""
+    print_item  "5"  "Reset to Driver Default"    ""
+    echo ""
+    print_section "Boot Persistence"
+    print_item  "6"  "Save Boot Profile"          ""
+    print_item  "7"  "Install Boot Service"       ""
+    print_item  "8"  "Uninstall Boot Service"     ""
+    echo ""
+    print_item  "0"  "Back"                       ""
+    echo ""
+    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_danger_zone_menu() {
+    dz_warn || return 0
+    while true; do
+        show_danger_zone_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" dz_choice
+
+        case "${dz_choice^^}" in
+            1) cu_install_umr;          press_enter ;;
+            2) cu_register_status;      press_enter ;;
+            3) cu_table_editor ;;
+            4) cu_enable_all;           press_enter ;;
+            5) cu_stock_dispatch;       press_enter ;;
+            6) cu_write_service_table;  press_enter ;;
+            7) cu_install_service;      press_enter ;;
+            8) cu_uninstall_service;    press_enter ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$dz_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ==============================================================================
 # ADDITIONAL TOOLS FUNCTIONS
 # ==============================================================================
 
@@ -1800,41 +2818,6 @@ EOF
 
     print_success "DolphinBar udev rules installed! Reconnect your device."
 }
-
-show_experimental_menu() {
-    print_banner
-    print_section "Additional Tools"
-    echo -e "  ${DIM}Additional system utilities and hardware support.${RESET}\n"
-    print_item  "1"  "CachyOS Kernel"    "Replace Deckify kernel with standard CachyOS"
-    print_item  "2"  "Toggle Boot Mode"  "Switch between Game Mode & Desktop"
-    print_item  "3"  "DolphinBar Setup"  "Install udev rules for Wiimote support via DolphinBar"
-    echo ""
-    print_item  "0"  "Back"             "Return to main menu"
-    echo ""
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
-}
-
-run_experimental_menu() {
-    while true; do
-        show_experimental_menu
-        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" exp_choice
-
-        case "${exp_choice^^}" in
-            1) run_switch_to_default_kernel; press_enter ;;
-            2) run_toggle_boot_mode;         press_enter ;;
-            3) run_dolphinbar_udev;          press_enter ;;
-            0)  return ;;
-            *)
-                print_error "Invalid selection: '$exp_choice'"
-                sleep 1
-                ;;
-        esac
-    done
-}
-
-# ==============================================================================
-# MAIN MENU LOOP
-# ==============================================================================
 
 run_revert_dolphinbar() {
     local RULES_FILE="/etc/udev/rules.d/51-dolphinbar.rules"
@@ -1908,7 +2891,6 @@ run_revert_gpu_governor() {
     print_success "GPU governor removed successfully."
 }
 
-
 show_revert_menu() {
     print_banner
     print_section "Revert / Undo"
@@ -1948,29 +2930,161 @@ run_revert_menu() {
     done
 }
 
-show_menu() {
+run_update_toolkit() {
+    local target
+    target="$(readlink -f "$0")"
+    local url="https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main/bc250-toolkit.sh"
+
+    print_section "Update Toolkit"
+    print_info "Downloading latest version from GitHub..."
+
+    if ! curl -sSL \
+        -H "Cache-Control: no-cache" \
+        -H "Pragma: no-cache" \
+        "$url" -o "${target}.tmp"; then
+        print_error "Download failed. Check your internet connection."
+        rm -f "${target}.tmp"
+        return 1
+    fi
+
+    if ! head -1 "${target}.tmp" | grep -q "^#!"; then
+        print_error "Downloaded file does not look like a valid script. Aborting."
+        rm -f "${target}.tmp"
+        return 1
+    fi
+
+    mv "${target}.tmp" "$target"
+    chmod +x "$target"
+    print_success "Toolkit updated successfully. Restarting..."
+    sleep 1
+    exec bash "$target"
+}
+
+show_initial_setup_menu() {
     print_banner
-    print_section "Performance"
-    print_item  "1"  "Overclock Menu"      "CPU & GPU performance profiles"
-    echo ""
-    print_section "Setup Tasks"
+    print_section "Initial Setup"
+    echo -e "  ${DIM}Run these tasks to configure your BC-250 system.${RESET}\n"
+    print_item  "1"  "CachyOS Kernel"      "Replace Deckify kernel with standard CachyOS"
     print_item  "2"  "CPU Governor"        "bc250-smu-oc CPU overclock service"
     print_item  "3"  "GPU Governor"        "cyan-skillfish GPU governor service"
-    print_item  "4"  "Enable Swap"         "16G Btrfs swapfile, swappiness=180"
+    print_item  "4"  "Enable Swap"         "Btrfs swapfile with configurable size and swappiness"
     print_item  "5"  "ZRAM -> ZSWAP"       "Disable ZRAM, enable ZSWAP w/ lz4"
     print_item  "6"  "Hide RDSEED Warning" "Set loglevel=0 in /boot/limine.conf"
     print_item  "7"  "Disable Mitigations" "Add mitigations=off to limine.conf"
-    print_item  "A"  "Run All (2-7)"       "Run all setup tasks in sequence"
+    print_item  "A"  "Run All (1-7)"       "Run all setup tasks in sequence"
     echo ""
-    print_section "Revert / Undo"
-    print_item  "R"  "Revert Menu"         "Undo previously applied settings"
+    print_section "⚠  Manual Steps — not included in Run All"
+    print_item  "8"  "Compute Units Unlock" ""
     echo ""
+    print_item  "0"  "Back"                ""
+    echo ""
+    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_initial_setup_menu() {
+    while true; do
+        show_initial_setup_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" is_choice
+
+        case "${is_choice^^}" in
+            1) run_switch_to_default_kernel;  press_enter ;;
+            2) run_cpu_governor;              press_enter ;;
+            3) run_gpu_governor;              press_enter ;;
+            4) run_enable_swap;               press_enter ;;
+            5) run_disable_zram_enable_zswap; press_enter ;;
+            6) run_set_loglevel;              press_enter ;;
+            7) run_disable_mitigations;       press_enter ;;
+            A) run_all;                       press_enter ;;
+            8) run_danger_zone_menu ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$is_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+run_install_decky() {
+    print_section "Install Decky"
+    print_info "Downloading and running Decky installer..."
+    echo ""
+    rm -f /tmp/user_install_script.sh
+    if curl -S -s -L -O --output-dir /tmp/ --connect-timeout 60 \
+        https://github.com/SteamDeckHomebrew/decky-installer/releases/latest/download/user_install_script.sh; then
+        bash /tmp/user_install_script.sh
+    else
+        print_error "Download failed. Check your internet connection and try again."
+    fi
+}
+
+run_install_emudeck() {
+    print_section "Install EmuDeck"
+    print_info "Downloading and running EmuDeck installer as $REAL_USER..."
+    echo ""
+    sudo -u "$REAL_USER" bash -c 'curl -L https://raw.githubusercontent.com/dragoonDorise/EmuDeck/main/install.sh | bash'
+}
+
+run_install_protonup_qt() {
+    print_section "Install ProtonUp-Qt"
+    print_info "Installing ProtonUp-Qt as $REAL_USER via paru..."
+    echo ""
+    if sudo -u "$REAL_USER" paru -S --noconfirm protonup-qt; then
+        print_success "ProtonUp-Qt installed successfully."
+    else
+        print_error "Installation failed. Make sure paru is installed and try again."
+    fi
+}
+
+show_experimental_menu() {
+    print_banner
     print_section "Additional Tools"
-    print_item  "E"  "Additional Tools"    "Additional system utilities"
+    echo -e "  ${DIM}Additional system utilities and hardware support.${RESET}\n"
+    print_item  "1"  "Toggle Boot Mode"   "Switch between Game Mode & Desktop"
+    print_item  "2"  "DolphinBar Setup"   "Install udev rules for Wiimote support via DolphinBar"
+    print_item  "3"  "Install Decky"      "Install the Decky plugin loader"
+    print_item  "4"  "Install EmuDeck"    "Install the EmuDeck emulation suite"
+    print_item  "5"  "Install ProtonUp-Qt" "Manage Proton and Wine versions"
+    echo ""
+    print_item  "0"  "Back"              "Return to main menu"
+    echo ""
+    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_experimental_menu() {
+    while true; do
+        show_experimental_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" exp_choice
+
+        case "${exp_choice^^}" in
+            1) run_toggle_boot_mode;      press_enter ;;
+            2) run_dolphinbar_udev;       press_enter ;;
+            3) run_install_decky;         press_enter ;;
+            4) run_install_emudeck;       press_enter ;;
+            5) run_install_protonup_qt;   press_enter ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$exp_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+show_menu() {
+    print_banner
+    print_section "Performance"
+    print_item  "1"  "Performance Profiles" "CPU & GPU performance profiles"
+    echo ""
+    print_section "Setup"
+    print_item  "2"  "Initial Setup"        "System configuration tasks"
+    print_item  "3"  "Additional Tools"     "Additional system utilities"
+    print_item  "4"  "Revert Menu"          "Undo previously applied settings"
     echo ""
     print_section "System"
-    print_item  "S"  "Status"              "Current system summary"
-    print_item  "0"  "Exit"                ""
+    print_item  "S"  "Status"               "Current system summary"
+    print_item  "U"  "Update Toolkit"       "Download and install the latest version from GitHub"
+    print_item  "0"  "Exit"                 ""
     echo ""
     echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
 }
@@ -1981,16 +3095,11 @@ while true; do
 
     case "${choice^^}" in
         1) run_overclock_menu ;;
-        2) run_cpu_governor;              press_enter ;;
-        3) run_gpu_governor;              press_enter ;;
-        4) run_enable_swap;               press_enter ;;
-        5) run_disable_zram_enable_zswap; press_enter ;;
-        6) run_set_loglevel;              press_enter ;;
-        7) run_disable_mitigations;       press_enter ;;
-        A) run_all;                       press_enter ;;
-        R) run_revert_menu ;;
-        E) run_experimental_menu ;;
-        S) run_status;                    press_enter ;;
+        2) run_initial_setup_menu ;;
+        3) run_experimental_menu ;;
+        4) run_revert_menu ;;
+        S) run_status;        press_enter ;;
+        U) run_update_toolkit ;;
         0)
             echo -e "\n  ${DIM}Goodbye.${RESET}\n"
             exit 0
