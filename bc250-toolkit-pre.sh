@@ -1231,7 +1231,7 @@ oc_edit_cpu_config_kate() {
     chown "$REAL_USER" "$CPU_DEST"
 
     print_info "Launching Kate as $REAL_USER — waiting for Kate to close..."
-    sudo -u "$REAL_USER" kate "$CPU_DEST" &>/dev/null
+    sudo -u "$REAL_USER" kate --new-window --block "$CPU_DEST" &>/dev/null
 
     print_info "Restoring root ownership of $CPU_DEST..."
     chown root "$CPU_DEST"
@@ -1255,7 +1255,7 @@ oc_edit_gpu_config_kate() {
     chown "$REAL_USER" "$GPU_DEST"
 
     print_info "Launching Kate as $REAL_USER — waiting for Kate to close..."
-    sudo -u "$REAL_USER" kate "$GPU_DEST" &>/dev/null
+    sudo -u "$REAL_USER" kate --new-window --block "$GPU_DEST" &>/dev/null
 
     print_info "Restoring root ownership of $GPU_DEST..."
     chown root "$GPU_DEST"
