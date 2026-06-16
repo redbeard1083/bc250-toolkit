@@ -1251,7 +1251,12 @@ oc_edit_gpu_config_nano() {
     nano "$GPU_DEST" || true
 
     if confirm "Would you like to restart the GPU service to apply changes?"; then
-        install_gpu
+        systemctl restart "$GPU_SERVICE"
+        if systemctl is-active --quiet "$GPU_SERVICE"; then
+            print_success "GPU service restarted successfully."
+        else
+            print_error "GPU service failed to start! Check: journalctl -u $GPU_SERVICE"
+        fi
     fi
 }
 
