@@ -1219,60 +1219,32 @@ install_gpu() {
     fi
 }
 
-oc_edit_cpu_config_kate() {
-    print_step "07-E" "Opening CPU Config in Kate"
+oc_edit_cpu_config_nano() {
+    print_step "07-E" "Opening CPU Config in nano"
 
     if [[ ! -f "$CPU_DEST" ]]; then
         print_error "Configuration file not found at $CPU_DEST"
         return 1
     fi
 
-    print_info "Temporarily granting $REAL_USER access to $CPU_DEST..."
-    chown "$REAL_USER" "$CPU_DEST"
+    nano "$CPU_DEST"
 
-    print_info "Launching Kate..."
-    sudo -u "$REAL_USER" kate "$CPU_DEST" &>/dev/null &
-
-    echo ""
-    echo -e "  ${BOLD}${WHITE}Kate is now open. Edit the file and save your changes.${RESET}"
-    echo -e "  ${DIM}Press Enter when you are done to restore permissions...${RESET}"
-    read -r
-
-    print_info "Restoring root ownership of $CPU_DEST..."
-    chown root "$CPU_DEST"
-
-    print_success "Permissions restored."
-
-    if confirm "Would you like to restart the CPU service to apply manual changes?"; then
+    if confirm "Would you like to restart the CPU service to apply changes?"; then
         install_cpu
     fi
 }
 
-oc_edit_gpu_config_kate() {
-    print_step "07-E" "Opening GPU Config in Kate"
+oc_edit_gpu_config_nano() {
+    print_step "07-E" "Opening GPU Config in nano"
 
     if [[ ! -f "$GPU_DEST" ]]; then
         print_error "Configuration file not found at $GPU_DEST"
         return 1
     fi
 
-    print_info "Temporarily granting $REAL_USER access to $GPU_DEST..."
-    chown "$REAL_USER" "$GPU_DEST"
+    nano "$GPU_DEST"
 
-    print_info "Launching Kate..."
-    sudo -u "$REAL_USER" kate "$GPU_DEST" &>/dev/null &
-
-    echo ""
-    echo -e "  ${BOLD}${WHITE}Kate is now open. Edit the file and save your changes.${RESET}"
-    echo -e "  ${DIM}Press Enter when you are done to restore permissions...${RESET}"
-    read -r
-
-    print_info "Restoring root ownership of $GPU_DEST..."
-    chown root "$GPU_DEST"
-
-    print_success "Permissions restored."
-
-    if confirm "Would you like to restart the GPU service to apply manual changes?"; then
+    if confirm "Would you like to restart the GPU service to apply changes?"; then
         install_gpu
     fi
 }
@@ -1536,8 +1508,8 @@ run_overclock_menu() {
         done
         echo ""
         print_item "C" "Custom"            "Mix & match CPU and GPU profiles"
-        print_item "E" "Edit GPU Config"   "Manually edit GPU config with Kate"
-        print_item "F" "Edit CPU Config"   "Manually edit CPU config with Kate"
+        print_item "E" "Edit GPU Config"   "Manually edit GPU config with nano"
+        print_item "F" "Edit CPU Config"   "Manually edit CPU config with nano"
         print_item "0" "Back to Main Menu" ""
         echo ""
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
@@ -1545,8 +1517,8 @@ run_overclock_menu() {
 
         case "${oc_choice^^}" in
             C) oc_apply_custom;         press_enter ;;
-            E) oc_edit_gpu_config_kate; press_enter ;;
-            F) oc_edit_cpu_config_kate; press_enter ;;
+            E) oc_edit_gpu_config_nano; press_enter ;;
+            F) oc_edit_cpu_config_nano; press_enter ;;
             0) return 0 ;;
             *)
                 if [[ "$oc_choice" =~ ^[0-9]+$ ]] && (( oc_choice >= 1 && oc_choice <= ${#PRESET_NAMES[@]} )); then
