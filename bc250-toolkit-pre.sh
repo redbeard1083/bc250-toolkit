@@ -1230,7 +1230,13 @@ oc_edit_cpu_config_nano() {
     nano "$CPU_DEST"
 
     if confirm "Would you like to restart the CPU service to apply changes?"; then
-        install_cpu
+        systemctl daemon-reload
+        systemctl restart "$CPU_SERVICE"
+        if systemctl is-active --quiet "$CPU_SERVICE"; then
+            print_success "CPU service restarted successfully."
+        else
+            print_error "CPU service failed to start! Check: journalctl -u $CPU_SERVICE"
+        fi
     fi
 }
 
