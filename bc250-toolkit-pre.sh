@@ -1227,7 +1227,7 @@ oc_edit_cpu_config_nano() {
         return 1
     fi
 
-    nano "$CPU_DEST"
+    nano "$CPU_DEST" || true
 
     if confirm "Would you like to restart the CPU service to apply changes?"; then
         systemctl daemon-reload
@@ -1248,7 +1248,7 @@ oc_edit_gpu_config_nano() {
         return 1
     fi
 
-    nano "$GPU_DEST"
+    nano "$GPU_DEST" || true
 
     if confirm "Would you like to restart the GPU service to apply changes?"; then
         install_gpu
