@@ -271,27 +271,52 @@ run_gpu_governor() {
 
 run_enable_swap() {
     print_step "04" "Configuring Swap"
+
+    # Prompt for swap size
+    echo ""
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Swap size in GB (default: 16):${RESET} ")" swap_size_input
+    if [[ -z "$swap_size_input" ]]; then
+        swap_size="16"
+    elif [[ "$swap_size_input" =~ ^[0-9]+$ ]] && (( swap_size_input > 0 )); then
+        swap_size="$swap_size_input"
+    else
+        print_error "Invalid size '$swap_size_input' — must be a positive integer. Using default 16G."
+        swap_size="16"
+    fi
+
+    # Prompt for swappiness
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Swappiness value (default: 60):${RESET} ")" swappiness_input
+    if [[ -z "$swappiness_input" ]]; then
+        swappiness="60"
+    elif [[ "$swappiness_input" =~ ^[0-9]+$ ]]; then
+        swappiness="$swappiness_input"
+    else
+        print_error "Invalid swappiness '$swappiness_input' — must be a number. Using default 60."
+        swappiness="60"
+    fi
+
+    echo ""
     print_info "Disabling and removing existing swapfile..."
-    sudo swapoff /var/swap/swapfile 2>/dev/null || true
-    sudo rm -f /var/swap/swapfile 2>/dev/null || true
+    swapoff /var/swap/swapfile 2>/dev/null || true
+    rm -f /var/swap/swapfile 2>/dev/null || true
 
     print_info "Recreating Btrfs subvolume..."
-    sudo btrfs subvolume delete /var/swap 2>/dev/null || true
-    sudo btrfs subvolume create /var/swap
+    btrfs subvolume delete /var/swap 2>/dev/null || true
+    btrfs subvolume create /var/swap
 
-    print_info "Creating 16G swapfile..."
-    sudo btrfs filesystem mkswapfile --size 16G /var/swap/swapfile
+    print_info "Creating ${swap_size}G swapfile..."
+    btrfs filesystem mkswapfile --size "${swap_size}G" /var/swap/swapfile
 
     print_info "Updating /etc/fstab..."
-    sudo sed -i '/\/var\/swap\/swapfile/d' /etc/fstab
-    echo '/var/swap/swapfile none swap defaults,nofail 0 0' | sudo tee -a /etc/fstab > /dev/null
+    sed -i '/\/var\/swap\/swapfile/d' /etc/fstab
+    echo '/var/swap/swapfile none swap defaults,nofail 0 0' | tee -a /etc/fstab > /dev/null
 
-    print_info "Setting swappiness to 180..."
-    echo 'vm.swappiness = 180' | sudo tee /etc/sysctl.d/99-swappiness.conf > /dev/null
-    sudo sysctl vm.swappiness=180 > /dev/null
+    print_info "Setting swappiness to ${swappiness}..."
+    echo "vm.swappiness = ${swappiness}" | tee /etc/sysctl.d/99-swappiness.conf > /dev/null
+    sysctl vm.swappiness="${swappiness}" > /dev/null
 
     print_info "Enabling swapfile..."
-    sudo swapon /var/swap/swapfile
+    swapon /var/swap/swapfile
 
     print_success "Swap configured! Current swap:"
     echo ""
@@ -472,7 +497,7 @@ EOF
 }
 
 run_switch_to_default_kernel() {
-    print_step "14" "Migrating to Default CachyOS Kernel"
+    print_step "01" "Migrating to Default CachyOS Kernel"
 
     # 1. Check if we are already on the standard kernel
     if pacman -Qq linux-cachyos &>/dev/null; then
@@ -1194,22 +1219,44 @@ install_gpu() {
     fi
 }
 
-oc_edit_gpu_config_kate() {
-    print_step "07-E" "Opening GPU Config in Kate"
+oc_edit_cpu_config_nano() {
+    print_step "07-E" "Opening CPU Config in nano"
+
+    if [[ ! -f "$CPU_DEST" ]]; then
+        print_error "Configuration file not found at $CPU_DEST"
+        return 1
+    fi
+
+    nano "$CPU_DEST" || true
+
+    if confirm "Would you like to restart the CPU service to apply changes?"; then
+        systemctl daemon-reload
+        systemctl restart "$CPU_SERVICE"
+        if systemctl is-active --quiet "$CPU_SERVICE"; then
+            print_success "CPU service restarted successfully."
+        else
+            print_error "CPU service failed to start! Check: journalctl -u $CPU_SERVICE"
+        fi
+    fi
+}
+
+oc_edit_gpu_config_nano() {
+    print_step "07-E" "Opening GPU Config in nano"
 
     if [[ ! -f "$GPU_DEST" ]]; then
         print_error "Configuration file not found at $GPU_DEST"
         return 1
     fi
 
-    print_info "Launching Kate as $REAL_USER..."
-    # Launching as the real user prevents permission issues and root-execution blocks
-    sudo -u "$REAL_USER" kate "$GPU_DEST" &>/dev/null &
+    nano "$GPU_DEST" || true
 
-    print_success "Kate opened. Make your changes and save the file."
-
-    if confirm "Would you like to restart the GPU service to apply manual changes?"; then
-        install_gpu
+    if confirm "Would you like to restart the GPU service to apply changes?"; then
+        systemctl restart "$GPU_SERVICE"
+        if systemctl is-active --quiet "$GPU_SERVICE"; then
+            print_success "GPU service restarted successfully."
+        else
+            print_error "GPU service failed to start! Check: journalctl -u $GPU_SERVICE"
+        fi
     fi
 }
 
@@ -1472,7 +1519,8 @@ run_overclock_menu() {
         done
         echo ""
         print_item "C" "Custom"            "Mix & match CPU and GPU profiles"
-        print_item "E" "Edit with Kate"    "Manually edit GPU config"
+        print_item "E" "Edit GPU Config"   "Manually edit GPU config with nano"
+        print_item "F" "Edit CPU Config"   "Manually edit CPU config with nano"
         print_item "0" "Back to Main Menu" ""
         echo ""
         echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
@@ -1480,7 +1528,8 @@ run_overclock_menu() {
 
         case "${oc_choice^^}" in
             C) oc_apply_custom;         press_enter ;;
-            E) oc_edit_gpu_config_kate; press_enter ;;
+            E) oc_edit_gpu_config_nano; press_enter ;;
+            F) oc_edit_cpu_config_nano; press_enter ;;
             0) return 0 ;;
             *)
                 if [[ "$oc_choice" =~ ^[0-9]+$ ]] && (( oc_choice >= 1 && oc_choice <= ${#PRESET_NAMES[@]} )); then
@@ -2888,10 +2937,27 @@ run_revert_menu() {
 run_update_toolkit() {
     local target
     target="$(readlink -f "$0")"
-    local url="https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main/bc250-toolkit.sh"
+    local base_url="https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main"
 
     print_section "Update Toolkit"
-    print_info "Downloading latest version from GitHub..."
+    echo ""
+    print_item "1" "Stable"      "bc250-toolkit.sh"
+    print_item "2" "Pre-Release" "bc250-toolkit-pre.sh  (may contain bugs)"
+    echo ""
+    print_item "0" "Cancel" ""
+    echo ""
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Select version:${RESET} ")" ver_choice
+
+    local url
+    case "$ver_choice" in
+        1) url="$base_url/bc250-toolkit.sh" ;;
+        2) url="$base_url/bc250-toolkit-pre.sh" ;;
+        0) print_info "Cancelled."; return 0 ;;
+        *) print_error "Invalid selection."; return 1 ;;
+    esac
+
+    echo ""
+    print_info "Downloading from GitHub..."
 
     if ! curl -sSL \
         -H "Cache-Control: no-cache" \
@@ -2922,7 +2988,7 @@ show_initial_setup_menu() {
     print_item  "1"  "CachyOS Kernel"      "Replace Deckify kernel with standard CachyOS"
     print_item  "2"  "CPU Governor"        "bc250-smu-oc CPU overclock service"
     print_item  "3"  "GPU Governor"        "cyan-skillfish GPU governor service"
-    print_item  "4"  "Enable Swap"         "16G Btrfs swapfile, swappiness=180"
+    print_item  "4"  "Enable Swap"         "Btrfs swapfile with configurable size and swappiness"
     print_item  "5"  "ZRAM -> ZSWAP"       "Disable ZRAM, enable ZSWAP w/ lz4"
     print_item  "6"  "Hide RDSEED Warning" "Set loglevel=0 in /boot/limine.conf"
     print_item  "7"  "Disable Mitigations" "Add mitigations=off to limine.conf"
@@ -2995,13 +3061,13 @@ show_experimental_menu() {
     print_banner
     print_section "Additional Tools"
     echo -e "  ${DIM}Additional system utilities and hardware support.${RESET}\n"
-    print_item  "1"  "Toggle Boot Mode"   "Switch between Game Mode & Desktop"
-    print_item  "2"  "DolphinBar Setup"   "Install udev rules for Wiimote support via DolphinBar"
-    print_item  "3"  "Install Decky"      "Install the Decky plugin loader"
-    print_item  "4"  "Install EmuDeck"    "Install the EmuDeck emulation suite"
+    print_item  "1"  "Toggle Boot Mode"    "Switch between Game Mode & Desktop"
+    print_item  "2"  "DolphinBar Setup"    "Install udev rules for Wiimote support via DolphinBar"
+    print_item  "3"  "Install Decky"       "Install the Decky plugin loader"
+    print_item  "4"  "Install EmuDeck"     "Install the EmuDeck emulation suite"
     print_item  "5"  "Install ProtonUp-Qt" "Manage Proton and Wine versions"
     echo ""
-    print_item  "0"  "Back"              "Return to main menu"
+    print_item  "0"  "Back"               "Return to main menu"
     echo ""
     echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
 }
