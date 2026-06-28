@@ -167,12 +167,12 @@ BG_HEADER="\e[48;5;235m"
 print_banner() {
     clear
     echo -e "${BOLD}${CYAN}"
-    echo "  ╔══════════════════════════════════════════════════════════════╗"
-    echo "  ║                                                              ║"
-    echo "  ║              CachyOS BC250 Toolkit                           ║"
-    echo "  ║           System Setup & Configuration                       ║"
-    echo "  ║                                                              ║"
-    echo "  ╚══════════════════════════════════════════════════════════════╝"
+    echo "  ╔═════════════════════════════════════════════════════════════════════╗"
+    echo "  ║                                                                     ║"
+    echo "  ║              CachyOS BC250 Toolkit                                  ║"
+    echo "  ║           System Setup & Configuration                              ║"
+    echo "  ║                                                                     ║"
+    echo "  ╚═════════════════════════════════════════════════════════════════════╝"
     echo -e "${RESET}"
 }
 
