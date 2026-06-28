@@ -167,18 +167,18 @@ BG_HEADER="\e[48;5;235m"
 print_banner() {
     clear
     echo -e "${BOLD}${CYAN}"
-    echo "  ╔═════════════════════════════════════════════════════════════════════╗"
+    echo "  ╔════════════════════════════════════════════════════════════════════════════╗"
     echo "  ║                                                                     ║"
     echo "  ║              CachyOS BC250 Toolkit                                  ║"
     echo "  ║           System Setup & Configuration                              ║"
     echo "  ║                                                                     ║"
-    echo "  ╚═════════════════════════════════════════════════════════════════════╝"
+    echo "  ╚════════════════════════════════════════════════════════════════════════════╝"
     echo -e "${RESET}"
 }
 
 print_section() {
     echo -e "  ${BOLD}${YELLOW}$1${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 }
 
 print_item() {
@@ -1565,7 +1565,7 @@ run_overclock_menu() {
         print_item "F" "Edit CPU Config" "Manually edit CPU config with nano"
         print_item "0" "Back"            ""
         echo ""
-        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+        echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
         read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" oc_choice
 
         case "${oc_choice^^}" in
@@ -1726,7 +1726,7 @@ run_status() {
 
     # --- System ---
     echo -e "  ${BOLD}${YELLOW}System${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 
     local OVERRIDE_FILE="/etc/plasmalogin.conf.d/zzz-bc250-boot.conf"
     local boot_session="gamescope"
@@ -1754,7 +1754,7 @@ run_status() {
 
     # --- Overclock Profile ---
     echo -e "  ${BOLD}${YELLOW}Overclock${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
     if [[ -f "$CPU_CONF" ]]; then
         local cpu_freq cpu_scale cpu_temp cpu_preset
         cpu_freq=$(awk -F'= ' '/^frequency/{print $2}' "$CPU_CONF" | tr -d ' ')
@@ -1796,7 +1796,7 @@ run_status() {
 
     # --- Compute Units ---
     echo -e "  ${BOLD}${YELLOW}Compute Units${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
     if cu_find_umr; then
         cu_select_umr_instance
         local cu_total=0 cu_idx cu_se cu_sh cu_spi_hex cu_spi_val cu_wgp cu_bit
@@ -1834,7 +1834,7 @@ run_status() {
 
     # --- Memory / Swap ---
     echo -e "  ${BOLD}${YELLOW}Memory & Swap${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 
     # ZSWAP Detection
     local zswap_enabled zswap_compressor zswap_pool
@@ -1883,7 +1883,7 @@ run_status() {
 
     # --- Disk Space ---
     echo -e "  ${BOLD}${YELLOW}Disk Space${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
     local df_root df_boot
     df_root=$(df -h / | awk 'NR==2 {printf "%s used of %s (%s free)", $3, $2, $4}')
     df_boot=$(df -h /boot | awk 'NR==2 {printf "%s used of %s (%s free)", $3, $2, $4}')
@@ -1893,7 +1893,7 @@ run_status() {
 
     # --- Kernel Parameters ---
     echo -e "  ${BOLD}${YELLOW}Kernel Parameters${RESET}  ${DIM}(source: $LIMINE_CONF)${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 
     if [[ -f "$LIMINE_CONF" ]]; then
         local loglevel mitigations_off zram_disabled zswap_conf lz4_initrd
@@ -1913,7 +1913,7 @@ run_status() {
     fi
     echo ""
 
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 run_revert_loglevel() {
@@ -2024,7 +2024,7 @@ run_all() {
         (( failed++ ))
     fi
 
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
     if [[ "$failed" -eq 0 ]]; then
         print_success "All tasks completed successfully!"
     else
@@ -2074,7 +2074,7 @@ cu_err()  { echo -e "  ${BOLD}${RED}✘${RESET}  $*" >&2; }
 cu_die()  { cu_err "$@"; return 1; }
 
 cu_hr() {
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 cu_find_umr() {
@@ -2434,7 +2434,7 @@ cu_confirm_dispatch_plan() {
     print_section "$title"
     echo -e "  ${DIM}Legend: Default = driver default CUs, Enabled = additionally unlocked, Disabled = not active, Blocked = driver conflict${RESET}\n"
     printf "  %-9s %-30s %-30s %-20s\n" "Row" "Current" "Target" "Change"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────────────────────────${RESET}"
     for idx in 0 1 2 3; do
         current="${current_masks[$idx]}"
         target="${target_masks[$idx]}"
@@ -2462,12 +2462,12 @@ cu_module_status() {
 }
 
 cu_live_table_header() {
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────────────────────────${RESET}"
     printf "  %-9s %-8s %-8s %-8s %-8s %-8s %-8s %-12s %-8s\n" \
         "Row" "Pair0" "Pair1" "Pair2" "Pair3" "Pair4" "Routing" "CC Reg" "CUs"
     printf "  %-9s %-8s %-8s %-8s %-8s %-8s\n" \
         "" "CU0-1" "CU2-3" "CU4-5" "CU6-7" "CU8-9"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────────────────────────${RESET}"
 }
 
 cu_live_cell() {
@@ -2545,7 +2545,7 @@ cu_register_status() {
             printf "${DIM}%s${RESET}  %s  %3s/10 CUs\n" "$(cu_hex_mask "$spi")" "$cc_hex" "$count"
         done
     done
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────────────────────────${RESET}"
     echo ""
     echo -e "  ${BOLD}${WHITE}Routing total : ${total}/40 CUs${RESET}"
     [ "$service_has_config" -eq 1 ] && printf "  %-14s: %s\n" "Boot profile" "$(cu_mask_summary service_masks)"
@@ -2568,7 +2568,7 @@ cu_draw_table_editor() {
     echo -e "  ${GREEN}${BOLD}Default${RESET} = driver default CUs (locked)   ${CYAN}Enabled${RESET} = additionally unlocked   ${DIM}Disabled${RESET} = not active\n"
     printf "  %-9s %-8s %-8s %-8s %-8s %-8s\n" "Row" "Pair0" "Pair1" "Pair2" "Pair3" "Pair4"
     printf "  %-9s %-8s %-8s %-8s %-8s %-8s\n" "" "CU0-1" "CU2-3" "CU4-5" "CU6-7" "CU8-9"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
     for idx in 0 1 2 3; do
         printf "  %-9s" "$(cu_row_label "$idx")"
         for wgp in 0 1 2 3 4; do
@@ -2591,7 +2591,7 @@ cu_draw_table_editor() {
         done
         printf "\n"
     done
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 }
 
 cu_table_editor() {
@@ -2813,7 +2813,7 @@ show_danger_zone_menu() {
     echo ""
     print_item  "0"  "Back"                      ""
     echo ""
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 run_danger_zone_menu() {
@@ -2951,7 +2951,7 @@ show_revert_menu() {
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 run_revert_menu() {
@@ -3043,7 +3043,7 @@ show_initial_setup_menu() {
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 run_initial_setup_menu() {
@@ -3114,7 +3114,7 @@ show_experimental_menu() {
     echo ""
     print_item  "0"  "Back"               ""
     echo ""
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 run_experimental_menu() {
@@ -3152,7 +3152,7 @@ show_menu() {
     print_item  "U"  "Update Toolkit"        "Download latest version from GitHub"
     print_item  "0"  "Exit"                  ""
     echo ""
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 while true; do
