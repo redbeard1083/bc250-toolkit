@@ -169,8 +169,8 @@ print_banner() {
     echo -e "${BOLD}${CYAN}"
     echo "  ╔═════════════════════════════════════════════════════════════════════╗"
     echo "  ║                                                                     ║"
-    echo "  ║              CachyOS BC250 Toolkit                                  ║"
-    echo "  ║           System Setup & Configuration                              ║"
+    echo "  ║                        CachyOS BC250 Toolkit                        ║"
+    echo "  ║                    System Setup & Configuration                     ║"
     echo "  ║                                                                     ║"
     echo "  ╚═════════════════════════════════════════════════════════════════════╝"
     echo -e "${RESET}"
@@ -185,7 +185,12 @@ print_item() {
     local num="$1"
     local label="$2"
     local desc="$3"
-    printf "  ${BOLD}${WHITE}[${CYAN}%2s${WHITE}]${RESET}  %-26s ${DIM}%s${RESET}\n" "$num" "$label" "$desc"
+    # Calculate visual width by stripping multi-byte chars and measuring byte difference
+    local label_bytes=${#label}
+    local label_visual=$(echo -n "$label" | wc -m)
+    local extra=$(( label_bytes - label_visual ))
+    local width=$(( 26 + extra ))
+    printf "  ${BOLD}${WHITE}[${CYAN}%2s${WHITE}]${RESET}  %-${width}s ${DIM}%s${RESET}\n" "$num" "$label" "$desc"
 }
 
 print_success() {
@@ -1350,9 +1355,9 @@ PRESET_DESCS=(
     "CPU 3.5GHz, GPU 1750MHz — 80°C"
     "CPU 3.5GHz, GPU 1850MHz — 80°C"
     "CPU 3.5GHz, GPU 2000MHz — 80°C"
-    "CPU 3.5GHz, GPU 2100MHz — 80°C  [HIGH RISK]"
-    "CPU 3.85GHz, GPU 2100MHz — 80°C  [HIGH RISK]"
-    "CPU 4GHz, GPU 2350MHz — 90°C  [HIGH RISK]"
+    "CPU 3.5GHz, GPU 2100MHz — 80°C"
+    "CPU 3.85GHz, GPU 2100MHz — 80°C"
+    "CPU 4GHz, GPU 2350MHz — 90°C"
 )
 PRESET_CPU_WRITERS=(write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_overclock_3_85ghz write_cpu_overclock_4ghz)
 PRESET_GPU_WRITERS=(write_gpu_overclock_1500mhz write_gpu_overclock_1600mhz write_gpu_overclock_1750mhz write_gpu_overclock_1850mhz write_gpu_overclock_2000mhz write_gpu_overclock_2100mhz write_gpu_overclock_2100mhz write_gpu_overclock_2350mhz)
