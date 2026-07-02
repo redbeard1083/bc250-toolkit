@@ -164,6 +164,45 @@ BG_HEADER="\e[48;5;235m"
 # HELPERS
 # ==============================================================================
 
+# AUR helper — detects shelly, paru, or yay in that order
+aur_helper() {
+    if command -v shelly >/dev/null 2>&1; then printf "shelly"
+    elif command -v paru >/dev/null 2>&1;  then printf "paru"
+    elif command -v yay >/dev/null 2>&1;   then printf "yay"
+    else return 1
+    fi
+}
+
+aur_install() {
+    local package="$1"
+    local helper
+    if ! helper="$(aur_helper)"; then
+        print_error "No AUR helper found (shelly, paru, or yay). Please install one first."
+        return 1
+    fi
+    print_info "Installing $package via $helper..."
+    case "$helper" in
+        shelly) sudo -u "$REAL_USER" shelly aur install "$package" ;;
+        paru)   sudo -u "$REAL_USER" paru -S --noconfirm "$package" ;;
+        yay)    sudo -u "$REAL_USER" yay -S --noconfirm "$package" ;;
+    esac
+}
+
+aur_remove() {
+    local package="$1"
+    local helper
+    if ! helper="$(aur_helper)"; then
+        print_error "No AUR helper found (shelly, paru, or yay). Please install one first."
+        return 1
+    fi
+    print_info "Removing $package via $helper..."
+    case "$helper" in
+        shelly) shelly remove "$package" ;;
+        paru)   paru -Rns --noconfirm "$package" 2>/dev/null || true ;;
+        yay)    yay -Rns --noconfirm "$package" 2>/dev/null || true ;;
+    esac
+}
+
 print_banner() {
     clear
     echo -e "${BOLD}${CYAN}"
@@ -267,8 +306,8 @@ run_gpu_governor() {
         return 0
     fi
 
-    print_info "Installing cyan-skillfish-governor-smu via paru (as $REAL_USER)..."
-    sudo -u "$REAL_USER" paru -S cyan-skillfish-governor-smu --noconfirm
+    print_info "Installing cyan-skillfish-governor-smu via AUR helper..."
+    aur_install cyan-skillfish-governor-smu
     print_info "Enabling and starting systemd service..."
     systemctl enable --now cyan-skillfish-governor-smu.service
     print_success "GPU Governor installed and started successfully!"
@@ -1827,7 +1866,7 @@ run_status() {
             fi
             echo -e "  ${CYAN}Active CUs${RESET}        ${cu_color}${BOLD}${cu_total}/40${RESET}  ${DIM}(default 24, max 40)${RESET}"
             if [ "$cu_total" -gt 24 ]; then
-                echo -e "  ${YELLOW}Additional compute units are unlocked — ensure adequate power and cooling${RESET}"
+                echo -e "  ${YELLOW}⚠  CUs unlocked — verify power and cooling${RESET}"
             fi
         else
             echo -e "  ${CYAN}Active CUs${RESET}        ${DIM}unavailable (umr could not read registers)${RESET}"
@@ -1848,7 +1887,7 @@ run_status() {
     zswap_pool=$(cat /sys/module/zswap/parameters/max_pool_percent 2>/dev/null || echo "N/A")
     local zswap_color
     [[ "$zswap_enabled" == "Y" ]] && zswap_color="$GREEN" || zswap_color="$RED"
-    echo -e "  ${CYAN}ZSWAP${RESET}              ${zswap_color}${zswap_enabled}${RESET}  compressor=${zswap_compressor}  pool=${zswap_pool}%"
+    echo -e "  ${CYAN}ZSWAP${RESET}              ${zswap_color}${zswap_enabled}${RESET}  ${DIM}${zswap_compressor} / pool ${zswap_pool}%${RESET}"
 
     # ZRAM Detection (Checks kernel device instead of just one specific service)
     local zram_state="inactive"
@@ -1881,7 +1920,7 @@ run_status() {
         echo -e "    ${DIM}(No active swap devices found)${RESET}"
     else
         echo "$swap_output" | while read -r name type size used prio; do
-            echo -e "    ${DIM}${name}  ${type}  size=${size}  used=${used}  prio=${prio}${RESET}"
+            echo -e "    ${DIM}${name} (${size})${RESET}"
         done
     fi
     echo ""
@@ -1890,14 +1929,15 @@ run_status() {
     echo -e "  ${BOLD}${YELLOW}Disk Space${RESET}"
     echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
     local df_root df_boot
-    df_root=$(df -h / | awk 'NR==2 {printf "%s used of %s (%s free)", $3, $2, $4}')
-    df_boot=$(df -h /boot | awk 'NR==2 {printf "%s used of %s (%s free)", $3, $2, $4}')
+    df_root=$(df -h / | awk 'NR==2 {printf "%s/%s (%s free)", $3, $2, $4}')
+    df_boot=$(df -h /boot | awk 'NR==2 {printf "%s/%s (%s free)", $3, $2, $4}')
     echo -e "  ${CYAN}/${RESET}                 ${df_root}"
     echo -e "  ${CYAN}/boot${RESET}             ${df_boot}"
     echo ""
 
     # --- Kernel Parameters ---
-    echo -e "  ${BOLD}${YELLOW}Kernel Parameters${RESET}  ${DIM}(source: $LIMINE_CONF)${RESET}"
+    echo -e "  ${BOLD}${YELLOW}Kernel Parameters${RESET}"
+    echo -e "  ${DIM}source: $LIMINE_CONF${RESET}"
     echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 
     if [[ -f "$LIMINE_CONF" ]]; then
@@ -2752,10 +2792,9 @@ cu_install_umr() {
     if command -v pacman >/dev/null 2>&1 && pacman -Si umr >/dev/null 2>&1; then
         cu_info "Installing umr with pacman..."; pacman -S --needed umr; return 0
     fi
-    if command -v paru >/dev/null 2>&1; then
-        [ -n "$REAL_USER" ] || { cu_die "paru install needs SUDO_USER set"; return 1; }
-        cu_info "Installing umr with paru as $REAL_USER..."
-        sudo -u "$REAL_USER" paru -S --needed umr; return 0
+    if aur_helper >/dev/null 2>&1; then
+        cu_info "Installing umr via AUR helper..."
+        aur_install umr; return 0
     fi
     if command -v rpm-ostree >/dev/null 2>&1; then
         cu_warn "rpm-ostree layering is host-level and may affect immutable system upgrades."
@@ -2768,7 +2807,7 @@ cu_install_umr() {
         dnf install -y umr && return 0
         cu_die "dnf could not install umr"; return 1
     fi
-    cu_die "could not install umr automatically — install with pacman/paru/rpm-ostree/dnf first"
+    cu_die "could not install umr automatically — install shelly, paru, or yay first"
 }
 
 dz_warn() {
@@ -2936,8 +2975,8 @@ run_revert_gpu_governor() {
     systemctl stop cyan-skillfish-governor-smu.service 2>/dev/null || true
     systemctl disable cyan-skillfish-governor-smu.service 2>/dev/null || true
 
-    print_info "Removing package via paru (as $REAL_USER)..."
-    sudo -u "$REAL_USER" paru -Rns --noconfirm cyan-skillfish-governor-smu 2>/dev/null || true
+    print_info "Removing cyan-skillfish-governor-smu via AUR helper..."
+    aur_remove cyan-skillfish-governor-smu
 
     print_success "GPU governor removed successfully."
 }
@@ -3098,12 +3137,10 @@ run_install_emudeck() {
 
 run_install_protonup_qt() {
     print_section "Install ProtonUp-Qt"
-    print_info "Installing ProtonUp-Qt as $REAL_USER via paru..."
-    echo ""
-    if sudo -u "$REAL_USER" paru -S --noconfirm protonup-qt; then
+    if aur_install protonup-qt; then
         print_success "ProtonUp-Qt installed successfully."
     else
-        print_error "Installation failed. Make sure paru is installed and try again."
+        print_error "Installation failed. Make sure shelly, paru, or yay is installed and try again."
     fi
 }
 
