@@ -164,28 +164,72 @@ BG_HEADER="\e[48;5;235m"
 # HELPERS
 # ==============================================================================
 
+# AUR helper — detects shelly, paru, or yay in that order
+aur_helper() {
+    if command -v shelly >/dev/null 2>&1; then printf "shelly"
+    elif command -v paru >/dev/null 2>&1;  then printf "paru"
+    elif command -v yay >/dev/null 2>&1;   then printf "yay"
+    else return 1
+    fi
+}
+
+aur_install() {
+    local package="$1"
+    local helper
+    if ! helper="$(aur_helper)"; then
+        print_error "No AUR helper found (shelly, paru, or yay). Please install one first."
+        return 1
+    fi
+    print_info "Installing $package via $helper..."
+    case "$helper" in
+        shelly) sudo -u "$REAL_USER" shelly aur install "$package" ;;
+        paru)   sudo -u "$REAL_USER" paru -S --noconfirm "$package" ;;
+        yay)    sudo -u "$REAL_USER" yay -S --noconfirm "$package" ;;
+    esac
+}
+
+aur_remove() {
+    local package="$1"
+    local helper
+    if ! helper="$(aur_helper)"; then
+        print_error "No AUR helper found (shelly, paru, or yay). Please install one first."
+        return 1
+    fi
+    print_info "Removing $package via $helper..."
+    case "$helper" in
+        shelly) shelly remove "$package" ;;
+        paru)   paru -Rns --noconfirm "$package" 2>/dev/null || true ;;
+        yay)    yay -Rns --noconfirm "$package" 2>/dev/null || true ;;
+    esac
+}
+
 print_banner() {
     clear
     echo -e "${BOLD}${CYAN}"
-    echo "  ╔══════════════════════════════════════════════════════════════╗"
-    echo "  ║                                                              ║"
-    echo "  ║              CachyOS BC250 Toolkit                           ║"
-    echo "  ║           System Setup & Configuration                       ║"
-    echo "  ║                                                              ║"
-    echo "  ╚══════════════════════════════════════════════════════════════╝"
+    echo "  ╔═════════════════════════════════════════════════════════════════════╗"
+    echo "  ║                                                                     ║"
+    echo "  ║                        CachyOS BC250 Toolkit                        ║"
+    echo "  ║                    System Setup & Configuration                     ║"
+    echo "  ║                                                                     ║"
+    echo "  ╚═════════════════════════════════════════════════════════════════════╝"
     echo -e "${RESET}"
 }
 
 print_section() {
     echo -e "  ${BOLD}${YELLOW}$1${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 }
 
 print_item() {
     local num="$1"
     local label="$2"
     local desc="$3"
-    printf "  ${BOLD}${WHITE}[${CYAN}%2s${WHITE}]${RESET}  %-19s ${DIM}%s${RESET}\n" "$num" "$label" "$desc"
+    # Calculate visual width by stripping multi-byte chars and measuring byte difference
+    local label_bytes=${#label}
+    local label_visual=$(echo -n "$label" | wc -m)
+    local extra=$(( label_bytes - label_visual ))
+    local width=$(( 26 + extra ))
+    printf "  ${BOLD}${WHITE}[${CYAN}%2s${WHITE}]${RESET}  %-${width}s ${DIM}%s${RESET}\n" "$num" "$label" "$desc"
 }
 
 print_success() {
@@ -262,8 +306,8 @@ run_gpu_governor() {
         return 0
     fi
 
-    print_info "Installing cyan-skillfish-governor-smu via paru (as $REAL_USER)..."
-    sudo -u "$REAL_USER" paru -S cyan-skillfish-governor-smu --noconfirm
+    print_info "Installing cyan-skillfish-governor-smu via AUR helper..."
+    aur_install cyan-skillfish-governor-smu
     print_info "Enabling and starting systemd service..."
     systemctl enable --now cyan-skillfish-governor-smu.service
     print_success "GPU Governor installed and started successfully!"
@@ -444,7 +488,7 @@ run_toggle_boot_mode() {
 
     echo -e "  ${CYAN}→${RESET}  Current: $current_mode"
     echo ""
-    print_item "1" "Game Mode"         "No password — boot straight to Steam UI"
+    print_item "1" "Game Mode"         "Auto-login to Steam UI"
     print_item "2" "Game Mode"         "Password required for desktop mode"
     print_item "3" "Desktop Mode"      "Password required on boot"
     print_item "4" "Desktop Mode"      "No password — autologin to Plasma"
@@ -497,51 +541,92 @@ EOF
 }
 
 run_switch_to_default_kernel() {
-    print_step "01" "Migrating to Default CachyOS Kernel"
+    print_step "01" "Installing Default CachyOS Kernel"
 
-    # 1. Check if we are already on the standard kernel
+    # Check if already installed
     if pacman -Qq linux-cachyos &>/dev/null; then
         print_info "Standard CachyOS kernel is already installed."
-
-        # If deckify is also there, we should still clean it up
-        if pacman -Qq linux-cachyos-deckify &>/dev/null; then
-            print_info "Deckify kernel found alongside standard. Proceeding to cleanup..."
-        else
+        if ! pacman -Qq linux-cachyos-deckify &>/dev/null; then
             print_success "System is already running the default kernel. Nothing to do."
             return 0
         fi
+        print_info "Deckify kernel found alongside standard — you can remove it via 'Remove Deckify Kernel'."
+        return 0
     fi
 
-    # 2. Check if Deckify is actually here to be replaced
+    # Check if Deckify is present
     if ! pacman -Qq linux-cachyos-deckify &>/dev/null; then
         print_error "linux-cachyos-deckify not found. Migration is not applicable."
         return 1
     fi
 
-    if ! confirm "This will install linux-cachyos and remove linux-cachyos-deckify. Proceed?"; then
+    if ! confirm "This will install linux-cachyos and linux-cachyos-headers. Proceed?"; then
         print_info "Cancelled."
         return 0
     fi
 
-    # 3. Install the default kernel
+    # Install the default kernel
     print_info "Installing linux-cachyos and headers..."
-    if ! sudo pacman -S --noconfirm linux-cachyos linux-cachyos-headers; then
+    if ! pacman -S --noconfirm linux-cachyos linux-cachyos-headers; then
         print_error "Failed to install the default CachyOS kernel."
         return 1
     fi
 
-    # 4. Remove the deckify kernel
-    print_info "Removing linux-cachyos-deckify..."
-    sudo pacman -Rs --noconfirm linux-cachyos-deckify linux-cachyos-deckify-headers 2>/dev/null
-
-    # 5. Update Limine
+    # Update bootloader
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
         print_info "Regenerating Limine boot menu..."
-        sudo limine-update
+        if ! limine-update; then
+            print_error "limine-update failed — do not remove Deckify kernel until this is resolved."
+            return 1
+        fi
     fi
 
-    print_success "System successfully migrated to default kernel."
-    print_info "Please reboot to apply changes."
+    print_success "linux-cachyos installed successfully."
+    echo ""
+    echo -e "  ${BOLD}${YELLOW}Next steps:${RESET}"
+    echo -e "  ${WHITE}1. Reboot your system${RESET}"
+    echo -e "  ${WHITE}2. At the Limine boot menu, select 'linux-cachyos'${RESET}"
+    echo -e "  ${WHITE}3. Verify the system boots correctly${RESET}"
+    echo -e "  ${WHITE}4. Return here and run 'Remove Deckify Kernel' to complete the migration${RESET}"
+    echo ""
+}
+
+run_remove_deckify_kernel() {
+    print_step "09" "Remove Deckify Kernel"
+
+    if ! pacman -Qq linux-cachyos-deckify &>/dev/null; then
+        print_info "linux-cachyos-deckify is not installed — nothing to remove."
+        return 0
+    fi
+
+    if ! pacman -Qq linux-cachyos &>/dev/null; then
+        print_error "linux-cachyos is not installed. Install and verify it boots before removing Deckify."
+        return 1
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}${RED}⚠  Only proceed if you have already rebooted into linux-cachyos and confirmed it works.${RESET}"
+    echo ""
+    if ! confirm "Remove linux-cachyos-deckify and its headers?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Removing linux-cachyos-deckify..."
+    if ! pacman -Rs --noconfirm linux-cachyos-deckify linux-cachyos-deckify-headers; then
+        print_error "Failed to remove Deckify kernel. Check pacman output above."
+        return 1
+    fi
+
+    if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
+        print_info "Regenerating Limine boot menu..."
+        if ! limine-update; then
+            print_error "limine-update failed — boot menu may need manual attention."
+            return 1
+        fi
+    fi
+
+    print_success "Deckify kernel removed successfully."
 }
 
 run_install_acpi_fix() {
@@ -1309,9 +1394,9 @@ PRESET_DESCS=(
     "CPU 3.5GHz, GPU 1750MHz — 80°C"
     "CPU 3.5GHz, GPU 1850MHz — 80°C"
     "CPU 3.5GHz, GPU 2000MHz — 80°C"
-    "CPU 3.5GHz, GPU 2100MHz — 80°C  [HIGH RISK]"
-    "CPU 3.85GHz, GPU 2100MHz — 80°C  [HIGH RISK]"
-    "CPU 4GHz, GPU 2350MHz — 90°C  [HIGH RISK]"
+    "CPU 3.5GHz, GPU 2100MHz — 80°C"
+    "CPU 3.85GHz, GPU 2100MHz — 80°C"
+    "CPU 4GHz, GPU 2350MHz — 90°C"
 )
 PRESET_CPU_WRITERS=(write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_overclock_3_85ghz write_cpu_overclock_4ghz)
 PRESET_GPU_WRITERS=(write_gpu_overclock_1500mhz write_gpu_overclock_1600mhz write_gpu_overclock_1750mhz write_gpu_overclock_1850mhz write_gpu_overclock_2000mhz write_gpu_overclock_2100mhz write_gpu_overclock_2100mhz write_gpu_overclock_2350mhz)
@@ -1518,12 +1603,13 @@ run_overclock_menu() {
             print_item "$((i+1))" "${PRESET_NAMES[$i]}" "${PRESET_DESCS[$i]}"
         done
         echo ""
-        print_item "C" "Custom"            "Mix & match CPU and GPU profiles"
-        print_item "E" "Edit GPU Config"   "Manually edit GPU config with nano"
-        print_item "F" "Edit CPU Config"   "Manually edit CPU config with nano"
-        print_item "0" "Back to Main Menu" ""
+        print_section "Advanced"
+        print_item "C" "Custom"          "Mix & match CPU and GPU profiles"
+        print_item "E" "Edit GPU Config" "Manually edit GPU config with nano"
+        print_item "F" "Edit CPU Config" "Manually edit CPU config with nano"
+        print_item "0" "Back"            ""
         echo ""
-        echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+        echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
         read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" oc_choice
 
         case "${oc_choice^^}" in
@@ -1684,7 +1770,7 @@ run_status() {
 
     # --- System ---
     echo -e "  ${BOLD}${YELLOW}System${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 
     local OVERRIDE_FILE="/etc/plasmalogin.conf.d/zzz-bc250-boot.conf"
     local boot_session="gamescope"
@@ -1712,7 +1798,7 @@ run_status() {
 
     # --- Overclock Profile ---
     echo -e "  ${BOLD}${YELLOW}Overclock${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
     if [[ -f "$CPU_CONF" ]]; then
         local cpu_freq cpu_scale cpu_temp cpu_preset
         cpu_freq=$(awk -F'= ' '/^frequency/{print $2}' "$CPU_CONF" | tr -d ' ')
@@ -1754,7 +1840,7 @@ run_status() {
 
     # --- Compute Units ---
     echo -e "  ${BOLD}${YELLOW}Compute Units${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
     if cu_find_umr; then
         cu_select_umr_instance
         local cu_total=0 cu_idx cu_se cu_sh cu_spi_hex cu_spi_val cu_wgp cu_bit
@@ -1780,7 +1866,7 @@ run_status() {
             fi
             echo -e "  ${CYAN}Active CUs${RESET}        ${cu_color}${BOLD}${cu_total}/40${RESET}  ${DIM}(default 24, max 40)${RESET}"
             if [ "$cu_total" -gt 24 ]; then
-                echo -e "  ${YELLOW}Additional compute units are unlocked — ensure adequate power and cooling${RESET}"
+                echo -e "  ${YELLOW}⚠  CUs unlocked — verify power and cooling${RESET}"
             fi
         else
             echo -e "  ${CYAN}Active CUs${RESET}        ${DIM}unavailable (umr could not read registers)${RESET}"
@@ -1792,7 +1878,7 @@ run_status() {
 
     # --- Memory / Swap ---
     echo -e "  ${BOLD}${YELLOW}Memory & Swap${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 
     # ZSWAP Detection
     local zswap_enabled zswap_compressor zswap_pool
@@ -1801,7 +1887,7 @@ run_status() {
     zswap_pool=$(cat /sys/module/zswap/parameters/max_pool_percent 2>/dev/null || echo "N/A")
     local zswap_color
     [[ "$zswap_enabled" == "Y" ]] && zswap_color="$GREEN" || zswap_color="$RED"
-    echo -e "  ${CYAN}ZSWAP${RESET}              ${zswap_color}${zswap_enabled}${RESET}  compressor=${zswap_compressor}  pool=${zswap_pool}%"
+    echo -e "  ${CYAN}ZSWAP${RESET}              ${zswap_color}${zswap_enabled}${RESET}  ${DIM}${zswap_compressor} / pool ${zswap_pool}%${RESET}"
 
     # ZRAM Detection (Checks kernel device instead of just one specific service)
     local zram_state="inactive"
@@ -1834,24 +1920,25 @@ run_status() {
         echo -e "    ${DIM}(No active swap devices found)${RESET}"
     else
         echo "$swap_output" | while read -r name type size used prio; do
-            echo -e "    ${DIM}${name}  ${type}  size=${size}  used=${used}  prio=${prio}${RESET}"
+            echo -e "    ${DIM}${name} (${size})${RESET}"
         done
     fi
     echo ""
 
     # --- Disk Space ---
     echo -e "  ${BOLD}${YELLOW}Disk Space${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
     local df_root df_boot
-    df_root=$(df -h / | awk 'NR==2 {printf "%s used of %s (%s free)", $3, $2, $4}')
-    df_boot=$(df -h /boot | awk 'NR==2 {printf "%s used of %s (%s free)", $3, $2, $4}')
+    df_root=$(df -h / | awk 'NR==2 {printf "%s/%s (%s free)", $3, $2, $4}')
+    df_boot=$(df -h /boot | awk 'NR==2 {printf "%s/%s (%s free)", $3, $2, $4}')
     echo -e "  ${CYAN}/${RESET}                 ${df_root}"
     echo -e "  ${CYAN}/boot${RESET}             ${df_boot}"
     echo ""
 
     # --- Kernel Parameters ---
-    echo -e "  ${BOLD}${YELLOW}Kernel Parameters${RESET}  ${DIM}(source: $LIMINE_CONF)${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${BOLD}${YELLOW}Kernel Parameters${RESET}"
+    echo -e "  ${DIM}source: $LIMINE_CONF${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 
     if [[ -f "$LIMINE_CONF" ]]; then
         local loglevel mitigations_off zram_disabled zswap_conf lz4_initrd
@@ -1871,7 +1958,7 @@ run_status() {
     fi
     echo ""
 
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 run_revert_loglevel() {
@@ -1982,7 +2069,7 @@ run_all() {
         (( failed++ ))
     fi
 
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
     if [[ "$failed" -eq 0 ]]; then
         print_success "All tasks completed successfully!"
     else
@@ -2032,7 +2119,7 @@ cu_err()  { echo -e "  ${BOLD}${RED}✘${RESET}  $*" >&2; }
 cu_die()  { cu_err "$@"; return 1; }
 
 cu_hr() {
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 cu_find_umr() {
@@ -2392,7 +2479,7 @@ cu_confirm_dispatch_plan() {
     print_section "$title"
     echo -e "  ${DIM}Legend: Default = driver default CUs, Enabled = additionally unlocked, Disabled = not active, Blocked = driver conflict${RESET}\n"
     printf "  %-9s %-30s %-30s %-20s\n" "Row" "Current" "Target" "Change"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────────────────────────${RESET}"
     for idx in 0 1 2 3; do
         current="${current_masks[$idx]}"
         target="${target_masks[$idx]}"
@@ -2420,12 +2507,12 @@ cu_module_status() {
 }
 
 cu_live_table_header() {
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────────────────────────${RESET}"
     printf "  %-9s %-8s %-8s %-8s %-8s %-8s %-8s %-12s %-8s\n" \
         "Row" "Pair0" "Pair1" "Pair2" "Pair3" "Pair4" "Routing" "CC Reg" "CUs"
     printf "  %-9s %-8s %-8s %-8s %-8s %-8s\n" \
         "" "CU0-1" "CU2-3" "CU4-5" "CU6-7" "CU8-9"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────────────────────────${RESET}"
 }
 
 cu_live_cell() {
@@ -2503,7 +2590,7 @@ cu_register_status() {
             printf "${DIM}%s${RESET}  %s  %3s/10 CUs\n" "$(cu_hex_mask "$spi")" "$cc_hex" "$count"
         done
     done
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────────────────────────${RESET}"
     echo ""
     echo -e "  ${BOLD}${WHITE}Routing total : ${total}/40 CUs${RESET}"
     [ "$service_has_config" -eq 1 ] && printf "  %-14s: %s\n" "Boot profile" "$(cu_mask_summary service_masks)"
@@ -2526,7 +2613,7 @@ cu_draw_table_editor() {
     echo -e "  ${GREEN}${BOLD}Default${RESET} = driver default CUs (locked)   ${CYAN}Enabled${RESET} = additionally unlocked   ${DIM}Disabled${RESET} = not active\n"
     printf "  %-9s %-8s %-8s %-8s %-8s %-8s\n" "Row" "Pair0" "Pair1" "Pair2" "Pair3" "Pair4"
     printf "  %-9s %-8s %-8s %-8s %-8s %-8s\n" "" "CU0-1" "CU2-3" "CU4-5" "CU6-7" "CU8-9"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
     for idx in 0 1 2 3; do
         printf "  %-9s" "$(cu_row_label "$idx")"
         for wgp in 0 1 2 3 4; do
@@ -2549,7 +2636,7 @@ cu_draw_table_editor() {
         done
         printf "\n"
     done
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 }
 
 cu_table_editor() {
@@ -2705,10 +2792,9 @@ cu_install_umr() {
     if command -v pacman >/dev/null 2>&1 && pacman -Si umr >/dev/null 2>&1; then
         cu_info "Installing umr with pacman..."; pacman -S --needed umr; return 0
     fi
-    if command -v paru >/dev/null 2>&1; then
-        [ -n "$REAL_USER" ] || { cu_die "paru install needs SUDO_USER set"; return 1; }
-        cu_info "Installing umr with paru as $REAL_USER..."
-        sudo -u "$REAL_USER" paru -S --needed umr; return 0
+    if aur_helper >/dev/null 2>&1; then
+        cu_info "Installing umr via AUR helper..."
+        aur_install umr; return 0
     fi
     if command -v rpm-ostree >/dev/null 2>&1; then
         cu_warn "rpm-ostree layering is host-level and may affect immutable system upgrades."
@@ -2721,7 +2807,7 @@ cu_install_umr() {
         dnf install -y umr && return 0
         cu_die "dnf could not install umr"; return 1
     fi
-    cu_die "could not install umr automatically — install with pacman/paru/rpm-ostree/dnf first"
+    cu_die "could not install umr automatically — install shelly, paru, or yay first"
 }
 
 dz_warn() {
@@ -2756,22 +2842,22 @@ show_danger_zone_menu() {
     print_section "⚠  Experimental/Danger Zone — Compute Units Unlock"
     echo -e "  ${DIM}Direct hardware register access. Read the status dashboard before making changes.${RESET}\n"
     print_section "Prerequisites"
-    print_item  "1"  "Install umr"               ""
+    print_item  "1"  "Install umr"              ""
     echo ""
     print_section "Compute Unit Management"
-    print_item  "2"  "CU Status Dashboard"        ""
-    print_item  "3"  "Edit Compute Pairs"         ""
-    print_item  "4"  "Enable All Compute Pairs"   ""
-    print_item  "5"  "Reset to Driver Default"    ""
+    print_item  "2"  "CU Status Dashboard"       ""
+    print_item  "3"  "Edit Compute Pairs"        ""
+    print_item  "4"  "Enable All Compute Pairs"  ""
+    print_item  "5"  "Reset to Driver Default"   ""
     echo ""
     print_section "Boot Persistence"
-    print_item  "6"  "Save Boot Profile"          ""
-    print_item  "7"  "Install Boot Service"       ""
-    print_item  "8"  "Uninstall Boot Service"     ""
+    print_item  "6"  "Save Boot Profile"         ""
+    print_item  "7"  "Install Boot Service"      ""
+    print_item  "8"  "Uninstall Boot Service"    ""
     echo ""
-    print_item  "0"  "Back"                       ""
+    print_item  "0"  "Back"                      ""
     echo ""
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 run_danger_zone_menu() {
@@ -2889,8 +2975,8 @@ run_revert_gpu_governor() {
     systemctl stop cyan-skillfish-governor-smu.service 2>/dev/null || true
     systemctl disable cyan-skillfish-governor-smu.service 2>/dev/null || true
 
-    print_info "Removing package via paru (as $REAL_USER)..."
-    sudo -u "$REAL_USER" paru -Rns --noconfirm cyan-skillfish-governor-smu 2>/dev/null || true
+    print_info "Removing cyan-skillfish-governor-smu via AUR helper..."
+    aur_remove cyan-skillfish-governor-smu
 
     print_success "GPU governor removed successfully."
 }
@@ -2899,17 +2985,17 @@ show_revert_menu() {
     print_banner
     print_section "Revert / Undo"
     echo -e "  ${DIM}Undo previously applied settings and restore defaults.${RESET}\n"
-    print_item  "1"  "Revert CPU Governor" "Disable and remove bc250-smu-oc service"
-    print_item  "2"  "Revert GPU Governor" "Disable and remove cyan-skillfish-governor-smu"
-    print_item  "3"  "Revert ZSWAP"        "Remove zswap, swapfile & re-enable ZRAM"
-    print_item  "4"  "Revert loglevel"     "Restore loglevel to default (3)"
-    print_item  "5"  "Revert Mitigations"  "Re-enable CPU security mitigations"
-    print_item  "6"  "Revert ACPI Fix"     "Remove ACPI fix and pacman hook"
-    print_item  "7"  "DolphinBar Setup"    "Remove DolphinBar udev rules"
+    print_item  "1"  "Revert CPU Governor"     "Remove bc250-smu-oc service"
+    print_item  "2"  "Revert GPU Governor"     "Remove cyan-skillfish-governor-smu"
+    print_item  "3"  "Revert ZSWAP"            "Re-enable ZRAM, remove swapfile"
+    print_item  "4"  "Revert loglevel"         "Restore loglevel to default (3)"
+    print_item  "5"  "Revert Mitigations"      "Re-enable CPU security mitigations"
+    print_item  "6"  "Revert ACPI Fix"         "Remove ACPI fix and pacman hook"
+    print_item  "7"  "Revert DolphinBar"       "Remove DolphinBar udev rules"
     echo ""
-    print_item  "0"  "Back"                "Return to main menu"
+    print_item  "0"  "Back"                    ""
     echo ""
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 run_revert_menu() {
@@ -2942,7 +3028,7 @@ run_update_toolkit() {
     print_section "Update Toolkit"
     echo ""
     print_item "1" "Stable"      "bc250-toolkit.sh"
-    print_item "2" "Pre-Release" "bc250-toolkit-pre.sh  (may contain bugs)"
+    print_item "2" "Pre-Release" "Pre-release build"
     echo ""
     print_item "0" "Cancel" ""
     echo ""
@@ -2985,21 +3071,23 @@ show_initial_setup_menu() {
     print_banner
     print_section "Initial Setup"
     echo -e "  ${DIM}Run these tasks to configure your BC-250 system.${RESET}\n"
-    print_item  "1"  "CachyOS Kernel"      "Replace Deckify kernel with standard CachyOS"
-    print_item  "2"  "CPU Governor"        "bc250-smu-oc CPU overclock service"
-    print_item  "3"  "GPU Governor"        "cyan-skillfish GPU governor service"
-    print_item  "4"  "Enable Swap"         "Btrfs swapfile with configurable size and swappiness"
-    print_item  "5"  "ZRAM -> ZSWAP"       "Disable ZRAM, enable ZSWAP w/ lz4"
-    print_item  "6"  "Hide RDSEED Warning" "Set loglevel=0 in /boot/limine.conf"
-    print_item  "7"  "Disable Mitigations" "Add mitigations=off to limine.conf"
-    print_item  "A"  "Run All (1-7)"       "Run all setup tasks in sequence"
+    print_item  "1"  "Install CachyOS Kernel"  "Replaces linux-cachyos-deckify"
+    print_item  "2"  "CPU Governor"            "bc250-smu-oc CPU overclock service"
+    print_item  "3"  "GPU Governor"            "cyan-skillfish GPU governor service"
+    print_item  "4"  "Enable Swap"             "Btrfs swapfile, configurable"
+    print_item  "5"  "ZRAM -> ZSWAP"           "Disable ZRAM, enable ZSWAP w/ lz4"
+    print_item  "6"  "Hide RDSEED Warning"     "Set loglevel=0 in /boot/limine.conf"
+    print_item  "7"  "Disable Mitigations"     "Add mitigations=off to limine.conf"
+    echo ""
+    print_item  "A"  "Run All (1-7)"           "Run all setup tasks in sequence"
     echo ""
     print_section "⚠  Manual Steps — not included in Run All"
-    print_item  "8"  "Compute Units Unlock" ""
+    print_item  "8"  "Compute Units Unlock"    ""
+    print_item  "9"  "Remove Deckify Kernel"   "Verify new kernel boots first"
     echo ""
-    print_item  "0"  "Back"                ""
+    print_item  "0"  "Back"                    ""
     echo ""
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 run_initial_setup_menu() {
@@ -3017,6 +3105,7 @@ run_initial_setup_menu() {
             7) run_disable_mitigations;       press_enter ;;
             A) run_all;                       press_enter ;;
             8) run_danger_zone_menu ;;
+            9) run_remove_deckify_kernel;     press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$is_choice'"
@@ -3048,12 +3137,10 @@ run_install_emudeck() {
 
 run_install_protonup_qt() {
     print_section "Install ProtonUp-Qt"
-    print_info "Installing ProtonUp-Qt as $REAL_USER via paru..."
-    echo ""
-    if sudo -u "$REAL_USER" paru -S --noconfirm protonup-qt; then
+    if aur_install protonup-qt; then
         print_success "ProtonUp-Qt installed successfully."
     else
-        print_error "Installation failed. Make sure paru is installed and try again."
+        print_error "Installation failed. Make sure shelly, paru, or yay is installed and try again."
     fi
 }
 
@@ -3062,14 +3149,14 @@ show_experimental_menu() {
     print_section "Additional Tools"
     echo -e "  ${DIM}Additional system utilities and hardware support.${RESET}\n"
     print_item  "1"  "Toggle Boot Mode"    "Switch between Game Mode & Desktop"
-    print_item  "2"  "DolphinBar Setup"    "Install udev rules for Wiimote support via DolphinBar"
+    print_item  "2"  "DolphinBar Setup"    "Wiimote support via DolphinBar"
     print_item  "3"  "Install Decky"       "Install the Decky plugin loader"
     print_item  "4"  "Install EmuDeck"     "Install the EmuDeck emulation suite"
     print_item  "5"  "Install ProtonUp-Qt" "Manage Proton and Wine versions"
     echo ""
-    print_item  "0"  "Back"               "Return to main menu"
+    print_item  "0"  "Back"               ""
     echo ""
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 run_experimental_menu() {
@@ -3095,19 +3182,19 @@ run_experimental_menu() {
 show_menu() {
     print_banner
     print_section "Performance"
-    print_item  "1"  "Performance Profiles" "CPU & GPU performance profiles"
+    print_item  "1"  "Performance Profiles"  "CPU & GPU performance profiles"
     echo ""
     print_section "Setup"
-    print_item  "2"  "Initial Setup"        "System configuration tasks"
-    print_item  "3"  "Additional Tools"     "Additional system utilities"
-    print_item  "4"  "Revert Menu"          "Undo previously applied settings"
+    print_item  "2"  "Initial Setup"         "System configuration tasks"
+    print_item  "3"  "Additional Tools"      "Additional system utilities"
+    print_item  "4"  "Revert Menu"           "Undo previously applied settings"
     echo ""
     print_section "System"
-    print_item  "S"  "Status"               "Current system summary"
-    print_item  "U"  "Update Toolkit"       "Download and install the latest version from GitHub"
-    print_item  "0"  "Exit"                 ""
+    print_item  "S"  "Status"                "Current system summary"
+    print_item  "U"  "Update Toolkit"        "Download latest version from GitHub"
+    print_item  "0"  "Exit"                  ""
     echo ""
-    echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
 }
 
 while true; do
