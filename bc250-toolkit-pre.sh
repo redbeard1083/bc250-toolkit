@@ -831,6 +831,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 1500
@@ -873,6 +877,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 1600
@@ -918,6 +926,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 1750
@@ -969,6 +981,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 1850
@@ -1020,6 +1036,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 2000
@@ -1074,6 +1094,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 2100
@@ -1134,6 +1158,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 2300
@@ -1209,6 +1237,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 2350
