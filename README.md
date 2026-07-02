@@ -21,6 +21,10 @@ In desktop mode run the below in the terminal(Konsole):
 <pre>
 curl -sSLO https://raw.githubusercontent.com/redbeard1083/bc250-toolkit/main/bc250-toolkit.sh && chmod +x bc250-toolkit.sh && ./bc250-toolkit.sh
 </pre>
+As it is a frequently asked question, to re-run the script after running it the first time:
+<pre>
+./bc250-toolkit.sh
+</pre>
 
 ```
   ╔══════════════════════════════════════════════════════════════╗
