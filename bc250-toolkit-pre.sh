@@ -203,6 +203,47 @@ aur_remove() {
     esac
 }
 
+# Bootloader detection
+detect_bootloader() {
+    if [[ -f /etc/default/limine ]]; then echo "limine"
+    elif [[ -f /etc/default/grub ]]; then echo "grub"
+    else echo "unknown"
+    fi
+}
+
+bootloader_conf() {
+    case "$(detect_bootloader)" in
+        limine) echo "/etc/default/limine" ;;
+        grub)   echo "/etc/default/grub" ;;
+        *)      echo "" ;;
+    esac
+}
+
+bootloader_update() {
+    case "$(detect_bootloader)" in
+        limine)
+            print_info "Regenerating Limine boot config..."
+            limine-update
+            ;;
+        grub)
+            print_info "Regenerating GRUB boot config..."
+            grub-mkconfig -o /boot/grub/grub.cfg
+            ;;
+        *)
+            print_error "Unknown bootloader — please update your boot config manually."
+            return 1
+            ;;
+    esac
+}
+
+bootloader_cmdline_var() {
+    case "$(detect_bootloader)" in
+        limine) echo "KERNEL_CMDLINE[default]" ;;
+        grub)   echo "GRUB_CMDLINE_LINUX_DEFAULT" ;;
+        *)      echo "" ;;
+    esac
+}
+
 print_banner() {
     clear
     echo -e "${BOLD}${CYAN}"
@@ -379,15 +420,18 @@ run_enable_swap() {
 }
 
 run_set_loglevel() {
-    local CONF="/etc/default/limine"
-    print_step "06" "Hiding RDSEED Warning — Setting loglevel=0 in $CONF"
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
+    print_step "06" "Hiding RDSEED Warning — Setting loglevel=0"
 
-    if [[ ! -f "$CONF" ]]; then
-        print_error "File not found: $CONF"
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
         return 1
     fi
+    print_info "Detected bootloader: $BOOTLOADER ($CONF)"
 
-    # Create backup before any modifications
     if [[ ! -f "${CONF}.bak" ]]; then
         print_info "Creating original backup at ${CONF}.bak ..."
         cp "$CONF" "${CONF}.bak"
@@ -395,35 +439,35 @@ run_set_loglevel() {
         print_info "Backup already exists — preserving original."
     fi
 
-    # 1. If loglevel= exists anywhere in the file, update it to 0
+    local cmdline_var
+    cmdline_var="$(bootloader_cmdline_var)"
+
     if grep -q 'loglevel=' "$CONF"; then
         print_info "loglevel= found. Updating value to 0..."
         sed -i 's/loglevel=[0-9]*/loglevel=0/g' "$CONF"
-
-    # 2. If loglevel= is missing, append it inside the KERNEL_CMDLINE[default] quotes
     else
-        print_info "loglevel= not found. Adding to KERNEL_CMDLINE[default]..."
-        # This matches the KERNEL_CMDLINE[default]+="... line and inserts loglevel=0 before the closing quote
-        sed -i '/^KERNEL_CMDLINE\[default\]/ s/\"$/ loglevel=0\"/' "$CONF"
+        print_info "loglevel= not found. Adding to $cmdline_var..."
+        sed -i "/^${cmdline_var}/ s/\"$/ loglevel=0\"/" "$CONF"
     fi
 
-    # Regenerate Limine config
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        print_info "Regenerating /boot/limine.conf..."
-        limine-update
+        bootloader_update
     fi
-
     print_success "loglevel set to 0. Reboot to apply."
 }
 
 run_disable_zram_enable_zswap() {
-    local CONF="/etc/default/limine"
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
     print_step "05" "Disabling ZRAM & Enabling ZSWAP"
 
-    if [[ ! -f "$CONF" ]]; then
-        print_error "File not found: $CONF"
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
         return 1
     fi
+    print_info "Detected bootloader: $BOOTLOADER ($CONF)"
 
     if [[ ! -f "${CONF}.bak" ]]; then
         print_info "Creating original backup at ${CONF}.bak ..."
@@ -432,12 +476,15 @@ run_disable_zram_enable_zswap() {
         print_info "Backup already exists at ${CONF}.bak — preserving original."
     fi
 
+    local cmdline_var
+    cmdline_var="$(bootloader_cmdline_var)"
+
     # --- Disable ZRAM ---
     if grep -q 'systemd\.zram=0' "$CONF"; then
         print_info "ZRAM already disabled in $CONF — skipping."
     else
         print_info "Disabling ZRAM..."
-        sed -i '/^KERNEL_CMDLINE/s/"$/ systemd.zram=0"/' "$CONF"
+        sed -i "/^${cmdline_var}/s/\"$/ systemd.zram=0\"/" "$CONF"
         print_info "systemd.zram=0 added."
     fi
 
@@ -446,7 +493,7 @@ run_disable_zram_enable_zswap() {
         print_info "ZSWAP already enabled in $CONF — skipping."
     else
         print_info "Enabling zswap (lz4, 25% pool)..."
-        sed -i '/^KERNEL_CMDLINE/s/"$/ zswap.enabled=1 zswap.max_pool_percent=25 zswap.compressor=lz4"/' "$CONF"
+        sed -i "/^${cmdline_var}/s/\"$/ zswap.enabled=1 zswap.max_pool_percent=25 zswap.compressor=lz4\"/" "$CONF"
         print_info "ZSWAP kernel parameters added."
     fi
 
@@ -463,8 +510,7 @@ run_disable_zram_enable_zswap() {
     fi
 
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        print_info "Regenerating /boot/limine.conf..."
-        limine-update
+        bootloader_update
     fi
     print_success "ZRAM disabled && ZSWAP enabled! Reboot to apply."
     echo -e "  ${DIM}After reboot, verify with: cat /sys/module/zswap/parameters/enabled${RESET}\n"
@@ -584,9 +630,8 @@ run_switch_to_default_kernel() {
 
     # Update bootloader
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        print_info "Regenerating Limine boot menu..."
-        if ! limine-update; then
-            print_error "limine-update failed — do not remove Deckify kernel until this is resolved."
+        if ! bootloader_update; then
+            print_error "Boot config update failed — do not remove Deckify kernel until this is resolved."
             return 1
         fi
     fi
@@ -629,9 +674,8 @@ run_remove_deckify_kernel() {
     fi
 
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        print_info "Regenerating Limine boot menu..."
-        if ! limine-update; then
-            print_error "limine-update failed — boot menu may need manual attention."
+        if ! bootloader_update; then
+            print_error "Boot config update failed — boot menu may need manual attention."
             return 1
         fi
     fi
@@ -639,161 +683,6 @@ run_remove_deckify_kernel() {
     print_success "Deckify kernel removed successfully."
 }
 
-run_install_acpi_fix() {
-    print_step "08" "Installing BC250 ACPI Fix"
-    print_info "NOTE: This fix is known to not work and is retained for reference only. Proceed at your own risk."
-    local CPIO_NAME="bc250_acpi.cpio"
-    local CPIO_DEST="/boot/$CPIO_NAME"
-    local LIMINE_CONFIG="/boot/limine.conf"
-    local HOOK_DIR="/etc/pacman.d/hooks"
-    local HOOK_FILE="$HOOK_DIR/bc250-acpi-fix.hook"
-    local INJECT_SCRIPT="/usr/local/bin/bc250-acpi-inject.sh"
-
-    # 1. Dependency & Lock Check
-    while [ -f /var/lib/pacman/db.lck ]; do sleep 2; done
-    if ! command -v git &>/dev/null || ! command -v cpio &>/dev/null; then
-        pacman -S --noconfirm git cpio
-    fi
-
-    # 2. Build the CPIO
-    local BUILD_DIR="/tmp/bc250-acpi-build"
-    rm -rf "$BUILD_DIR"
-    print_info "Cloning bc250-acpi-fix repository..."
-    git clone "https://github.com/bc250-collective/bc250-acpi-fix.git" "$BUILD_DIR" \
-        || { print_error "Failed to clone repository."; return 1; }
-    mkdir -p "$BUILD_DIR/kernel/firmware/acpi"
-    cp "$BUILD_DIR"/*.aml "$BUILD_DIR/kernel/firmware/acpi/" \
-        || { print_error "No .aml files found in repository."; return 1; }
-    ( cd "$BUILD_DIR" && find kernel | cpio -o -H newc > "$CPIO_DEST" 2>/dev/null )
-    print_success "ACPI archive created at $CPIO_DEST"
-
-    # 3. Install the inject script that pacman hook will call
-    print_info "Installing inject script at $INJECT_SCRIPT..."
-    mkdir -p /usr/local/bin
-    cat > "$INJECT_SCRIPT" <<'INJECT'
-#!/bin/bash
-# bc250-acpi-inject.sh — Re-inserts the ACPI CPIO module line into
-# /boot/limine.conf after every limine-update run.
-LIMINE_CONFIG="/boot/limine.conf"
-CPIO_NAME="bc250_acpi.cpio"
-
-if [[ ! -f "$LIMINE_CONFIG" ]]; then
-    echo "bc250-acpi-inject: $LIMINE_CONFIG not found, skipping." >&2
-    exit 0
-fi
-
-if grep -q "$CPIO_NAME" "$LIMINE_CONFIG"; then
-    exit 0  # already present, nothing to do
-fi
-
-# Insert one ACPI module_path line before the FIRST protocol: linux entry.
-# This ensures the CPIO is loaded for every kernel without duplicating lines.
-sed -i "0,/^  protocol: linux/{s/^  protocol: linux/  module_path: boot():\/${CPIO_NAME}\n  protocol: linux/}" \
-    "$LIMINE_CONFIG"
-
-echo "bc250-acpi-inject: ACPI module line inserted into $LIMINE_CONFIG."
-INJECT
-    chmod +x "$INJECT_SCRIPT"
-    print_success "Inject script installed."
-
-    # 4. Install the pacman hook so the inject script runs after every limine upgrade
-    print_info "Installing pacman hook at $HOOK_FILE..."
-    mkdir -p "$HOOK_DIR"
-    cat > "$HOOK_FILE" <<'HOOK'
-[Trigger]
-Operation = Install
-Operation = Upgrade
-Type = Package
-Target = limine
-
-[Action]
-Description = Re-injecting BC250 ACPI fix module into limine.conf...
-When = PostTransaction
-Exec = /usr/local/bin/bc250-acpi-inject.sh
-HOOK
-    print_success "Pacman hook installed — fix will survive kernel and limine updates."
-
-    # 5. Inject into the current limine.conf immediately
-    if [[ -f "$LIMINE_CONFIG" ]]; then
-        if grep -q "$CPIO_NAME" "$LIMINE_CONFIG"; then
-            print_info "ACPI module already present in $LIMINE_CONFIG."
-        else
-            print_info "Injecting ACPI module into current $LIMINE_CONFIG..."
-            "$INJECT_SCRIPT"
-            print_success "ACPI module line inserted."
-        fi
-    else
-        print_error "Could not find $LIMINE_CONFIG"
-        return 1
-    fi
-
-    print_success "ACPI fix installed. Reboot to apply."
-    echo -e "  ${DIM}After reboot, verify with: journalctl -k | grep -i 'acpi\\|c-state'${RESET}\n"
-    if confirm "Reboot now?"; then
-        reboot
-    fi
-}
-
-run_revert_acpi_fix() {
-    print_step "R-6" "Revert BC250 ACPI Fix"
-
-    local CPIO_DEST="/boot/bc250_acpi.cpio"
-    local HOOK_FILE="/etc/pacman.d/hooks/bc250-acpi-fix.hook"
-    local INJECT_SCRIPT="/usr/local/bin/bc250-acpi-inject.sh"
-    local LIMINE_CONFIG="/boot/limine.conf"
-    local CPIO_NAME="bc250_acpi.cpio"
-
-    if [[ ! -f "$CPIO_DEST" ]] && [[ ! -f "$HOOK_FILE" ]]; then
-        print_info "ACPI fix does not appear to be installed — nothing to revert."
-        return 0
-    fi
-
-    if ! confirm "This will remove the BC250 ACPI fix and its pacman hook. Proceed?"; then
-        print_info "Cancelled."
-        return 0
-    fi
-
-    # Remove the pacman hook
-    if [[ -f "$HOOK_FILE" ]]; then
-        print_info "Removing pacman hook..."
-        rm -f "$HOOK_FILE"
-        print_success "Pacman hook removed."
-    else
-        print_info "Pacman hook not found — skipping."
-    fi
-
-    # Remove the inject script
-    if [[ -f "$INJECT_SCRIPT" ]]; then
-        print_info "Removing inject script..."
-        rm -f "$INJECT_SCRIPT"
-        print_success "Inject script removed."
-    else
-        print_info "Inject script not found — skipping."
-    fi
-
-    # Remove the ACPI module line from limine.conf
-    if [[ -f "$LIMINE_CONFIG" ]] && grep -q "$CPIO_NAME" "$LIMINE_CONFIG"; then
-        print_info "Removing ACPI module line from $LIMINE_CONFIG..."
-        sed -i "/${CPIO_NAME}/d" "$LIMINE_CONFIG"
-        print_success "ACPI module line removed from $LIMINE_CONFIG."
-    else
-        print_info "ACPI module line not found in $LIMINE_CONFIG — skipping."
-    fi
-
-    # Remove the CPIO archive
-    if [[ -f "$CPIO_DEST" ]]; then
-        print_info "Removing ACPI CPIO archive..."
-        rm -f "$CPIO_DEST"
-        print_success "CPIO archive removed."
-    else
-        print_info "CPIO archive not found — skipping."
-    fi
-
-    print_success "ACPI fix reverted. Reboot to apply."
-    if confirm "Reboot now?"; then
-        reboot
-    fi
-}
 # ==============================================================================
 # OVERCLOCK MENU (embedded from 07-overclock_menu.sh)
 # ==============================================================================
@@ -1674,11 +1563,14 @@ run_overclock_menu() {
 
 
 run_revert_zswap() {
-    local CONF="/etc/default/limine"
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
     print_step "R-3" "Revert ZSWAP — Re-enabling ZRAM, removing swapfile"
 
-    if [[ ! -f "$CONF" ]]; then
-        print_error "File not found: $CONF"
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
         return 1
     fi
 
@@ -1762,8 +1654,8 @@ run_revert_zswap() {
         print_info "No swappiness config found — skipping."
     fi
 
-    print_info "Regenerating /boot/limine.conf..."
-    limine-update
+    print_info "Updating boot config..."
+    bootloader_update
     print_success "Revert complete! Reboot to restore ZRAM and disable ZSWAP."
     print_info "Note: ZRAM will not be active until after reboot."
     echo -e "  ${DIM}After reboot, verify with: systemctl is-active systemd-zram-setup@zram0.service${RESET}\n"
@@ -1771,13 +1663,17 @@ run_revert_zswap() {
 
 
 run_disable_mitigations() {
-    local CONF="/etc/default/limine"
-    print_step "07" "Disabling CPU Mitigations in $CONF"
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
+    print_step "07" "Disabling CPU Mitigations"
 
-    if [[ ! -f "$CONF" ]]; then
-        print_error "File not found: $CONF"
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
         return 1
     fi
+    print_info "Detected bootloader: $BOOTLOADER ($CONF)"
 
     if [[ ! -f "${CONF}.bak" ]]; then
         print_info "Creating original backup at ${CONF}.bak ..."
@@ -1787,15 +1683,17 @@ run_disable_mitigations() {
     fi
 
     if grep -q 'mitigations=off' "$CONF"; then
-        print_info "mitigations=off already present in $CONF — skipping."
+        print_info "mitigations=off already present — skipping."
         return 0
     fi
 
+    local cmdline_var
+    cmdline_var="$(bootloader_cmdline_var)"
     print_info "Adding mitigations=off..."
-    sed -i '/^KERNEL_CMDLINE/s/"$/ mitigations=off"/' "$CONF"
+    sed -i "/^${cmdline_var}/s/\"$/ mitigations=off\"/" "$CONF"
+
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        print_info "Regenerating /boot/limine.conf..."
-        limine-update
+        bootloader_update
     fi
     print_success "mitigations=off added. Reboot to apply."
     echo -e "  ${DIM}Note: this disables Spectre/Meltdown mitigations for a performance gain.${RESET}\n"
@@ -1805,7 +1703,10 @@ run_status() {
     print_banner
     print_section "System Status"
 
-    local LIMINE_CONF="/etc/default/limine"
+    local LIMINE_CONF
+    LIMINE_CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
     local CPU_CONF="/etc/bc250-smu-oc.conf"
     local GPU_CONF="/etc/cyan-skillfish-governor-smu/config.toml"
     local MKINITCPIO="/etc/mkinitcpio.conf"
@@ -1979,7 +1880,7 @@ run_status() {
 
     # --- Kernel Parameters ---
     echo -e "  ${BOLD}${YELLOW}Kernel Parameters${RESET}"
-    echo -e "  ${DIM}source: $LIMINE_CONF${RESET}"
+    echo -e "  ${DIM}bootloader: $BOOTLOADER — source: $LIMINE_CONF${RESET}"
     echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 
     if [[ -f "$LIMINE_CONF" ]]; then
@@ -2004,11 +1905,14 @@ run_status() {
 }
 
 run_revert_loglevel() {
-    local CONF="/etc/default/limine"
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
     print_step "R-4" "Revert loglevel — Restoring default"
 
-    if [[ ! -f "$CONF" ]]; then
-        print_error "File not found: $CONF"
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
         return 1
     fi
 
@@ -2028,17 +1932,19 @@ run_revert_loglevel() {
     fi
 
     sed -i 's/loglevel=[0-9]*/loglevel=3/g' "$CONF"
-    print_info "Regenerating /boot/limine.conf..."
-    limine-update
+    bootloader_update
     print_success "loglevel restored to 3. Reboot to apply."
 }
 
 run_revert_mitigations() {
-    local CONF="/etc/default/limine"
-    print_step "R-5" "Revert Mitigations — Re-enabling in $CONF"
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
+    print_step "R-5" "Revert Mitigations — Re-enabling"
 
-    if [[ ! -f "$CONF" ]]; then
-        print_error "File not found: $CONF"
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
         return 1
     fi
 
@@ -2054,8 +1960,7 @@ run_revert_mitigations() {
 
     print_info "Removing mitigations=off..."
     sed -i 's/ mitigations=off//g' "$CONF"
-    print_info "Regenerating /boot/limine.conf..."
-    limine-update
+    bootloader_update
     print_success "mitigations=off removed. Reboot to re-enable CPU security mitigations."
 }
 
@@ -2105,9 +2010,8 @@ run_all() {
 
     # Re-enable and run the bootloader update once at the end
     SKIP_LIMINE_UPDATE=0
-    print_info "Regenerating /boot/limine.conf..."
-    if ! limine-update; then
-        print_error "Failed to update Limine. Please run manually."
+    if ! bootloader_update; then
+        print_error "Failed to update boot config. Please run manually."
         (( failed++ ))
     fi
 
@@ -3032,8 +2936,7 @@ show_revert_menu() {
     print_item  "3"  "Revert ZSWAP"            "Re-enable ZRAM, remove swapfile"
     print_item  "4"  "Revert loglevel"         "Restore loglevel to default (3)"
     print_item  "5"  "Revert Mitigations"      "Re-enable CPU security mitigations"
-    print_item  "6"  "Revert ACPI Fix"         "Remove ACPI fix and pacman hook"
-    print_item  "7"  "Revert DolphinBar"       "Remove DolphinBar udev rules"
+    print_item  "6"  "Revert DolphinBar"       "Remove DolphinBar udev rules"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -3051,8 +2954,7 @@ run_revert_menu() {
             3) run_revert_zswap;              press_enter ;;
             4) run_revert_loglevel;           press_enter ;;
             5) run_revert_mitigations;        press_enter ;;
-            6) run_revert_acpi_fix;           press_enter ;;
-            7) run_revert_dolphinbar;         press_enter ;;
+            6) run_revert_dolphinbar;         press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
