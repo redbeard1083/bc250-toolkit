@@ -344,12 +344,22 @@ run_enable_swap() {
     swapoff /var/swap/swapfile 2>/dev/null || true
     rm -f /var/swap/swapfile 2>/dev/null || true
 
-    print_info "Recreating Btrfs subvolume..."
-    btrfs subvolume delete /var/swap 2>/dev/null || true
-    btrfs subvolume create /var/swap
+    # Detect filesystem type
+    local fs_type
+    fs_type=$(stat -f -c "%T" / 2>/dev/null || echo "unknown")
 
-    print_info "Creating ${swap_size}G swapfile..."
-    btrfs filesystem mkswapfile --size "${swap_size}G" /var/swap/swapfile
+    if [[ "$fs_type" == "btrfs" ]]; then
+        print_info "Btrfs detected — creating Btrfs subvolume and swapfile..."
+        btrfs subvolume delete /var/swap 2>/dev/null || true
+        btrfs subvolume create /var/swap
+        btrfs filesystem mkswapfile --size "${swap_size}G" /var/swap/swapfile
+    else
+        print_info "Non-Btrfs filesystem detected ($fs_type) — creating standard swapfile..."
+        mkdir -p /var/swap
+        dd if=/dev/zero of=/var/swap/swapfile bs=1M count=$(( swap_size * 1024 )) status=progress
+        chmod 600 /var/swap/swapfile
+        mkswap /var/swap/swapfile
+    fi
 
     print_info "Updating /etc/fstab..."
     sed -i '/\/var\/swap\/swapfile/d' /etc/fstab
