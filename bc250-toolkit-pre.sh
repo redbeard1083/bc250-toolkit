@@ -244,6 +244,86 @@ bootloader_cmdline_var() {
     esac
 }
 
+# Returns the cmdline var with regex special chars escaped for use in sed
+bootloader_cmdline_var_escaped() {
+    bootloader_cmdline_var | sed 's/\[/\\[/g; s/\]/\\]/g'
+}
+
+# Initramfs detection
+detect_initramfs() {
+    if command -v mkinitcpio &>/dev/null; then echo "mkinitcpio"
+    elif command -v dracut &>/dev/null;   then echo "dracut"
+    else echo "unknown"
+    fi
+}
+
+initramfs_add_module() {
+    local module="$1"
+    case "$(detect_initramfs)" in
+        mkinitcpio)
+            local MKINITCPIO="/etc/mkinitcpio.conf"
+            if grep -q "$module" "$MKINITCPIO"; then
+                print_info "$module already present in $MKINITCPIO — skipping."
+            else
+                print_info "Adding $module to initramfs modules..."
+                sed -i "s/^MODULES=(\(.*\))/MODULES=(\1 $module)/" "$MKINITCPIO"
+            fi
+            ;;
+        dracut)
+            local DRACUT_CONF="/etc/dracut.conf.d/bc250-modules.conf"
+            print_info "Adding $module to dracut config..."
+            echo "add_drivers+=\" $module \"" >> "$DRACUT_CONF"
+            ;;
+        *)
+            print_error "Unknown initramfs tool — add $module manually."
+            return 1
+            ;;
+    esac
+}
+
+initramfs_remove_module() {
+    local module="$1"
+    case "$(detect_initramfs)" in
+        mkinitcpio)
+            local MKINITCPIO="/etc/mkinitcpio.conf"
+            if grep -q "$module" "$MKINITCPIO"; then
+                print_info "Removing $module from initramfs modules..."
+                sed -i "s/ ${module}//g" "$MKINITCPIO"
+            else
+                print_info "$module not found in $MKINITCPIO — skipping."
+            fi
+            ;;
+        dracut)
+            local DRACUT_CONF="/etc/dracut.conf.d/bc250-modules.conf"
+            if [[ -f "$DRACUT_CONF" ]]; then
+                print_info "Removing $module from dracut config..."
+                sed -i "/ $module /d" "$DRACUT_CONF"
+            fi
+            ;;
+        *)
+            print_error "Unknown initramfs tool — remove $module manually."
+            return 1
+            ;;
+    esac
+}
+
+initramfs_rebuild() {
+    case "$(detect_initramfs)" in
+        mkinitcpio)
+            print_info "Rebuilding initramfs with mkinitcpio..."
+            mkinitcpio -P
+            ;;
+        dracut)
+            print_info "Rebuilding initramfs with dracut..."
+            dracut --force
+            ;;
+        *)
+            print_error "Unknown initramfs tool — rebuild manually."
+            return 1
+            ;;
+    esac
+}
+
 print_banner() {
     clear
     echo -e "${BOLD}${CYAN}"
@@ -441,13 +521,15 @@ run_set_loglevel() {
 
     local cmdline_var
     cmdline_var="$(bootloader_cmdline_var)"
+    local cmdline_var_esc
+    cmdline_var_esc="$(bootloader_cmdline_var_escaped)"
 
     if grep -q 'loglevel=' "$CONF"; then
         print_info "loglevel= found. Updating value to 0..."
         sed -i 's/loglevel=[0-9]*/loglevel=0/g' "$CONF"
     else
         print_info "loglevel= not found. Adding to $cmdline_var..."
-        sed -i "/^${cmdline_var}/ s/\"$/ loglevel=0\"/" "$CONF"
+        sed -i "/^${cmdline_var_esc}/ s/\"$/ loglevel=0\"/" "$CONF"
     fi
 
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
@@ -478,13 +560,15 @@ run_disable_zram_enable_zswap() {
 
     local cmdline_var
     cmdline_var="$(bootloader_cmdline_var)"
+    local cmdline_var_esc
+    cmdline_var_esc="$(bootloader_cmdline_var_escaped)"
 
     # --- Disable ZRAM ---
     if grep -q 'systemd\.zram=0' "$CONF"; then
         print_info "ZRAM already disabled in $CONF — skipping."
     else
         print_info "Disabling ZRAM..."
-        sed -i "/^${cmdline_var}/s/\"$/ systemd.zram=0\"/" "$CONF"
+        sed -i "/^${cmdline_var_esc}/s/\"$/ systemd.zram=0\"/" "$CONF"
         print_info "systemd.zram=0 added."
     fi
 
@@ -493,21 +577,14 @@ run_disable_zram_enable_zswap() {
         print_info "ZSWAP already enabled in $CONF — skipping."
     else
         print_info "Enabling zswap (lz4, 25% pool)..."
-        sed -i "/^${cmdline_var}/s/\"$/ zswap.enabled=1 zswap.max_pool_percent=25 zswap.compressor=lz4\"/" "$CONF"
+        sed -i "/^${cmdline_var_esc}/s/\"$/ zswap.enabled=1 zswap.max_pool_percent=25 zswap.compressor=lz4\"/" "$CONF"
         print_info "ZSWAP kernel parameters added."
     fi
 
     # --- Add lz4 modules to initramfs ---
-    local MKINITCPIO="/etc/mkinitcpio.conf"
-    if grep -q 'lz4' "$MKINITCPIO"; then
-        print_info "lz4 modules already present in $MKINITCPIO — skipping."
-    else
-        print_info "Adding lz4 and lz4_compress modules to initramfs..."
-        sed -i 's/^MODULES=(\(.*\))/MODULES=(\1 lz4 lz4_compress)/' "$MKINITCPIO"
-        print_info "Rebuilding initramfs (this may take a moment)..."
-        mkinitcpio -P
-        print_info "Initramfs rebuilt."
-    fi
+    initramfs_add_module lz4 || true
+    initramfs_add_module lz4_compress || true
+    initramfs_rebuild
 
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
         bootloader_update
@@ -1597,17 +1674,10 @@ run_revert_zswap() {
         print_info "systemd.zram=0 not found — ZRAM already enabled."
     fi
 
-    # --- Remove lz4 from mkinitcpio ---
-    local MKINITCPIO="/etc/mkinitcpio.conf"
-    if grep -q 'lz4' "$MKINITCPIO"; then
-        print_info "Removing lz4 modules from initramfs..."
-        sed -i 's/ lz4_compress//g;s/ lz4//g' "$MKINITCPIO"
-        print_info "Rebuilding initramfs..."
-        mkinitcpio -P
-        print_info "Initramfs rebuilt."
-    else
-        print_info "lz4 not found in $MKINITCPIO — skipping."
-    fi
+    # --- Remove lz4 from initramfs ---
+    initramfs_remove_module lz4_compress || true
+    initramfs_remove_module lz4 || true
+    initramfs_rebuild
 
     # --- Disable and remove swapfile ---
     if swapon --show | grep -q '/var/swap/swapfile'; then
@@ -1689,8 +1759,10 @@ run_disable_mitigations() {
 
     local cmdline_var
     cmdline_var="$(bootloader_cmdline_var)"
+    local cmdline_var_esc
+    cmdline_var_esc="$(bootloader_cmdline_var_escaped)"
     print_info "Adding mitigations=off..."
-    sed -i "/^${cmdline_var}/s/\"$/ mitigations=off\"/" "$CONF"
+    sed -i "/^${cmdline_var_esc}/s/\"$/ mitigations=off\"/" "$CONF"
 
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
         bootloader_update
@@ -1889,7 +1961,20 @@ run_status() {
         grep -q 'mitigations=off' "$LIMINE_CONF" && mitigations_off="off ${RED}(vulnerable)${RESET}" || mitigations_off="${GREEN}on (default)${RESET}"
         grep -q 'systemd\.zram=0' "$LIMINE_CONF" && zram_disabled="${RED}disabled${RESET}" || zram_disabled="${GREEN}enabled (default)${RESET}"
         grep -q 'zswap\.enabled=1' "$LIMINE_CONF" && zswap_conf="${GREEN}enabled${RESET}" || zswap_conf="${DIM}not set${RESET}"
-        grep -q 'lz4' "$MKINITCPIO" 2>/dev/null && lz4_initrd="${GREEN}yes${RESET}" || lz4_initrd="${DIM}no${RESET}"
+        local initramfs_tool
+        initramfs_tool="$(detect_initramfs)"
+        case "$initramfs_tool" in
+            mkinitcpio)
+                local MKINITCPIO="/etc/mkinitcpio.conf"
+                grep -q 'lz4' "$MKINITCPIO" 2>/dev/null && lz4_initrd="${GREEN}yes${RESET}" || lz4_initrd="${DIM}no${RESET}"
+                ;;
+            dracut)
+                grep -rq 'lz4' /etc/dracut.conf.d/ 2>/dev/null && lz4_initrd="${GREEN}yes${RESET}" || lz4_initrd="${DIM}no${RESET}"
+                ;;
+            *)
+                lz4_initrd="${DIM}unknown${RESET}"
+                ;;
+        esac
 
         echo -e "  ${CYAN}loglevel${RESET}          ${loglevel}"
         echo -e "  ${CYAN}Mitigations${RESET}       ${mitigations_off}"
@@ -3020,8 +3105,8 @@ show_initial_setup_menu() {
     print_item  "3"  "GPU Governor"            "cyan-skillfish GPU governor service"
     print_item  "4"  "Enable Swap"             "Btrfs swapfile, configurable"
     print_item  "5"  "ZRAM -> ZSWAP"           "Disable ZRAM, enable ZSWAP w/ lz4"
-    print_item  "6"  "Hide RDSEED Warning"     "Set loglevel=0 in /boot/limine.conf"
-    print_item  "7"  "Disable Mitigations"     "Add mitigations=off to limine.conf"
+    print_item  "6"  "Hide RDSEED Warning"     "Set loglevel=0 in bootloader config"
+    print_item  "7"  "Disable Mitigations"     "Add mitigations=off to bootloader config"
     echo ""
     print_item  "A"  "Run All (1-7)"           "Run all setup tasks in sequence"
     echo ""
