@@ -1,5 +1,6 @@
 # bc250-toolkit
 Setup script for BC250 on CachyOS
+(However, the pre-release version of the script aims to work across any arch distro, but no guarantees as it needs to be tested.)
 
 Disclaimer:  I am not responsible for any damages caused by use of this script.  Please review it to make sure the overclocking configs are compatible with your board. Unlocking compute units will increase power draw and heat.  You are responsible for your own power and cooling setups.  Misuse of this script could cause physical damage to your board.
 
