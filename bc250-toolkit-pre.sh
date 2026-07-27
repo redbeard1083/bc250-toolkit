@@ -404,34 +404,50 @@ confirm() {
 run_cpu_governor() {
     print_step "02" "Installing CPU Governor"
 
+    local user_home
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    local user_bin="$user_home/.local/bin"
+    local build_dir="$user_home/.cache/bc250-toolkit/bc250_smu_oc"
+
     if systemctl is-enabled bc250-smu-oc.service &>/dev/null || \
-       pipx list 2>/dev/null | grep -q 'bc250-smu-oc'; then
+       [[ -x "$user_bin/bc250-detect" ]]; then
         print_info "CPU governor already installed — skipping."
         return 0
     fi
 
     print_info "Installing dependencies: python-pipx, stress"
     pacman -Syu python-pipx stress --noconfirm || { print_error "Failed to install dependencies."; return 1; }
-    print_info "Cloning bc250_smu_oc repository..."
-    if [[ -d "bc250_smu_oc" ]]; then
+
+    print_info "Cloning bc250_smu_oc repository as $REAL_USER..."
+    sudo -u "$REAL_USER" mkdir -p "$(dirname "$build_dir")"
+    if [[ -d "$build_dir" ]]; then
         print_info "Directory already exists — pulling latest changes..."
-        git -C bc250_smu_oc pull || { print_error "Failed to pull repository."; return 1; }
+        sudo -u "$REAL_USER" git -C "$build_dir" pull || { print_error "Failed to pull repository."; return 1; }
     else
-        git clone https://github.com/bc250-collective/bc250_smu_oc.git || { print_error "Failed to clone repository."; return 1; }
+        sudo -u "$REAL_USER" git clone https://github.com/bc250-collective/bc250_smu_oc.git "$build_dir" || { print_error "Failed to clone repository."; return 1; }
     fi
-    cd bc250_smu_oc
-    print_info "Installing via pipx..."
-    pipx install . || { print_error "Failed to install via pipx."; cd ..; return 1; }
-    pipx ensurepath || true
-    export PATH="$PATH:/root/.local/bin"
-    print_info "Running bc250-detect..."
-    bc250-detect --frequency 3500 --vid 1000 --keep || { print_error "bc250-detect failed."; cd ..; return 1; }
+
+    # Install and run as the real user, not root — bc250_smu_oc installs into
+    # the invoking user's pipx bin dir and elevates itself internally when it
+    # needs SMU access. Installing as root instead puts the binaries in
+    # /root/.local/bin, where the user's own shell can never find them.
+    print_info "Installing via pipx as $REAL_USER..."
+    sudo -u "$REAL_USER" bash -c "cd '$build_dir' && pipx install . && pipx ensurepath" \
+        || { print_error "Failed to install via pipx."; return 1; }
+
+    print_info "Running bc250-detect as $REAL_USER (it will elevate privileges itself if needed)..."
+    sudo -u "$REAL_USER" env PATH="$user_bin:$PATH" bash -c "cd '$build_dir' && bc250-detect --frequency 3500 --vid 1000 --keep" \
+        || { print_error "bc250-detect failed."; return 1; }
+
     print_info "Applying overclock config..."
-    bc250-apply --install overclock.conf || { print_error "bc250-apply failed."; cd ..; return 1; }
+    sudo -u "$REAL_USER" env PATH="$user_bin:$PATH" bash -c "cd '$build_dir' && bc250-apply --install overclock.conf" \
+        || { print_error "bc250-apply failed."; return 1; }
+
     print_info "Enabling systemd service..."
-    systemctl enable bc250-smu-oc || { print_error "Failed to enable service."; cd ..; return 1; }
-    cd ..
+    systemctl enable bc250-smu-oc || { print_error "Failed to enable service."; return 1; }
+
     print_success "CPU Governor installed successfully!"
+    echo -e "  ${DIM}bc250-detect / bc250-apply are on ${REAL_USER}'s PATH at ${user_bin}${RESET}\n"
 }
 
 run_gpu_governor() {
@@ -3332,7 +3348,13 @@ run_revert_dolphinbar() {
 run_revert_cpu_governor() {
     print_step "R-1" "Revert CPU Governor — Removing bc250-smu-oc"
 
+    local user_home
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    local user_bin="$user_home/.local/bin"
+
     if ! systemctl is-enabled bc250-smu-oc.service &>/dev/null && \
+       [[ ! -x "$user_bin/bc250-detect" ]] && \
+       ! sudo -u "$REAL_USER" pipx list 2>/dev/null | grep -q 'bc250-smu-oc' && \
        ! pipx list 2>/dev/null | grep -q 'bc250-smu-oc'; then
         print_info "CPU governor does not appear to be installed — nothing to revert."
         return 0
@@ -3347,7 +3369,9 @@ run_revert_cpu_governor() {
     systemctl stop bc250-smu-oc.service 2>/dev/null || true
     systemctl disable bc250-smu-oc.service 2>/dev/null || true
 
-    print_info "Uninstalling via pipx..."
+    print_info "Uninstalling via pipx as $REAL_USER..."
+    sudo -u "$REAL_USER" pipx uninstall bc250-smu-oc 2>/dev/null || true
+    # Also try root's pipx, in case an older toolkit version installed it there
     pipx uninstall bc250-smu-oc 2>/dev/null || true
 
     if [[ -f "$CPU_DEST" ]]; then
