@@ -1891,6 +1891,23 @@ run_status() {
     fi
     echo ""
 
+    # --- BC-250 Memory Config (bc250_memcfg) ---
+    echo -e "  ${BOLD}${YELLOW}Memory Config (bc250_memcfg)${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
+    if memcfg_installed; then
+        echo -e "  ${CYAN}Tool${RESET}              ${GREEN}installed${RESET}  ${DIM}($MEMCFG_BIN)${RESET}"
+        local status_vram_size
+        status_vram_size="$(memcfg_current_uma_size)"
+        if [[ -n "$status_vram_size" ]]; then
+            echo -e "  ${CYAN}VRAM Size${RESET}         ${BOLD}${WHITE}${status_vram_size}MB${RESET}  ${DIM}(UMA_SIZE, current CMOS setting)${RESET}"
+        else
+            echo -e "  ${CYAN}VRAM Size${RESET}         ${DIM}unknown — see Initial Setup > BC-250 Memory Config${RESET}"
+        fi
+    else
+        echo -e "  ${CYAN}Tool${RESET}              ${DIM}not installed${RESET}"
+    fi
+    echo ""
+
     # --- Memory / Swap ---
     echo -e "  ${BOLD}${YELLOW}Memory & Swap${RESET}"
     echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
@@ -2115,11 +2132,11 @@ run_all() {
 # Terminology mapping:
 #   WGP (Work Group Processor) → Compute Pair  (always 2 CUs)
 #   SE/SH rows                 → Row           (SE0.SH0 etc.)
-#   SPI dispatch               → Routing
-#   D+ / S+ / D!               → Default / Enabled / Blocked
-#   stock-dispatch             → Reset to Driver Default
-#   write-service-table        → Save Boot Profile
-#   apply-service              → Apply Saved Boot Profile
+#   SPI dispatch                → Routing
+#   D+ / S+ / D!                → Default / Enabled / Blocked
+#   stock-dispatch              → Reset to Driver Default
+#   write-service-table         → Save Boot Profile
+#   apply-service                → Apply Saved Boot Profile
 # ==============================================================================
 
 CU_BC250_PCI_ID="13fe"
@@ -2916,6 +2933,208 @@ run_danger_zone_menu() {
 }
 
 # ==============================================================================
+# BC-250 MEMORY CONFIG (bc250_memcfg — https://github.com/fanoush/bc250_memcfg)
+# ==============================================================================
+
+MEMCFG_REPO_URL="https://github.com/fanoush/bc250_memcfg.git"
+MEMCFG_BUILD_DIR="/tmp/bc250_memcfg_build"
+MEMCFG_BIN="/usr/local/bin/bc250memcfg"
+MEMCFG_VERSION_FILE="/usr/local/share/bc250-memcfg.commit"
+
+memcfg_installed() {
+    [[ -x "$MEMCFG_BIN" ]]
+}
+
+# Prints the remote HEAD commit hash, or empty string if it couldn't be reached
+memcfg_remote_commit() {
+    git ls-remote "$MEMCFG_REPO_URL" HEAD 2>/dev/null | awk '{print $1}'
+}
+
+memcfg_installed_commit() {
+    [[ -f "$MEMCFG_VERSION_FILE" ]] && cat "$MEMCFG_VERSION_FILE"
+}
+
+run_install_memcfg() {
+    print_step "AT-6" "Installing bc250_memcfg"
+
+    print_info "Checking for the latest version..."
+    local remote_commit
+    remote_commit="$(memcfg_remote_commit)"
+
+    if memcfg_installed; then
+        local installed_commit
+        installed_commit="$(memcfg_installed_commit)"
+        if [[ -z "$remote_commit" ]]; then
+            print_info "Could not reach GitHub to check for updates — keeping existing install at $MEMCFG_BIN."
+            return 0
+        elif [[ -n "$installed_commit" && "$installed_commit" == "$remote_commit" ]]; then
+            print_info "bc250_memcfg is already up to date ($MEMCFG_BIN)."
+            return 0
+        else
+            print_info "bc250_memcfg is installed at $MEMCFG_BIN, but a newer version is available upstream."
+            if ! confirm "Rebuild and reinstall the latest version?"; then
+                print_info "Keeping current install."
+                return 0
+            fi
+        fi
+    fi
+
+    print_info "Installing build dependencies: base-devel"
+    pacman -S --needed --noconfirm base-devel || { print_error "Failed to install build dependencies."; return 1; }
+
+    print_info "Cloning bc250_memcfg repository..."
+    rm -rf "$MEMCFG_BUILD_DIR"
+    if ! git clone "$MEMCFG_REPO_URL" "$MEMCFG_BUILD_DIR"; then
+        print_error "Failed to clone repository."
+        return 1
+    fi
+
+    print_info "Building bc250memcfg..."
+    if ! make -C "$MEMCFG_BUILD_DIR"; then
+        print_error "Build failed."
+        return 1
+    fi
+
+    # The Makefile's output binary name — fall back to searching the build dir
+    local built_bin="$MEMCFG_BUILD_DIR/bc250memcfg"
+    if [[ ! -x "$built_bin" ]]; then
+        built_bin="$(find "$MEMCFG_BUILD_DIR" -maxdepth 1 -type f -executable | head -1)"
+    fi
+    if [[ -z "$built_bin" || ! -x "$built_bin" ]]; then
+        print_error "Build did not produce an executable."
+        return 1
+    fi
+
+    print_info "Installing binary to $MEMCFG_BIN..."
+    install -m 0755 "$built_bin" "$MEMCFG_BIN"
+
+    # Record the commit we just built so future runs can detect updates
+    local built_commit
+    built_commit="$(git -C "$MEMCFG_BUILD_DIR" rev-parse HEAD 2>/dev/null || printf '%s' "$remote_commit")"
+    if [[ -n "$built_commit" ]]; then
+        mkdir -p "$(dirname "$MEMCFG_VERSION_FILE")"
+        echo "$built_commit" > "$MEMCFG_VERSION_FILE"
+    fi
+
+    rm -rf "$MEMCFG_BUILD_DIR"
+
+    print_success "bc250_memcfg installed successfully!"
+}
+
+memcfg_warn() {
+    echo ""
+    echo -e "  ${BOLD}${RED}⚠  WARNING: Direct BIOS CMOS Memory Configuration${RESET}"
+    echo ""
+    echo -e "  ${WHITE}This tool writes directly to the battery-backed CMOS RAM the BIOS"
+    echo -e "  uses for memory configuration (VRAM size, memory timings). Incorrect"
+    echo -e "  values can cause instability or a failure to boot."
+    echo ""
+    echo -e "  Changes only take effect after a reboot. To revert to defaults you"
+    echo -e "  must clear CMOS via the board jumper, or by removing the battery —"
+    echo -e "  this tool cannot undo its own changes.${RESET}"
+    echo ""
+    echo -e "  ${DIM}Type ${RESET}${BOLD}${YELLOW}yes${RESET}${DIM} to continue, or press Enter to cancel.${RESET}"
+    echo ""
+    read -rp "  → " mc_ack
+    [[ "${mc_ack,,}" == "yes" ]]
+}
+
+run_memcfg_show() {
+    print_step "AT-6" "Current Memory Configuration"
+    if ! memcfg_installed; then
+        print_error "bc250_memcfg is not installed. Run 'Install bc250_memcfg' first."
+        return 1
+    fi
+    "$MEMCFG_BIN"
+}
+
+# Best-effort parse of the current UMA_SIZE (VRAM size in MB) from the tool's
+# no-args output. The exact print format isn't documented upstream, so this
+# grabs the first number on whatever line mentions UMA_SIZE.
+memcfg_current_uma_size() {
+    memcfg_installed || return 1
+    "$MEMCFG_BIN" 2>/dev/null | grep -i 'UMA_SIZE' | head -1 | grep -oE '[0-9]+' | head -1
+}
+
+run_memcfg_set_uma_size() {
+    print_step "AT-6" "Set VRAM Size (UMA_SIZE)"
+    if ! memcfg_installed; then
+        print_error "bc250_memcfg is not installed. Run 'Install bc250_memcfg' first."
+        return 1
+    fi
+
+    memcfg_warn || { print_info "Cancelled."; return 0; }
+
+    echo ""
+    read -rp "$(echo -e "  ${BOLD}${WHITE}VRAM size in MB, >=256, aligned to 16MB steps (default: 512):${RESET} ")" uma_input
+    local uma_size
+    if [[ -z "$uma_input" ]]; then
+        uma_size="512"
+    elif [[ "$uma_input" =~ ^[0-9]+$ ]] && (( uma_input >= 256 )); then
+        uma_size="$uma_input"
+    else
+        print_error "Invalid size '$uma_input' — must be an integer >= 256."
+        return 1
+    fi
+
+    if ! confirm "Set UMA_SIZE to ${uma_size}MB? A reboot is required to apply."; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    "$MEMCFG_BIN" UMA_SIZE "$uma_size"
+    print_success "UMA_SIZE written. Reboot to apply."
+}
+
+show_memcfg_menu() {
+    print_banner
+    print_section "BC-250 Memory Config"
+    echo -e "  ${DIM}Configure BIOS CMOS memory settings via bc250_memcfg (https://github.com/fanoush/bc250_memcfg).${RESET}\n"
+    local status_label
+    if memcfg_installed; then
+        status_label="${GREEN}installed${RESET}  ${DIM}($MEMCFG_BIN)${RESET}"
+    else
+        status_label="${DIM}not installed${RESET}"
+    fi
+    echo -e "  ${CYAN}Status${RESET}      ${status_label}"
+    if memcfg_installed; then
+        local current_vram
+        current_vram="$(memcfg_current_uma_size)"
+        if [[ -n "$current_vram" ]]; then
+            echo -e "  ${CYAN}VRAM Size${RESET}   ${BOLD}${WHITE}${current_vram}MB${RESET}  ${DIM}(UMA_SIZE, current CMOS setting)${RESET}"
+        else
+            echo -e "  ${CYAN}VRAM Size${RESET}   ${DIM}unknown — see 'Show Current Config' for raw output${RESET}"
+        fi
+    fi
+    echo -e "  ${DIM}(Re-running Install checks GitHub and offers to rebuild if a newer version exists.)${RESET}\n"
+    print_item "1" "Install bc250_memcfg" "Build and install from source"
+    print_item "2" "Show Current Config"  "Print all tunable memory parameters"
+    print_item "3" "Set VRAM Size"        "Set UMA_SIZE (requires reboot)"
+    echo ""
+    print_item "0" "Back" ""
+    echo ""
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_memcfg_menu() {
+    while true; do
+        show_memcfg_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" mc_choice
+
+        case "${mc_choice^^}" in
+            1) run_install_memcfg;      press_enter ;;
+            2) run_memcfg_show;         press_enter ;;
+            3) run_memcfg_set_uma_size; press_enter ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$mc_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ==============================================================================
 # ADDITIONAL TOOLS FUNCTIONS
 # ==============================================================================
 
@@ -3112,7 +3331,8 @@ show_initial_setup_menu() {
     echo ""
     print_section "⚠  Manual Steps — not included in Run All"
     print_item  "8"  "Compute Units Unlock"    ""
-    print_item  "9"  "Remove Deckify Kernel"   "Verify new kernel boots first"
+    print_item  "9"  "BC-250 Memory Config"    "Configure VRAM size via bc250_memcfg"
+    print_item  "10" "Remove Deckify Kernel"   "Verify new kernel boots first"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -3134,7 +3354,8 @@ run_initial_setup_menu() {
             7) run_disable_mitigations;       press_enter ;;
             A) run_all;                       press_enter ;;
             8) run_danger_zone_menu ;;
-            9) run_remove_deckify_kernel;     press_enter ;;
+            9) run_memcfg_menu ;;
+            10) run_remove_deckify_kernel;    press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$is_choice'"
@@ -3208,6 +3429,15 @@ run_experimental_menu() {
     done
 }
 
+run_reboot() {
+    if confirm "Reboot the system now?"; then
+        echo -e "\n  ${DIM}Rebooting...${RESET}\n"
+        systemctl reboot
+    else
+        print_info "Cancelled."
+    fi
+}
+
 show_menu() {
     print_banner
     print_section "Performance"
@@ -3221,6 +3451,7 @@ show_menu() {
     print_section "System"
     print_item  "S"  "Status"                "Current system summary"
     print_item  "U"  "Update Toolkit"        "Download latest version from GitHub"
+    print_item  "R"  "Reboot"                "Restart the system"
     print_item  "0"  "Exit"                  ""
     echo ""
     echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
@@ -3237,6 +3468,7 @@ while true; do
         4) run_revert_menu ;;
         S) run_status;        press_enter ;;
         U) run_update_toolkit ;;
+        R) run_reboot ;;
         0)
             echo -e "\n  ${DIM}Goodbye.${RESET}\n"
             exit 0
