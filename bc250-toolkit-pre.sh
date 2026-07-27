@@ -85,10 +85,26 @@ if [[ "${1:-}" == "apply-service" ]] || [[ "${2:-}" == "apply-service" ]]; then
         service_masks[$_i]="$_v"
     done
 
-    # Verify ASIC is reachable
-    _out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -r "$CU_ASIC.$CU_REG_SPI" 2>&1 || true)"
-    _val="$(printf '%s\n' "$_out" | cu_parse_hex)"
-    [ -n "$_val" ] || cu_die "umr could not read $CU_ASIC.$CU_REG_SPI — GPU not ready"
+    # Verify ASIC is reachable — retry with a bounded backoff. The DRM render
+    # node (checked by ExecStartPre) can exist before the GPU is actually
+    # ready to service umr register reads, causing a single-shot check to
+    # fail intermittently at boot. See GitHub issue #9.
+    _cu_max_attempts="${BC250_CU_RETRY_ATTEMPTS:-60}"
+    _cu_retry_delay="${BC250_CU_RETRY_DELAY:-1}"
+    _val=""
+    for (( _attempt = 1; _attempt <= _cu_max_attempts; _attempt++ )); do
+        _out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -r "$CU_ASIC.$CU_REG_SPI" 2>&1 || true)"
+        _val="$(printf '%s\n' "$_out" | cu_parse_hex)"
+        if [ -n "$_val" ]; then
+            cu_info "GPU register access ready on attempt ${_attempt}/${_cu_max_attempts}"
+            break
+        fi
+        if [ "$_attempt" -eq "$_cu_max_attempts" ]; then
+            cu_die "umr could not read $CU_ASIC.$CU_REG_SPI after ${_cu_max_attempts} attempts — GPU not ready"
+        fi
+        cu_warn "GPU not ready, retrying in ${_cu_retry_delay}s (${_attempt}/${_cu_max_attempts})"
+        sleep "$_cu_retry_delay"
+    done
 
     # Apply masks
     declare -a target_masks=("${service_masks[@]}")
@@ -2797,12 +2813,15 @@ cu_install_service() {
     cat > "$CU_SERVICE_PATH" <<EOF
 [Unit]
 Description=BC-250 CU saved enumeration and dispatch
-After=systemd-udev-settle.service
+After=systemd-udev-settle.service cyan-skillfish-governor-smu.service
 Wants=systemd-udev-settle.service
 
 [Service]
 Type=oneshot
+Environment="BC250_CU_RETRY_ATTEMPTS=60"
+Environment="BC250_CU_RETRY_DELAY=1"
 EnvironmentFile=-$CU_SERVICE_CONF
+TimeoutStartSec=150s
 ExecStartPre=/usr/bin/bash -c 'for _ in {1..30}; do compgen -G "/dev/dri/renderD*" >/dev/null && exit 0; sleep 1; done; exit 1'
 ExecStart=$CU_SERVICE_BIN --yes apply-service
 RemainAfterExit=yes
