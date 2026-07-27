@@ -17,6 +17,7 @@ It does the following:
 6. Easily change CPU and GPU overclock settings on the fly
 7. Displays a status window showing you your current settings.
 8. Unlock compute units thanks to: https://github.com/WinnieLV/bc250-cu-live-manager
+9. Set vram split and ttm pages: https://github.com/fanoush/bc250_memcfg (pre-release)
 
 In desktop mode run the below in the terminal(Konsole):
 <pre>
