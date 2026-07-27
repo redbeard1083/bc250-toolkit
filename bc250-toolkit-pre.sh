@@ -1989,11 +1989,18 @@ run_status() {
     echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 
     if [[ -f "$LIMINE_CONF" ]]; then
-        local loglevel mitigations_off zram_disabled zswap_conf lz4_initrd
+        local loglevel mitigations_off zram_disabled zswap_conf lz4_initrd ttm_ceiling
         loglevel=$(grep -o 'loglevel=[0-9]*' "$LIMINE_CONF" | head -1 || echo "not set")
         grep -q 'mitigations=off' "$LIMINE_CONF" && mitigations_off="off ${RED}(vulnerable)${RESET}" || mitigations_off="${GREEN}on (default)${RESET}"
         grep -q 'systemd\.zram=0' "$LIMINE_CONF" && zram_disabled="${RED}disabled${RESET}" || zram_disabled="${GREEN}enabled (default)${RESET}"
         grep -q 'zswap\.enabled=1' "$LIMINE_CONF" && zswap_conf="${GREEN}enabled${RESET}" || zswap_conf="${DIM}not set${RESET}"
+        local ttm_value
+        ttm_value="$(ttm_configured_pages_limit || true)"
+        if [[ -n "$ttm_value" ]]; then
+            ttm_ceiling="${GREEN}~$(ttm_pages_to_gb "$ttm_value")GB${RESET}  ${DIM}(ttm.pages_limit=${ttm_value})${RESET}"
+        else
+            ttm_ceiling="${DIM}not set (driver default, ~8.25GB w/ 512MB split)${RESET}"
+        fi
         local initramfs_tool
         initramfs_tool="$(detect_initramfs)"
         case "$initramfs_tool" in
@@ -2014,6 +2021,7 @@ run_status() {
         echo -e "  ${CYAN}ZRAM (cmdline)${RESET}    ${zram_disabled}"
         echo -e "  ${CYAN}ZSWAP (cmdline)${RESET}   ${zswap_conf}"
         echo -e "  ${CYAN}lz4 in initramfs${RESET}  ${lz4_initrd}"
+        echo -e "  ${CYAN}VRAM Ceiling${RESET}      ${ttm_ceiling}"
     else
         echo -e "  ${RED}$LIMINE_CONF not found${RESET}"
     fi
@@ -2080,6 +2088,34 @@ run_revert_mitigations() {
     sed -i 's/ mitigations=off//g' "$CONF"
     bootloader_update
     print_success "mitigations=off removed. Reboot to re-enable CPU security mitigations."
+}
+
+run_revert_ttm_pages_limit() {
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
+    print_step "R-8" "Revert Dynamic VRAM Ceiling — Removing ttm.pages_limit"
+
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
+        return 1
+    fi
+
+    if ! grep -q 'ttm\.pages_limit=' "$CONF"; then
+        print_info "ttm.pages_limit not found — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "This will remove ttm.pages_limit from $CONF. Proceed?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Removing ttm.pages_limit..."
+    sed -i 's/ ttm\.pages_limit=[0-9]*//g' "$CONF"
+    bootloader_update
+    print_success "ttm.pages_limit removed. Reboot to restore the driver default dynamic VRAM ceiling."
 }
 
 run_all() {
@@ -3105,6 +3141,93 @@ run_memcfg_set_uma_size() {
     print_success "UMA_SIZE written. Reboot to apply."
 }
 
+# Reads the currently configured ttm.pages_limit value from the bootloader
+# cmdline config, if set. Prints nothing if not set or config unreadable.
+ttm_configured_pages_limit() {
+    local conf
+    conf="$(bootloader_conf)"
+    [[ -n "$conf" && -f "$conf" ]] || return 1
+    grep -o 'ttm\.pages_limit=[0-9]*' "$conf" | head -1 | cut -d= -f2
+}
+
+# Converts a ttm.pages_limit value (4KiB pages) to an approximate GB figure
+ttm_pages_to_gb() {
+    awk -v pages="$1" 'BEGIN{printf "%.1f", pages * 4 / 1024 / 1024}'
+}
+
+run_set_ttm_pages_limit() {
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
+    print_step "AT-7" "Raising Dynamic VRAM Ceiling — ttm.pages_limit"
+
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
+        return 1
+    fi
+    print_info "Detected bootloader: $BOOTLOADER ($CONF)"
+
+    echo ""
+    echo -e "  ${WHITE}With the 512MB VRAM split, the default dynamic VRAM ceiling is"
+    echo -e "  around 8.25GB, which some games can exceed and crash against."
+    echo -e "  This sets the ttm.pages_limit kernel parameter to raise that"
+    echo -e "  ceiling — similar headroom to a larger fixed split, while still"
+    echo -e "  returning unused VRAM to system RAM once a game closes.${RESET}"
+    echo ""
+
+    local existing
+    existing="$(ttm_configured_pages_limit || true)"
+    if [[ -n "$existing" ]]; then
+        print_info "Currently configured: ttm.pages_limit=${existing} (~$(ttm_pages_to_gb "$existing")GB)"
+    fi
+
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Desired max dynamic VRAM in GB (default: 12):${RESET} ")" vram_gb_input
+    local vram_gb
+    if [[ -z "$vram_gb_input" ]]; then
+        vram_gb="12"
+    elif [[ "$vram_gb_input" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v g="$vram_gb_input" 'BEGIN{exit !(g>0)}'; then
+        vram_gb="$vram_gb_input"
+    else
+        print_error "Invalid value '$vram_gb_input' — must be a positive number."
+        return 1
+    fi
+
+    local pages_limit
+    pages_limit=$(awk -v gb="$vram_gb" 'BEGIN{printf "%.0f", gb * 1024 * 1024 / 4}')
+
+    if ! confirm "Set ttm.pages_limit=${pages_limit} (~${vram_gb}GB dynamic VRAM ceiling)? Reboot required to apply."; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    if [[ ! -f "${CONF}.bak" ]]; then
+        print_info "Creating original backup at ${CONF}.bak ..."
+        cp "$CONF" "${CONF}.bak"
+    else
+        print_info "Backup already exists at ${CONF}.bak — preserving original."
+    fi
+
+    local cmdline_var
+    cmdline_var="$(bootloader_cmdline_var)"
+    local cmdline_var_esc
+    cmdline_var_esc="$(bootloader_cmdline_var_escaped)"
+
+    if grep -q 'ttm\.pages_limit=' "$CONF"; then
+        print_info "ttm.pages_limit= found. Updating value to ${pages_limit}..."
+        sed -i "s/ttm\.pages_limit=[0-9]*/ttm.pages_limit=${pages_limit}/g" "$CONF"
+    else
+        print_info "ttm.pages_limit= not found. Adding to $cmdline_var..."
+        sed -i "/^${cmdline_var_esc}/ s/\"$/ ttm.pages_limit=${pages_limit}\"/" "$CONF"
+    fi
+
+    if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
+        bootloader_update
+    fi
+    print_success "ttm.pages_limit set to ${pages_limit} (~${vram_gb}GB). Reboot to apply."
+    echo -e "  ${DIM}After reboot, verify with: cat /sys/module/ttm/parameters/pages_limit${RESET}\n"
+}
+
 show_memcfg_menu() {
     print_banner
     print_section "BC-250 Memory Config"
@@ -3125,10 +3248,18 @@ show_memcfg_menu() {
             echo -e "  ${CYAN}VRAM Size${RESET}   ${DIM}unknown — see 'Show Current Config' for raw output${RESET}"
         fi
     fi
+    local ttm_current
+    ttm_current="$(ttm_configured_pages_limit || true)"
+    if [[ -n "$ttm_current" ]]; then
+        echo -e "  ${CYAN}VRAM Ceiling${RESET} ${BOLD}${WHITE}~$(ttm_pages_to_gb "$ttm_current")GB${RESET}  ${DIM}(ttm.pages_limit=${ttm_current}, cmdline)${RESET}"
+    else
+        echo -e "  ${CYAN}VRAM Ceiling${RESET} ${DIM}not set (driver default, ~8.25GB with 512MB split)${RESET}"
+    fi
     echo -e "  ${DIM}(Re-running Install checks GitHub and offers to rebuild if a newer version exists.)${RESET}\n"
-    print_item "1" "Install bc250_memcfg" "Build and install from source"
-    print_item "2" "Show Current Config"  "Print all tunable memory parameters"
-    print_item "3" "Set VRAM Size"        "Set UMA_SIZE (requires reboot)"
+    print_item "1" "Install bc250_memcfg"     "Build and install from source"
+    print_item "2" "Show Current Config"      "Print all tunable memory parameters"
+    print_item "3" "Set VRAM Size"            "Set UMA_SIZE (requires reboot)"
+    print_item "4" "Set Dynamic VRAM Ceiling" "ttm.pages_limit kernel param (requires reboot)"
     echo ""
     print_item "0" "Back" ""
     echo ""
@@ -3141,9 +3272,10 @@ run_memcfg_menu() {
         read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" mc_choice
 
         case "${mc_choice^^}" in
-            1) run_install_memcfg;      press_enter ;;
-            2) run_memcfg_show;         press_enter ;;
-            3) run_memcfg_set_uma_size; press_enter ;;
+            1) run_install_memcfg;        press_enter ;;
+            2) run_memcfg_show;           press_enter ;;
+            3) run_memcfg_set_uma_size;   press_enter ;;
+            4) run_set_ttm_pages_limit;   press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$mc_choice'"
@@ -3260,6 +3392,7 @@ show_revert_menu() {
     print_item  "4"  "Revert loglevel"         "Restore loglevel to default (3)"
     print_item  "5"  "Revert Mitigations"      "Re-enable CPU security mitigations"
     print_item  "6"  "Revert DolphinBar"       "Remove DolphinBar udev rules"
+    print_item  "7"  "Revert VRAM Ceiling"     "Remove ttm.pages_limit kernel param"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -3278,6 +3411,7 @@ run_revert_menu() {
             4) run_revert_loglevel;           press_enter ;;
             5) run_revert_mitigations;        press_enter ;;
             6) run_revert_dolphinbar;         press_enter ;;
+            7) run_revert_ttm_pages_limit;    press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
