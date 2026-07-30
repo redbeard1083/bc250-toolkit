@@ -326,8 +326,20 @@ initramfs_remove_module() {
 initramfs_rebuild() {
     case "$(detect_initramfs)" in
         mkinitcpio)
-            print_info "Rebuilding initramfs with mkinitcpio..."
-            mkinitcpio -P
+            if [[ "$(detect_bootloader)" == "limine" ]] && command -v limine-mkinitcpio &>/dev/null; then
+                # CachyOS + Limine systems often have no mkinitcpio presets
+                # configured — plain `mkinitcpio -P` finds nothing to build
+                # and prompts interactively to use this tool instead, which
+                # hangs a non-interactive script. limine-mkinitcpio also
+                # correctly updates Limine's boot entries in the process.
+                # GRUB systems don't have this quirk and use the normal
+                # preset-based rebuild below.
+                print_info "Rebuilding initramfs with limine-mkinitcpio..."
+                limine-mkinitcpio
+            else
+                print_info "Rebuilding initramfs with mkinitcpio..."
+                mkinitcpio -P
+            fi
             ;;
         dracut)
             print_info "Rebuilding initramfs with dracut..."
@@ -1037,6 +1049,237 @@ run_revert_cpu_cores_unlock() {
     echo -e "  ${DIM}Note: the unlock itself is volatile and only applied at boot, so cores"
     echo -e "  will return to stock (6) on your next full power cycle. A warm reboot"
     echo -e "  alone may still show 8 cores until a cold boot occurs.${RESET}\n"
+}
+
+# ==============================================================================
+# ACPI FIX (mendesrr/bc250-acpi-fix-updated-8c) + CPU GOVERNOR
+# ==============================================================================
+
+ACPI_OVERRIDE_DIR="/etc/initcpio/acpi_override"
+ACPI_CST_URL="https://github.com/mendesrr/bc250-acpi-fix-updated-8c/raw/refs/heads/main/SSDT-CST.aml"
+ACPI_PST_URL="https://github.com/mendesrr/bc250-acpi-fix-updated-8c/raw/refs/heads/main/SSDT-PST.aml"
+MKINITCPIO_CONF="/etc/mkinitcpio.conf"
+CPUPOWER_CONF="/etc/default/cpupower-service.conf"
+CPUPOWER_SERVICE="cpupower.service"
+
+acpi_fix_installed() {
+    [[ -f "$ACPI_OVERRIDE_DIR/SSDT-CST.aml" && -f "$ACPI_OVERRIDE_DIR/SSDT-PST.aml" ]] && \
+        grep -qE '^HOOKS=.*\bacpi_override\b' "$MKINITCPIO_CONF" 2>/dev/null
+}
+
+# Prints the live scaling_governor if all CPUs agree, "mixed" if they don't,
+# or nothing if it couldn't be read at all.
+cpupower_current_governor() {
+    local govs govcount
+    govs="$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort -u)"
+    [[ -n "$govs" ]] || return 1
+    govcount="$(printf '%s\n' "$govs" | wc -l)"
+    if [[ "$govcount" -eq 1 ]]; then
+        printf '%s' "$govs"
+    else
+        printf 'mixed'
+    fi
+}
+
+run_install_acpi_fix() {
+    print_step "AS-1" "Installing ACPI Fix"
+
+    if acpi_fix_installed; then
+        print_info "ACPI Fix already installed — skipping."
+        return 0
+    fi
+
+    print_info "Creating $ACPI_OVERRIDE_DIR..."
+    mkdir -p "$ACPI_OVERRIDE_DIR"
+
+    print_info "Downloading SSDT-CST.aml and SSDT-PST.aml..."
+    if ! wget -nc -P "$ACPI_OVERRIDE_DIR" "$ACPI_CST_URL" "$ACPI_PST_URL"; then
+        print_error "Failed to download one or both ACPI override files."
+        return 1
+    fi
+    if [[ ! -f "$ACPI_OVERRIDE_DIR/SSDT-CST.aml" || ! -f "$ACPI_OVERRIDE_DIR/SSDT-PST.aml" ]]; then
+        print_error "Expected ACPI override files not found after download."
+        return 1
+    fi
+
+    if grep -qE '^HOOKS=.*\bacpi_override\b' "$MKINITCPIO_CONF"; then
+        print_info "acpi_override hook already present in $MKINITCPIO_CONF — skipping hook edit."
+    else
+        print_info "Adding acpi_override hook to $MKINITCPIO_CONF..."
+        sed -i '/^HOOKS=/ { /acpi_override/q; s/microcode/& acpi_override/; q }' "$MKINITCPIO_CONF"
+        if ! grep -qE '^HOOKS=.*\bacpi_override\b' "$MKINITCPIO_CONF"; then
+            print_error "Could not add the acpi_override hook automatically — no 'microcode' hook found to anchor next to."
+            print_error "Add 'acpi_override' to the HOOKS= line in $MKINITCPIO_CONF manually, then rebuild initramfs."
+            return 1
+        fi
+    fi
+
+    if ! initramfs_rebuild; then
+        print_error "Initramfs rebuild failed — check the output above."
+        return 1
+    fi
+
+    print_success "ACPI Fix installed successfully!"
+    echo -e "  ${BOLD}${YELLOW}A reboot is required to apply the ACPI override.${RESET}\n"
+}
+
+run_acpi_show_power_info() {
+    print_step "AS-2" "CPU Power Info"
+
+    if ! command -v cpupower &>/dev/null; then
+        print_error "cpupower is not installed."
+        return 1
+    fi
+
+    echo ""
+    print_section "cpupower idle-info"
+    cpupower idle-info || print_error "cpupower idle-info failed."
+    echo ""
+    print_section "cpupower frequency-info"
+    cpupower frequency-info || print_error "cpupower frequency-info failed."
+}
+
+run_set_cpu_governor() {
+    print_step "AS-3" "Set CPU Governor"
+
+    local current
+    if current="$(cpupower_current_governor)"; then
+        print_info "Current live governor: ${current}"
+    else
+        print_info "Could not read the current governor from sysfs."
+    fi
+
+    echo ""
+    print_item "1" "schedutil"   "Dynamic, kernel-driven scaling (default)"
+    print_item "2" "performance" "Locks CPUs at max frequency"
+    echo ""
+    print_item "0" "Cancel" ""
+    echo ""
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Select governor:${RESET} ")" gov_choice
+
+    local target_gov
+    case "$gov_choice" in
+        1) target_gov="schedutil" ;;
+        2) target_gov="performance" ;;
+        0) print_info "Cancelled."; return 0 ;;
+        *) print_error "Invalid selection."; return 1 ;;
+    esac
+
+    if ! confirm "Set CPU governor to '${target_gov}'?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    if [[ ! -f "$CPUPOWER_CONF" ]]; then
+        print_error "$CPUPOWER_CONF not found — is the 'cpupower' package/service installed?"
+        return 1
+    fi
+
+    print_info "Updating $CPUPOWER_CONF..."
+    if grep -qE '^GOVERNOR=' "$CPUPOWER_CONF"; then
+        sed -i "s/^GOVERNOR=.*/GOVERNOR='${target_gov}'/" "$CPUPOWER_CONF"
+    elif grep -qE '^#\s*GOVERNOR=' "$CPUPOWER_CONF"; then
+        sed -i "s/^#\s*GOVERNOR=.*/GOVERNOR='${target_gov}'/" "$CPUPOWER_CONF"
+    else
+        echo "GOVERNOR='${target_gov}'" >> "$CPUPOWER_CONF"
+    fi
+
+    if systemctl list-unit-files "$CPUPOWER_SERVICE" &>/dev/null; then
+        print_info "Restarting ${CPUPOWER_SERVICE}..."
+        systemctl enable "$CPUPOWER_SERVICE" &>/dev/null || true
+        if ! systemctl restart "$CPUPOWER_SERVICE"; then
+            print_error "Failed to restart $CPUPOWER_SERVICE — check: journalctl -u $CPUPOWER_SERVICE"
+            return 1
+        fi
+    else
+        print_error "$CPUPOWER_SERVICE not found — config was updated but not applied. Install/enable the cpupower service to apply it."
+        return 1
+    fi
+
+    print_success "CPU governor set to '${target_gov}'."
+    local new_current
+    if new_current="$(cpupower_current_governor)"; then
+        echo -e "  ${DIM}Live governor now reports: ${new_current}${RESET}\n"
+    fi
+}
+
+show_acpi_menu() {
+    print_banner
+    print_section "ACPI Fix"
+    echo -e "  ${DIM}SSDT idle/frequency table override (mendesrr/bc250-acpi-fix-updated-8c) plus CPU governor control.${RESET}\n"
+    local status_label
+    if acpi_fix_installed; then
+        status_label="${GREEN}installed${RESET}  ${DIM}($ACPI_OVERRIDE_DIR)${RESET}"
+    else
+        status_label="${DIM}not installed${RESET}"
+    fi
+    echo -e "  ${CYAN}Status${RESET}    ${status_label}"
+    local gov
+    if gov="$(cpupower_current_governor)"; then
+        echo -e "  ${CYAN}Governor${RESET}  ${BOLD}${WHITE}${gov}${RESET}"
+    else
+        echo -e "  ${CYAN}Governor${RESET}  ${DIM}unknown${RESET}"
+    fi
+    echo ""
+    print_item "1" "Install ACPI Fix"    "Downloads SSDT overrides, rebuilds initramfs"
+    print_item "2" "Show CPU Power Info" "cpupower idle-info / frequency-info"
+    print_item "3" "Set CPU Governor"    "Switch between schedutil and performance"
+    echo ""
+    print_item "0" "Back" ""
+    echo ""
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_acpi_menu() {
+    while true; do
+        show_acpi_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" acpi_choice
+
+        case "${acpi_choice^^}" in
+            1) run_install_acpi_fix;     press_enter ;;
+            2) run_acpi_show_power_info; press_enter ;;
+            3) run_set_cpu_governor;     press_enter ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$acpi_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+run_revert_acpi_fix() {
+    print_step "R-10" "Revert ACPI Fix"
+
+    if ! acpi_fix_installed && [[ ! -d "$ACPI_OVERRIDE_DIR" ]] && \
+       ! grep -qE '^HOOKS=.*\bacpi_override\b' "$MKINITCPIO_CONF" 2>/dev/null; then
+        print_info "ACPI Fix does not appear to be installed — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "This will remove the acpi_override hook, delete the SSDT override files, and rebuild initramfs. Proceed?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    if grep -qE '^HOOKS=.*\bacpi_override\b' "$MKINITCPIO_CONF" 2>/dev/null; then
+        print_info "Removing acpi_override hook from $MKINITCPIO_CONF..."
+        sed -i 's/ acpi_override//g' "$MKINITCPIO_CONF"
+    else
+        print_info "acpi_override hook not found in $MKINITCPIO_CONF — skipping."
+    fi
+
+    if [[ -d "$ACPI_OVERRIDE_DIR" ]]; then
+        print_info "Removing $ACPI_OVERRIDE_DIR..."
+        rm -rf "$ACPI_OVERRIDE_DIR"
+    fi
+
+    initramfs_rebuild || print_error "Initramfs rebuild failed — check the output above."
+
+    print_success "ACPI Fix removed."
+    echo -e "  ${BOLD}${YELLOW}A reboot is required to fully revert.${RESET}\n"
+    echo -e "  ${DIM}Note: this does not change your CPU governor setting — use 'Set CPU"
+    echo -e "  Governor' from the ACPI Fix menu if you also want to reset that.${RESET}\n"
 }
 
 # ==============================================================================
@@ -2177,6 +2420,22 @@ run_status() {
         fi
     else
         echo -e "  ${CYAN}Active CUs${RESET}        ${DIM}umr not installed${RESET}"
+    fi
+    echo ""
+
+    # --- ACPI Fix / CPU Governor ---
+    echo -e "  ${BOLD}${YELLOW}ACPI Fix${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
+    if acpi_fix_installed; then
+        echo -e "  ${CYAN}Status${RESET}            ${GREEN}installed${RESET}  ${DIM}($ACPI_OVERRIDE_DIR)${RESET}"
+    else
+        echo -e "  ${CYAN}Status${RESET}            ${DIM}not installed${RESET}"
+    fi
+    local status_gov
+    if status_gov="$(cpupower_current_governor)"; then
+        echo -e "  ${CYAN}CPU Governor${RESET}      ${BOLD}${WHITE}${status_gov}${RESET}"
+    else
+        echo -e "  ${CYAN}CPU Governor${RESET}      ${DIM}unknown${RESET}"
     fi
     echo ""
 
@@ -3675,6 +3934,7 @@ show_revert_menu() {
     print_item  "6"  "Revert DolphinBar"       "Remove DolphinBar udev rules"
     print_item  "7"  "Revert VRAM Ceiling"     "Remove ttm.pages_limit kernel param"
     print_item  "8"  "Revert CPU Cores Unlock" "Remove core unlock boot service"
+    print_item  "9"  "Revert ACPI Fix"         "Remove SSDT overrides & acpi_override hook"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -3695,6 +3955,7 @@ run_revert_menu() {
             6) run_revert_dolphinbar;         press_enter ;;
             7) run_revert_ttm_pages_limit;    press_enter ;;
             8) run_revert_cpu_cores_unlock;   press_enter ;;
+            9) run_revert_acpi_fix;           press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
@@ -3767,9 +4028,10 @@ show_initial_setup_menu() {
     echo ""
     print_section "⚠  Manual Steps — not included in Run All"
     print_item  "8"  "CPU Cores Unlock"        "6 → 8 CPU cores via SMU mailbox write"
-    print_item  "9"  "Compute Units Unlock"    ""
-    print_item  "10" "BC-250 Memory Config"    "Configure VRAM size via bc250_memcfg"
-    print_item  "11" "Remove Deckify Kernel"   "Verify new kernel boots first"
+    print_item  "9"  "ACPI Fix"                "SSDT override + CPU governor control"
+    print_item  "10" "Compute Units Unlock"    ""
+    print_item  "11" "BC-250 Memory Config"    "Configure VRAM size via bc250_memcfg"
+    print_item  "12" "Remove Deckify Kernel"   "Verify new kernel boots first"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -3791,9 +4053,10 @@ run_initial_setup_menu() {
             7) run_disable_mitigations;       press_enter ;;
             A) run_all;                       press_enter ;;
             8) run_cpu_cores_unlock;          press_enter ;;
-            9) run_danger_zone_menu ;;
-            10) run_memcfg_menu ;;
-            11) run_remove_deckify_kernel;    press_enter ;;
+            9) run_acpi_menu ;;
+            10) run_danger_zone_menu ;;
+            11) run_memcfg_menu ;;
+            12) run_remove_deckify_kernel;    press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$is_choice'"
