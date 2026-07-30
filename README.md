@@ -19,6 +19,7 @@ It does the following:
 8. Unlock compute units thanks to: https://github.com/WinnieLV/bc250-cu-live-manager
 9. Set vram split and ttm pages: https://github.com/fanoush/bc250_memcfg (pre-release)
 10. Unlock CPU Cores (pre-release): https://github.com/rw-r-r-0644/bc250-core-unlock
+11. Install ACPI Fix (pre-release): https://github.com/mendesrr/bc250-acpi-fix-updated-8c
 
 In desktop mode run the below in the terminal(Konsole):
 <pre>
