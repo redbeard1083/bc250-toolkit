@@ -793,6 +793,253 @@ run_remove_deckify_kernel() {
 }
 
 # ==============================================================================
+# CPU CORES UNLOCK (rw-r-r-0644/bc250-core-unlock)
+# ==============================================================================
+
+CPU_UNLOCK_RAW_URL="https://raw.githubusercontent.com/rw-r-r-0644/bc250-core-unlock/main/bc250-unlock-cores.py"
+CPU_UNLOCK_SCRIPT_NAME="bc250-unlock-cores.py"
+CPU_UNLOCK_SERVICE_NAME="bc250-unlock-cores"
+CPU_UNLOCK_GOVERNOR_SERVICE="cyan-skillfish-governor-smu.service"
+CPU_UNLOCK_WRAPPER="/usr/local/bin/bc250-unlock-wrapper.sh"
+CPU_UNLOCK_STATE_DIR="/var/lib/bc250-unlock"
+CPU_UNLOCK_DROPIN_DIR="/etc/systemd/system/${CPU_UNLOCK_GOVERNOR_SERVICE}.d"
+CPU_UNLOCK_DROPIN_FILE="$CPU_UNLOCK_DROPIN_DIR/wait-for-core-unlock.conf"
+
+cpu_cores_unlock_installed() {
+    systemctl list-unit-files "${CPU_UNLOCK_SERVICE_NAME}.service" &>/dev/null
+}
+
+cpu_cores_unlock_warn() {
+    echo ""
+    echo -e "  ${BOLD}${RED}⚠  WARNING: CPU CORES UNLOCK${RESET}"
+    echo ""
+    echo -e "  ${WHITE}This installs a boot-time service that unlocks CPU cores the OEM"
+    echo -e "  disabled (6 stock → 8 unlocked), using an undocumented SMU mailbox"
+    echo -e "  write. This is not officially supported and could affect system"
+    echo -e "  stability. The unlock does not survive a full power-off, so this"
+    echo -e "  service re-applies it on every single boot, permanently."
+    echo ""
+    echo -e "  On a cold boot where cores are still locked, the service will"
+    echo -e "  AUTOMATICALLY REBOOT YOUR SYSTEM ONCE, without asking, so the"
+    echo -e "  kernel can see the extra cores. This is expected, self-resolving"
+    echo -e "  behavior — but it does mean the system may reboot on its own"
+    echo -e "  shortly after this step completes or after your next cold start.${RESET}"
+    echo ""
+    echo -e "  ${DIM}Type ${RESET}${BOLD}${YELLOW}unlock${RESET}${DIM} to accept and proceed, or press Enter to cancel.${RESET}"
+    echo ""
+    read -rp "  → " cpu_unlock_ack
+    [[ "$cpu_unlock_ack" == "unlock" ]]
+}
+
+run_cpu_cores_unlock() {
+    print_step "08" "Installing CPU Cores Unlock"
+
+    if cpu_cores_unlock_installed; then
+        print_info "CPU Cores Unlock service already installed — skipping."
+        return 0
+    fi
+
+    cpu_cores_unlock_warn || { print_info "Cancelled."; return 0; }
+
+    local user_home
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    if [[ -z "$user_home" || ! -d "$user_home" ]]; then
+        print_error "Could not resolve home directory for user '$REAL_USER'."
+        return 1
+    fi
+    local dest="$user_home/$CPU_UNLOCK_SCRIPT_NAME"
+
+    print_info "Downloading $CPU_UNLOCK_SCRIPT_NAME..."
+    if ! curl -fsSL "$CPU_UNLOCK_RAW_URL" -o "$dest"; then
+        print_error "Failed to download unlock script."
+        return 1
+    fi
+    chown "$REAL_USER":"$(id -gn "$REAL_USER")" "$dest"
+    chmod 755 "$dest"
+
+    print_info "Creating self-healing wrapper (auto-reboots once if a lock→unlock change occurred)..."
+    mkdir -p "$CPU_UNLOCK_STATE_DIR"
+    cat > "$CPU_UNLOCK_WRAPPER" <<'WRAPEOF'
+#!/usr/bin/env bash
+# Runs the unlock script. If it actually flipped the core mask (cold-boot
+# locked state -> unlocked), the kernel already enumerated CPUs earlier in
+# THIS boot and can't pick up the change without a reboot. So: trigger one
+# automatic reboot when needed, and do nothing otherwise (e.g. on a normal
+# warm reboot where the kernel already sees all threads).
+#
+# The reboot decision is based on the kernel-visible thread count rather
+# than parsing the unlock script's log text, since that text isn't a fixed
+# format (e.g. it prints a different line when the mailbox is already
+# unlocked vs. when it just changed it) and text-matching missed cases.
+#
+# A persistent counter guards against a reboot loop if the thread count
+# somehow never comes up (hardware/firmware issue) - it will try at most
+# once before giving up and logging an error instead of rebooting forever.
+# The counter is reset whenever the mailbox reports locked at the start of
+# a run, since that only happens right after a genuine full power cycle and
+# is always a fresh episode - this stops a stale counter from an unrelated
+# earlier boot from blocking a legitimate new reboot request.
+
+set -uo pipefail
+
+STATE_DIR="/var/lib/bc250-unlock"
+COUNT_FILE="$STATE_DIR/reboot-attempts"
+mkdir -p "$STATE_DIR"
+
+TARGET_THREADS=16
+FULL_MASK="0x000000FF"
+
+OUTPUT="$(python3 "__SCRIPT_PATH__" 2>&1)"
+STATUS=$?
+echo "$OUTPUT"
+
+if [[ $STATUS -ne 0 ]]; then
+    echo "bc250-unlock-wrapper: unlock script exited with status $STATUS, not rebooting."
+    exit 0   # don't fail the unit - governor should still start (Wants=, not Requires=)
+fi
+
+BEFORE=$(echo "$OUTPUT" | grep -oP 'core presence mask:\s*\K0x[0-9A-Fa-f]+' || true)
+
+if [[ -z "$BEFORE" ]]; then
+    echo "bc250-unlock-wrapper: could not parse mask value from output, not rebooting."
+    exit 0
+fi
+
+if [[ "$BEFORE" != "$FULL_MASK" ]]; then
+    # Mailbox reported locked at the start of this run - only happens right
+    # after a genuine full power cycle. Always a fresh episode.
+    echo 0 > "$COUNT_FILE"
+fi
+
+CURRENT_THREADS=$(nproc --all 2>/dev/null || echo 0)
+
+if [[ "$CURRENT_THREADS" -ge "$TARGET_THREADS" ]]; then
+    echo "bc250-unlock-wrapper: kernel already sees $CURRENT_THREADS threads - no reboot needed."
+    echo 0 > "$COUNT_FILE"
+    exit 0
+fi
+
+ATTEMPTS=0
+[[ -f "$COUNT_FILE" ]] && ATTEMPTS=$(cat "$COUNT_FILE" 2>/dev/null || echo 0)
+
+if [[ "$ATTEMPTS" -ge 1 ]]; then
+    echo "bc250-unlock-wrapper: cores unlocked in hardware but kernel still reports"
+    echo "$CURRENT_THREADS/$TARGET_THREADS threads, and a reboot already ran without"
+    echo "fixing it. Not rebooting again - manual check needed."
+    exit 0
+fi
+
+echo "bc250-unlock-wrapper: mask unlocked but kernel reports $CURRENT_THREADS/$TARGET_THREADS threads. Rebooting once to apply."
+echo $((ATTEMPTS + 1)) > "$COUNT_FILE"
+systemctl reboot
+WRAPEOF
+    sed -i "s|__SCRIPT_PATH__|${dest}|" "$CPU_UNLOCK_WRAPPER"
+    chown root:root "$CPU_UNLOCK_WRAPPER"
+    chmod 755 "$CPU_UNLOCK_WRAPPER"
+
+    print_info "Writing systemd service (runs as root at boot, before $CPU_UNLOCK_GOVERNOR_SERVICE)..."
+    cat > "/etc/systemd/system/${CPU_UNLOCK_SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Unlock BC-250 disabled CPU cores (SMU mailbox write)
+# Run before the SMU governor service so we don't race it for mailbox access
+Before=${CPU_UNLOCK_GOVERNOR_SERVICE}
+DefaultDependencies=no
+After=sysinit.target
+Before=basic.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${CPU_UNLOCK_WRAPPER}
+
+[Install]
+WantedBy=sysinit.target
+EOF
+
+    print_info "Adding drop-in so $CPU_UNLOCK_GOVERNOR_SERVICE waits for the unlock to finish..."
+    mkdir -p "$CPU_UNLOCK_DROPIN_DIR"
+    cat > "$CPU_UNLOCK_DROPIN_FILE" <<EOF
+[Unit]
+# Prefer the core-unlock oneshot to run first (order after it), but do NOT
+# require it: if the unlock service is missing, masked, or fails, the
+# governor still starts normally. Wants= is a soft dependency - it pulls in
+# and waits for the unlock service when present, but never blocks on it.
+Wants=${CPU_UNLOCK_SERVICE_NAME}.service
+After=${CPU_UNLOCK_SERVICE_NAME}.service
+EOF
+
+    print_info "Reloading systemd and enabling services..."
+    systemctl daemon-reload
+    systemctl enable "${CPU_UNLOCK_SERVICE_NAME}.service"
+    if systemctl list-unit-files "$CPU_UNLOCK_GOVERNOR_SERVICE" &>/dev/null; then
+        systemctl enable "$CPU_UNLOCK_GOVERNOR_SERVICE" 2>/dev/null || true
+    fi
+
+    print_success "CPU Cores Unlock installed successfully!"
+    echo -e "  ${DIM}Script installed at:  $dest${RESET}"
+    echo -e "  ${DIM}Unlock service:       ${CPU_UNLOCK_SERVICE_NAME}.service (enabled, runs at every boot)${RESET}"
+    echo -e "  ${DIM}Governor drop-in at:  $CPU_UNLOCK_DROPIN_FILE${RESET}"
+    echo ""
+    echo -e "  ${WHITE}On the next COLD boot (full power off/on) with cores still locked,"
+    echo -e "  expect ONE automatic reboot triggered by the service itself — this"
+    echo -e "  is expected and self-resolving, not a crash.${RESET}"
+    echo -e "  ${DIM}Test now without rebooting: systemctl start ${CPU_UNLOCK_SERVICE_NAME}.service${RESET}\n"
+}
+
+run_revert_cpu_cores_unlock() {
+    print_step "R-9" "Revert CPU Cores Unlock"
+
+    if ! cpu_cores_unlock_installed && [[ ! -f "$CPU_UNLOCK_WRAPPER" ]]; then
+        print_info "CPU Cores Unlock does not appear to be installed — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "This will stop, disable, and remove the CPU Cores Unlock service and its files. Proceed?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Stopping and disabling ${CPU_UNLOCK_SERVICE_NAME}.service..."
+    systemctl stop "${CPU_UNLOCK_SERVICE_NAME}.service" 2>/dev/null || true
+    systemctl disable "${CPU_UNLOCK_SERVICE_NAME}.service" 2>/dev/null || true
+
+    if [[ -f "/etc/systemd/system/${CPU_UNLOCK_SERVICE_NAME}.service" ]]; then
+        print_info "Removing service unit..."
+        rm -f "/etc/systemd/system/${CPU_UNLOCK_SERVICE_NAME}.service"
+    fi
+
+    if [[ -f "$CPU_UNLOCK_DROPIN_FILE" ]]; then
+        print_info "Removing governor drop-in..."
+        rm -f "$CPU_UNLOCK_DROPIN_FILE"
+        rmdir --ignore-fail-on-non-empty "$CPU_UNLOCK_DROPIN_DIR" 2>/dev/null || true
+    fi
+
+    if [[ -f "$CPU_UNLOCK_WRAPPER" ]]; then
+        print_info "Removing wrapper script..."
+        rm -f "$CPU_UNLOCK_WRAPPER"
+    fi
+
+    if [[ -d "$CPU_UNLOCK_STATE_DIR" ]]; then
+        print_info "Removing state directory..."
+        rm -rf "$CPU_UNLOCK_STATE_DIR"
+    fi
+
+    local user_home
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    if [[ -n "$user_home" && -f "$user_home/$CPU_UNLOCK_SCRIPT_NAME" ]]; then
+        print_info "Removing downloaded unlock script from $REAL_USER's home..."
+        rm -f "$user_home/$CPU_UNLOCK_SCRIPT_NAME"
+    fi
+
+    systemctl daemon-reload
+
+    print_success "CPU Cores Unlock removed successfully."
+    echo -e "  ${DIM}Note: the unlock itself is volatile and only applied at boot, so cores"
+    echo -e "  will return to stock (6) on your next full power cycle. A warm reboot"
+    echo -e "  alone may still show 8 cores until a cold boot occurs.${RESET}\n"
+}
+
+# ==============================================================================
 # OVERCLOCK MENU (embedded from 07-overclock_menu.sh)
 # ==============================================================================
 
@@ -1885,9 +2132,19 @@ run_status() {
     echo -e "  ${CYAN}GPU Service${RESET}       ${gpu_color}${gpu_svc_state}${RESET}"
     echo ""
 
-    # --- Compute Units ---
-    echo -e "  ${BOLD}${YELLOW}Compute Units${RESET}"
+    # --- Hardware Unlocks (CPU Cores / Compute Units) ---
+    echo -e "  ${BOLD}${YELLOW}Hardware Unlocks${RESET}"
     echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
+    local cpu_core_count cpu_core_color
+    cpu_core_count=$(nproc --all 2>/dev/null || echo "?")
+    if [[ "$cpu_core_count" == "16" ]]; then
+        cpu_core_color="$GREEN"
+    elif [[ "$cpu_core_count" == "12" ]]; then
+        cpu_core_color="$DIM"
+    else
+        cpu_core_color="$YELLOW"
+    fi
+    echo -e "  ${CYAN}CPU Cores${RESET}         ${cpu_core_color}${BOLD}${cpu_core_count}${RESET}  ${DIM}(12 stock, 16 unlocked)${RESET}"
     if cu_find_umr; then
         cu_select_umr_instance
         local cu_total=0 cu_idx cu_se cu_sh cu_spi_hex cu_spi_val cu_wgp cu_bit
@@ -3417,6 +3674,7 @@ show_revert_menu() {
     print_item  "5"  "Revert Mitigations"      "Re-enable CPU security mitigations"
     print_item  "6"  "Revert DolphinBar"       "Remove DolphinBar udev rules"
     print_item  "7"  "Revert VRAM Ceiling"     "Remove ttm.pages_limit kernel param"
+    print_item  "8"  "Revert CPU Cores Unlock" "Remove core unlock boot service"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -3436,6 +3694,7 @@ run_revert_menu() {
             5) run_revert_mitigations;        press_enter ;;
             6) run_revert_dolphinbar;         press_enter ;;
             7) run_revert_ttm_pages_limit;    press_enter ;;
+            8) run_revert_cpu_cores_unlock;   press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
@@ -3507,9 +3766,10 @@ show_initial_setup_menu() {
     print_item  "A"  "Run All (1-7)"           "Run all setup tasks in sequence"
     echo ""
     print_section "⚠  Manual Steps — not included in Run All"
-    print_item  "8"  "Compute Units Unlock"    ""
-    print_item  "9"  "BC-250 Memory Config"    "Configure VRAM size via bc250_memcfg"
-    print_item  "10" "Remove Deckify Kernel"   "Verify new kernel boots first"
+    print_item  "8"  "CPU Cores Unlock"        "6 → 8 CPU cores via SMU mailbox write"
+    print_item  "9"  "Compute Units Unlock"    ""
+    print_item  "10" "BC-250 Memory Config"    "Configure VRAM size via bc250_memcfg"
+    print_item  "11" "Remove Deckify Kernel"   "Verify new kernel boots first"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -3530,9 +3790,10 @@ run_initial_setup_menu() {
             6) run_set_loglevel;              press_enter ;;
             7) run_disable_mitigations;       press_enter ;;
             A) run_all;                       press_enter ;;
-            8) run_danger_zone_menu ;;
-            9) run_memcfg_menu ;;
-            10) run_remove_deckify_kernel;    press_enter ;;
+            8) run_cpu_cores_unlock;          press_enter ;;
+            9) run_danger_zone_menu ;;
+            10) run_memcfg_menu ;;
+            11) run_remove_deckify_kernel;    press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$is_choice'"
