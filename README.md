@@ -17,7 +17,7 @@ It does the following:
 6. Easily change CPU and GPU overclock settings on the fly
 7. Displays a status window showing you your current settings.
 8. Unlock compute units thanks to: https://github.com/WinnieLV/bc250-cu-live-manager
-9. Set vram split and ttm pages: https://github.com/fanoush/bc250_memcfg (pre-release)
+9. Set vram split and ttm pages: https://github.com/fanoush/bc250_memcfg
 10. Unlock CPU Cores: https://github.com/rw-r-r-0644/bc250-core-unlock , https://github.com/Hexxeh/bc250-efi-core-unlock
 11. Install ACPI Fix: https://github.com/mendesrr/bc250-acpi-fix-updated-8c
 
