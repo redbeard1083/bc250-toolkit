@@ -85,10 +85,26 @@ if [[ "${1:-}" == "apply-service" ]] || [[ "${2:-}" == "apply-service" ]]; then
         service_masks[$_i]="$_v"
     done
 
-    # Verify ASIC is reachable
-    _out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -r "$CU_ASIC.$CU_REG_SPI" 2>&1 || true)"
-    _val="$(printf '%s\n' "$_out" | cu_parse_hex)"
-    [ -n "$_val" ] || cu_die "umr could not read $CU_ASIC.$CU_REG_SPI — GPU not ready"
+    # Verify ASIC is reachable — retry with a bounded backoff. The DRM render
+    # node (checked by ExecStartPre) can exist before the GPU is actually
+    # ready to service umr register reads, causing a single-shot check to
+    # fail intermittently at boot. See GitHub issue #9.
+    _cu_max_attempts="${BC250_CU_RETRY_ATTEMPTS:-60}"
+    _cu_retry_delay="${BC250_CU_RETRY_DELAY:-1}"
+    _val=""
+    for (( _attempt = 1; _attempt <= _cu_max_attempts; _attempt++ )); do
+        _out="$("$CU_UMR" "${CU_UMR_INSTANCE_ARGS[@]}" -r "$CU_ASIC.$CU_REG_SPI" 2>&1 || true)"
+        _val="$(printf '%s\n' "$_out" | cu_parse_hex)"
+        if [ -n "$_val" ]; then
+            cu_info "GPU register access ready on attempt ${_attempt}/${_cu_max_attempts}"
+            break
+        fi
+        if [ "$_attempt" -eq "$_cu_max_attempts" ]; then
+            cu_die "umr could not read $CU_ASIC.$CU_REG_SPI after ${_cu_max_attempts} attempts — GPU not ready"
+        fi
+        cu_warn "GPU not ready, retrying in ${_cu_retry_delay}s (${_attempt}/${_cu_max_attempts})"
+        sleep "$_cu_retry_delay"
+    done
 
     # Apply masks
     declare -a target_masks=("${service_masks[@]}")
@@ -130,6 +146,14 @@ if [[ "${1:-}" == "apply-service" ]] || [[ "${2:-}" == "apply-service" ]]; then
     cu_info "BC-250 boot profile applied: ${_total}/40 CUs active"
     exit 0
 fi
+
+# From here on we're in the interactive menu. Functions throughout this
+# script deliberately use 'return 1' to signal a recoverable error (print a
+# message, let the menu loop continue) — that's incompatible with 'set -e',
+# which would otherwise kill the entire script the moment any case-statement
+# action returns non-zero, before the user ever sees a chance to continue.
+# 'set -u' and pipefail stay on; only errexit is dropped here.
+set +e
 
 # Re-launch with sudo if not already root
 if [[ $EUID -ne 0 ]]; then
@@ -182,7 +206,7 @@ aur_install() {
     fi
     print_info "Installing $package via $helper..."
     case "$helper" in
-        shelly) sudo -u "$REAL_USER" shelly aur install "$package" ;;
+        shelly) sudo -u "$REAL_USER" shelly install aur "$package" ;;
         paru)   sudo -u "$REAL_USER" paru -S --noconfirm "$package" ;;
         yay)    sudo -u "$REAL_USER" yay -S --noconfirm "$package" ;;
     esac
@@ -197,9 +221,142 @@ aur_remove() {
     fi
     print_info "Removing $package via $helper..."
     case "$helper" in
-        shelly) shelly remove "$package" ;;
-        paru)   paru -Rns --noconfirm "$package" 2>/dev/null || true ;;
-        yay)    yay -Rns --noconfirm "$package" 2>/dev/null || true ;;
+        shelly) sudo -u "$REAL_USER" shelly remove aur "$package" --no-confirm ;;
+        paru)   sudo -u "$REAL_USER" paru -Rns --noconfirm "$package" 2>/dev/null || true ;;
+        yay)    sudo -u "$REAL_USER" yay -Rns --noconfirm "$package" 2>/dev/null || true ;;
+    esac
+}
+
+# Bootloader detection
+detect_bootloader() {
+    if [[ -f /etc/default/limine ]]; then echo "limine"
+    elif [[ -f /etc/default/grub ]]; then echo "grub"
+    else echo "unknown"
+    fi
+}
+
+bootloader_conf() {
+    case "$(detect_bootloader)" in
+        limine) echo "/etc/default/limine" ;;
+        grub)   echo "/etc/default/grub" ;;
+        *)      echo "" ;;
+    esac
+}
+
+bootloader_update() {
+    case "$(detect_bootloader)" in
+        limine)
+            print_info "Regenerating Limine boot config..."
+            limine-update
+            ;;
+        grub)
+            print_info "Regenerating GRUB boot config..."
+            grub-mkconfig -o /boot/grub/grub.cfg
+            ;;
+        *)
+            print_error "Unknown bootloader — please update your boot config manually."
+            return 1
+            ;;
+    esac
+}
+
+bootloader_cmdline_var() {
+    case "$(detect_bootloader)" in
+        limine) echo "KERNEL_CMDLINE[default]" ;;
+        grub)   echo "GRUB_CMDLINE_LINUX_DEFAULT" ;;
+        *)      echo "" ;;
+    esac
+}
+
+# Returns the cmdline var with regex special chars escaped for use in sed
+bootloader_cmdline_var_escaped() {
+    bootloader_cmdline_var | sed 's/\[/\\[/g; s/\]/\\]/g'
+}
+
+# Initramfs detection
+detect_initramfs() {
+    if command -v mkinitcpio &>/dev/null; then echo "mkinitcpio"
+    elif command -v dracut &>/dev/null;   then echo "dracut"
+    else echo "unknown"
+    fi
+}
+
+initramfs_add_module() {
+    local module="$1"
+    case "$(detect_initramfs)" in
+        mkinitcpio)
+            local MKINITCPIO="/etc/mkinitcpio.conf"
+            if grep -q "$module" "$MKINITCPIO"; then
+                print_info "$module already present in $MKINITCPIO — skipping."
+            else
+                print_info "Adding $module to initramfs modules..."
+                sed -i "s/^MODULES=(\(.*\))/MODULES=(\1 $module)/" "$MKINITCPIO"
+            fi
+            ;;
+        dracut)
+            local DRACUT_CONF="/etc/dracut.conf.d/bc250-modules.conf"
+            print_info "Adding $module to dracut config..."
+            echo "add_drivers+=\" $module \"" >> "$DRACUT_CONF"
+            ;;
+        *)
+            print_error "Unknown initramfs tool — add $module manually."
+            return 1
+            ;;
+    esac
+}
+
+initramfs_remove_module() {
+    local module="$1"
+    case "$(detect_initramfs)" in
+        mkinitcpio)
+            local MKINITCPIO="/etc/mkinitcpio.conf"
+            if grep -q "$module" "$MKINITCPIO"; then
+                print_info "Removing $module from initramfs modules..."
+                sed -i "s/ ${module}//g" "$MKINITCPIO"
+            else
+                print_info "$module not found in $MKINITCPIO — skipping."
+            fi
+            ;;
+        dracut)
+            local DRACUT_CONF="/etc/dracut.conf.d/bc250-modules.conf"
+            if [[ -f "$DRACUT_CONF" ]]; then
+                print_info "Removing $module from dracut config..."
+                sed -i "/ $module /d" "$DRACUT_CONF"
+            fi
+            ;;
+        *)
+            print_error "Unknown initramfs tool — remove $module manually."
+            return 1
+            ;;
+    esac
+}
+
+initramfs_rebuild() {
+    case "$(detect_initramfs)" in
+        mkinitcpio)
+            if [[ "$(detect_bootloader)" == "limine" ]] && command -v limine-mkinitcpio &>/dev/null; then
+                # CachyOS + Limine systems often have no mkinitcpio presets
+                # configured — plain `mkinitcpio -P` finds nothing to build
+                # and prompts interactively to use this tool instead, which
+                # hangs a non-interactive script. limine-mkinitcpio also
+                # correctly updates Limine's boot entries in the process.
+                # GRUB systems don't have this quirk and use the normal
+                # preset-based rebuild below.
+                print_info "Rebuilding initramfs with limine-mkinitcpio..."
+                limine-mkinitcpio
+            else
+                print_info "Rebuilding initramfs with mkinitcpio..."
+                mkinitcpio -P
+            fi
+            ;;
+        dracut)
+            print_info "Rebuilding initramfs with dracut..."
+            dracut --force
+            ;;
+        *)
+            print_error "Unknown initramfs tool — rebuild manually."
+            return 1
+            ;;
     esac
 }
 
@@ -267,34 +424,50 @@ confirm() {
 run_cpu_governor() {
     print_step "02" "Installing CPU Governor"
 
+    local user_home
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    local user_bin="$user_home/.local/bin"
+    local build_dir="$user_home/.cache/bc250-toolkit/bc250_smu_oc"
+
     if systemctl is-enabled bc250-smu-oc.service &>/dev/null || \
-       pipx list 2>/dev/null | grep -q 'bc250-smu-oc'; then
+       [[ -x "$user_bin/bc250-detect" ]]; then
         print_info "CPU governor already installed — skipping."
         return 0
     fi
 
     print_info "Installing dependencies: python-pipx, stress"
     pacman -Syu python-pipx stress --noconfirm || { print_error "Failed to install dependencies."; return 1; }
-    print_info "Cloning bc250_smu_oc repository..."
-    if [[ -d "bc250_smu_oc" ]]; then
+
+    print_info "Cloning bc250_smu_oc repository as $REAL_USER..."
+    sudo -u "$REAL_USER" mkdir -p "$(dirname "$build_dir")"
+    if [[ -d "$build_dir" ]]; then
         print_info "Directory already exists — pulling latest changes..."
-        git -C bc250_smu_oc pull || { print_error "Failed to pull repository."; return 1; }
+        sudo -u "$REAL_USER" git -C "$build_dir" pull || { print_error "Failed to pull repository."; return 1; }
     else
-        git clone https://github.com/bc250-collective/bc250_smu_oc.git || { print_error "Failed to clone repository."; return 1; }
+        sudo -u "$REAL_USER" git clone https://github.com/bc250-collective/bc250_smu_oc.git "$build_dir" || { print_error "Failed to clone repository."; return 1; }
     fi
-    cd bc250_smu_oc
-    print_info "Installing via pipx..."
-    pipx install . || { print_error "Failed to install via pipx."; cd ..; return 1; }
-    pipx ensurepath || true
-    export PATH="$PATH:/root/.local/bin"
-    print_info "Running bc250-detect..."
-    bc250-detect --frequency 3500 --vid 1000 --keep || { print_error "bc250-detect failed."; cd ..; return 1; }
+
+    # Install and run as the real user, not root — bc250_smu_oc installs into
+    # the invoking user's pipx bin dir and elevates itself internally when it
+    # needs SMU access. Installing as root instead puts the binaries in
+    # /root/.local/bin, where the user's own shell can never find them.
+    print_info "Installing via pipx as $REAL_USER..."
+    sudo -u "$REAL_USER" bash -c "cd '$build_dir' && pipx install . && pipx ensurepath" \
+        || { print_error "Failed to install via pipx."; return 1; }
+
+    print_info "Running bc250-detect as $REAL_USER (it will elevate privileges itself if needed)..."
+    sudo -u "$REAL_USER" env PATH="$user_bin:$PATH" bash -c "cd '$build_dir' && bc250-detect --frequency 3500 --vid 1000 --keep" \
+        || { print_error "bc250-detect failed."; return 1; }
+
     print_info "Applying overclock config..."
-    bc250-apply --install overclock.conf || { print_error "bc250-apply failed."; cd ..; return 1; }
+    sudo -u "$REAL_USER" env PATH="$user_bin:$PATH" bash -c "cd '$build_dir' && bc250-apply --install overclock.conf" \
+        || { print_error "bc250-apply failed."; return 1; }
+
     print_info "Enabling systemd service..."
-    systemctl enable bc250-smu-oc || { print_error "Failed to enable service."; cd ..; return 1; }
-    cd ..
+    systemctl enable bc250-smu-oc || { print_error "Failed to enable service."; return 1; }
+
     print_success "CPU Governor installed successfully!"
+    echo -e "  ${DIM}bc250-detect / bc250-apply are on ${REAL_USER}'s PATH at ${user_bin}${RESET}\n"
 }
 
 run_gpu_governor() {
@@ -307,9 +480,20 @@ run_gpu_governor() {
     fi
 
     print_info "Installing cyan-skillfish-governor-smu via AUR helper..."
-    aur_install cyan-skillfish-governor-smu
+    if ! aur_install cyan-skillfish-governor-smu; then
+        print_error "Failed to install cyan-skillfish-governor-smu — check the output above."
+        return 1
+    fi
+    if ! pacman -Qq cyan-skillfish-governor-smu &>/dev/null; then
+        print_error "The install command reported success, but cyan-skillfish-governor-smu is not actually installed — check the output above."
+        return 1
+    fi
+
     print_info "Enabling and starting systemd service..."
-    systemctl enable --now cyan-skillfish-governor-smu.service
+    if ! systemctl enable --now cyan-skillfish-governor-smu.service; then
+        print_error "Failed to enable/start the service — check: journalctl -u cyan-skillfish-governor-smu.service"
+        return 1
+    fi
     print_success "GPU Governor installed and started successfully!"
 }
 
@@ -344,12 +528,22 @@ run_enable_swap() {
     swapoff /var/swap/swapfile 2>/dev/null || true
     rm -f /var/swap/swapfile 2>/dev/null || true
 
-    print_info "Recreating Btrfs subvolume..."
-    btrfs subvolume delete /var/swap 2>/dev/null || true
-    btrfs subvolume create /var/swap
+    # Detect filesystem type
+    local fs_type
+    fs_type=$(stat -f -c "%T" / 2>/dev/null || echo "unknown")
 
-    print_info "Creating ${swap_size}G swapfile..."
-    btrfs filesystem mkswapfile --size "${swap_size}G" /var/swap/swapfile
+    if [[ "$fs_type" == "btrfs" ]]; then
+        print_info "Btrfs detected — creating Btrfs subvolume and swapfile..."
+        btrfs subvolume delete /var/swap 2>/dev/null || true
+        btrfs subvolume create /var/swap
+        btrfs filesystem mkswapfile --size "${swap_size}G" /var/swap/swapfile
+    else
+        print_info "Non-Btrfs filesystem detected ($fs_type) — creating standard swapfile..."
+        mkdir -p /var/swap
+        dd if=/dev/zero of=/var/swap/swapfile bs=1M count=$(( swap_size * 1024 )) status=progress
+        chmod 600 /var/swap/swapfile
+        mkswap /var/swap/swapfile
+    fi
 
     print_info "Updating /etc/fstab..."
     sed -i '/\/var\/swap\/swapfile/d' /etc/fstab
@@ -369,15 +563,18 @@ run_enable_swap() {
 }
 
 run_set_loglevel() {
-    local CONF="/etc/default/limine"
-    print_step "06" "Hiding RDSEED Warning — Setting loglevel=0 in $CONF"
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
+    print_step "06" "Hiding RDSEED Warning — Setting loglevel=0"
 
-    if [[ ! -f "$CONF" ]]; then
-        print_error "File not found: $CONF"
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
         return 1
     fi
+    print_info "Detected bootloader: $BOOTLOADER ($CONF)"
 
-    # Create backup before any modifications
     if [[ ! -f "${CONF}.bak" ]]; then
         print_info "Creating original backup at ${CONF}.bak ..."
         cp "$CONF" "${CONF}.bak"
@@ -385,35 +582,37 @@ run_set_loglevel() {
         print_info "Backup already exists — preserving original."
     fi
 
-    # 1. If loglevel= exists anywhere in the file, update it to 0
+    local cmdline_var
+    cmdline_var="$(bootloader_cmdline_var)"
+    local cmdline_var_esc
+    cmdline_var_esc="$(bootloader_cmdline_var_escaped)"
+
     if grep -q 'loglevel=' "$CONF"; then
         print_info "loglevel= found. Updating value to 0..."
         sed -i 's/loglevel=[0-9]*/loglevel=0/g' "$CONF"
-
-    # 2. If loglevel= is missing, append it inside the KERNEL_CMDLINE[default] quotes
     else
-        print_info "loglevel= not found. Adding to KERNEL_CMDLINE[default]..."
-        # This matches the KERNEL_CMDLINE[default]+="... line and inserts loglevel=0 before the closing quote
-        sed -i '/^KERNEL_CMDLINE\[default\]/ s/\"$/ loglevel=0\"/' "$CONF"
+        print_info "loglevel= not found. Adding to $cmdline_var..."
+        sed -i "/^${cmdline_var_esc}/ s/\"$/ loglevel=0\"/" "$CONF"
     fi
 
-    # Regenerate Limine config
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        print_info "Regenerating /boot/limine.conf..."
-        limine-update
+        bootloader_update
     fi
-
     print_success "loglevel set to 0. Reboot to apply."
 }
 
 run_disable_zram_enable_zswap() {
-    local CONF="/etc/default/limine"
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
     print_step "05" "Disabling ZRAM & Enabling ZSWAP"
 
-    if [[ ! -f "$CONF" ]]; then
-        print_error "File not found: $CONF"
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
         return 1
     fi
+    print_info "Detected bootloader: $BOOTLOADER ($CONF)"
 
     if [[ ! -f "${CONF}.bak" ]]; then
         print_info "Creating original backup at ${CONF}.bak ..."
@@ -422,12 +621,17 @@ run_disable_zram_enable_zswap() {
         print_info "Backup already exists at ${CONF}.bak — preserving original."
     fi
 
+    local cmdline_var
+    cmdline_var="$(bootloader_cmdline_var)"
+    local cmdline_var_esc
+    cmdline_var_esc="$(bootloader_cmdline_var_escaped)"
+
     # --- Disable ZRAM ---
     if grep -q 'systemd\.zram=0' "$CONF"; then
         print_info "ZRAM already disabled in $CONF — skipping."
     else
         print_info "Disabling ZRAM..."
-        sed -i '/^KERNEL_CMDLINE/s/"$/ systemd.zram=0"/' "$CONF"
+        sed -i "/^${cmdline_var_esc}/s/\"$/ systemd.zram=0\"/" "$CONF"
         print_info "systemd.zram=0 added."
     fi
 
@@ -436,25 +640,17 @@ run_disable_zram_enable_zswap() {
         print_info "ZSWAP already enabled in $CONF — skipping."
     else
         print_info "Enabling zswap (lz4, 25% pool)..."
-        sed -i '/^KERNEL_CMDLINE/s/"$/ zswap.enabled=1 zswap.max_pool_percent=25 zswap.compressor=lz4"/' "$CONF"
+        sed -i "/^${cmdline_var_esc}/s/\"$/ zswap.enabled=1 zswap.max_pool_percent=25 zswap.compressor=lz4\"/" "$CONF"
         print_info "ZSWAP kernel parameters added."
     fi
 
     # --- Add lz4 modules to initramfs ---
-    local MKINITCPIO="/etc/mkinitcpio.conf"
-    if grep -q 'lz4' "$MKINITCPIO"; then
-        print_info "lz4 modules already present in $MKINITCPIO — skipping."
-    else
-        print_info "Adding lz4 and lz4_compress modules to initramfs..."
-        sed -i 's/^MODULES=(\(.*\))/MODULES=(\1 lz4 lz4_compress)/' "$MKINITCPIO"
-        print_info "Rebuilding initramfs (this may take a moment)..."
-        mkinitcpio -P
-        print_info "Initramfs rebuilt."
-    fi
+    initramfs_add_module lz4 || true
+    initramfs_add_module lz4_compress || true
+    initramfs_rebuild
 
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        print_info "Regenerating /boot/limine.conf..."
-        limine-update
+        bootloader_update
     fi
     print_success "ZRAM disabled && ZSWAP enabled! Reboot to apply."
     echo -e "  ${DIM}After reboot, verify with: cat /sys/module/zswap/parameters/enabled${RESET}\n"
@@ -574,9 +770,8 @@ run_switch_to_default_kernel() {
 
     # Update bootloader
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        print_info "Regenerating Limine boot menu..."
-        if ! limine-update; then
-            print_error "limine-update failed — do not remove Deckify kernel until this is resolved."
+        if ! bootloader_update; then
+            print_error "Boot config update failed — do not remove Deckify kernel until this is resolved."
             return 1
         fi
     fi
@@ -619,9 +814,8 @@ run_remove_deckify_kernel() {
     fi
 
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        print_info "Regenerating Limine boot menu..."
-        if ! limine-update; then
-            print_error "limine-update failed — boot menu may need manual attention."
+        if ! bootloader_update; then
+            print_error "Boot config update failed — boot menu may need manual attention."
             return 1
         fi
     fi
@@ -629,161 +823,427 @@ run_remove_deckify_kernel() {
     print_success "Deckify kernel removed successfully."
 }
 
-run_install_acpi_fix() {
-    print_step "08" "Installing BC250 ACPI Fix"
-    print_info "NOTE: This fix is known to not work and is retained for reference only. Proceed at your own risk."
-    local CPIO_NAME="bc250_acpi.cpio"
-    local CPIO_DEST="/boot/$CPIO_NAME"
-    local LIMINE_CONFIG="/boot/limine.conf"
-    local HOOK_DIR="/etc/pacman.d/hooks"
-    local HOOK_FILE="$HOOK_DIR/bc250-acpi-fix.hook"
-    local INJECT_SCRIPT="/usr/local/bin/bc250-acpi-inject.sh"
+# ==============================================================================
+# CPU CORES UNLOCK — EFI Boot Entry method (Hexxeh/bc250-efi-core-unlock)
+# ==============================================================================
 
-    # 1. Dependency & Lock Check
-    while [ -f /var/lib/pacman/db.lck ]; do sleep 2; done
-    if ! command -v git &>/dev/null || ! command -v cpio &>/dev/null; then
-        pacman -S --noconfirm git cpio
-    fi
+CPU_UNLOCK_EFI_REPO_URL="https://github.com/Hexxeh/bc250-efi-core-unlock"
+CPU_UNLOCK_EFI_YOPPEH_URL="https://github.com/yoppeh/efi"
+CPU_UNLOCK_EFI_LABEL="CoreUnlock"
+CPU_UNLOCK_EFI_BIN_NAME="COREUNLOCK.EFI"
 
-    # 2. Build the CPIO
-    local BUILD_DIR="/tmp/bc250-acpi-build"
-    rm -rf "$BUILD_DIR"
-    print_info "Cloning bc250-acpi-fix repository..."
-    git clone "https://github.com/bc250-collective/bc250-acpi-fix.git" "$BUILD_DIR" \
-        || { print_error "Failed to clone repository."; return 1; }
-    mkdir -p "$BUILD_DIR/kernel/firmware/acpi"
-    cp "$BUILD_DIR"/*.aml "$BUILD_DIR/kernel/firmware/acpi/" \
-        || { print_error "No .aml files found in repository."; return 1; }
-    ( cd "$BUILD_DIR" && find kernel | cpio -o -H newc > "$CPIO_DEST" 2>/dev/null )
-    print_success "ACPI archive created at $CPIO_DEST"
-
-    # 3. Install the inject script that pacman hook will call
-    print_info "Installing inject script at $INJECT_SCRIPT..."
-    mkdir -p /usr/local/bin
-    cat > "$INJECT_SCRIPT" <<'INJECT'
-#!/bin/bash
-# bc250-acpi-inject.sh — Re-inserts the ACPI CPIO module line into
-# /boot/limine.conf after every limine-update run.
-LIMINE_CONFIG="/boot/limine.conf"
-CPIO_NAME="bc250_acpi.cpio"
-
-if [[ ! -f "$LIMINE_CONFIG" ]]; then
-    echo "bc250-acpi-inject: $LIMINE_CONFIG not found, skipping." >&2
-    exit 0
-fi
-
-if grep -q "$CPIO_NAME" "$LIMINE_CONFIG"; then
-    exit 0  # already present, nothing to do
-fi
-
-# Insert one ACPI module_path line before the FIRST protocol: linux entry.
-# This ensures the CPIO is loaded for every kernel without duplicating lines.
-sed -i "0,/^  protocol: linux/{s/^  protocol: linux/  module_path: boot():\/${CPIO_NAME}\n  protocol: linux/}" \
-    "$LIMINE_CONFIG"
-
-echo "bc250-acpi-inject: ACPI module line inserted into $LIMINE_CONFIG."
-INJECT
-    chmod +x "$INJECT_SCRIPT"
-    print_success "Inject script installed."
-
-    # 4. Install the pacman hook so the inject script runs after every limine upgrade
-    print_info "Installing pacman hook at $HOOK_FILE..."
-    mkdir -p "$HOOK_DIR"
-    cat > "$HOOK_FILE" <<'HOOK'
-[Trigger]
-Operation = Install
-Operation = Upgrade
-Type = Package
-Target = limine
-
-[Action]
-Description = Re-injecting BC250 ACPI fix module into limine.conf...
-When = PostTransaction
-Exec = /usr/local/bin/bc250-acpi-inject.sh
-HOOK
-    print_success "Pacman hook installed — fix will survive kernel and limine updates."
-
-    # 5. Inject into the current limine.conf immediately
-    if [[ -f "$LIMINE_CONFIG" ]]; then
-        if grep -q "$CPIO_NAME" "$LIMINE_CONFIG"; then
-            print_info "ACPI module already present in $LIMINE_CONFIG."
-        else
-            print_info "Injecting ACPI module into current $LIMINE_CONFIG..."
-            "$INJECT_SCRIPT"
-            print_success "ACPI module line inserted."
-        fi
-    else
-        print_error "Could not find $LIMINE_CONFIG"
-        return 1
-    fi
-
-    print_success "ACPI fix installed. Reboot to apply."
-    echo -e "  ${DIM}After reboot, verify with: journalctl -k | grep -i 'acpi\\|c-state'${RESET}\n"
-    if confirm "Reboot now?"; then
-        reboot
-    fi
+cpu_unlock_efi_installed() {
+    efibootmgr 2>/dev/null | grep -q "$CPU_UNLOCK_EFI_LABEL"
 }
 
-run_revert_acpi_fix() {
-    print_step "R-6" "Revert BC250 ACPI Fix"
+# Finds the EFI System Partition's mount point by checking common locations
+cpu_unlock_efi_find_esp() {
+    local mnt
+    for mnt in /boot/efi /efi /boot; do
+        if mountpoint -q "$mnt" 2>/dev/null && [[ -d "$mnt/EFI" ]]; then
+            printf '%s' "$mnt"
+            return 0
+        fi
+    done
+    return 1
+}
 
-    local CPIO_DEST="/boot/bc250_acpi.cpio"
-    local HOOK_FILE="/etc/pacman.d/hooks/bc250-acpi-fix.hook"
-    local INJECT_SCRIPT="/usr/local/bin/bc250-acpi-inject.sh"
-    local LIMINE_CONFIG="/boot/limine.conf"
-    local CPIO_NAME="bc250_acpi.cpio"
+# Prints "<disk> <partition-number>" for the ESP, e.g. "/dev/nvme0n1 1"
+cpu_unlock_efi_find_disk_part() {
+    local esp_mount="$1" esp_dev pkname partnum
+    esp_dev="$(findmnt -n -o SOURCE "$esp_mount" 2>/dev/null)"
+    [[ -n "$esp_dev" ]] || return 1
+    pkname="$(lsblk -rno PKNAME "$esp_dev" 2>/dev/null)"
+    partnum="$(lsblk -rno PARTN "$esp_dev" 2>/dev/null)"
+    [[ -n "$pkname" && -n "$partnum" ]] || return 1
+    printf '/dev/%s %s' "$pkname" "$partnum"
+}
 
-    if [[ ! -f "$CPIO_DEST" ]] && [[ ! -f "$HOOK_FILE" ]]; then
-        print_info "ACPI fix does not appear to be installed — nothing to revert."
+cpu_unlock_efi_warn() {
+    echo ""
+    echo -e "  ${BOLD}${RED}⚠  WARNING: CPU CORES UNLOCK — EFI BOOT ENTRY METHOD${RESET}"
+    echo ""
+    echo -e "  ${WHITE}This is an alternative to the SMU mailbox service: instead of a boot-time"
+    echo -e "  systemd service, it builds a standalone EFI executable and registers it as"
+    echo -e "  a NEW UEFI FIRMWARE BOOT ENTRY (via efibootmgr), typically placed FIRST in"
+    echo -e "  your boot order. It runs before your OS bootloader, unlocks the cores, then"
+    echo -e "  chain-loads into your normal boot process."
+    echo ""
+    echo -e "  This modifies UEFI NVRAM boot entries directly, not just OS-level files."
+    echo -e "  Only proceed if you understand that.${RESET}"
+    echo ""
+    echo -e "  ${DIM}Type ${RESET}${BOLD}${YELLOW}unlock${RESET}${DIM} to accept and proceed, or press Enter to cancel.${RESET}"
+    echo ""
+    read -rp "  → " cpu_unlock_efi_ack
+    [[ "$cpu_unlock_efi_ack" == "unlock" ]]
+}
+
+run_cpu_cores_unlock_efi() {
+    print_step "08b" "Installing CPU Cores Unlock — EFI Boot Entry Method"
+
+    if cpu_unlock_efi_installed; then
+        print_info "A '$CPU_UNLOCK_EFI_LABEL' EFI boot entry already exists — skipping."
         return 0
     fi
 
-    if ! confirm "This will remove the BC250 ACPI fix and its pacman hook. Proceed?"; then
+    cpu_unlock_efi_warn || { print_info "Cancelled."; return 0; }
+
+    if ! command -v clang &>/dev/null; then
+        print_error "clang is not installed. Install it (e.g. 'pacman -S clang') and try again."
+        return 1
+    fi
+
+    print_info "Locating the EFI System Partition..."
+    local esp_mount
+    if ! esp_mount="$(cpu_unlock_efi_find_esp)"; then
+        print_error "Could not automatically locate the EFI System Partition (checked /boot/efi, /efi, /boot)."
+        return 1
+    fi
+    print_info "Found ESP at $esp_mount"
+
+    local disk_part disk part
+    if ! disk_part="$(cpu_unlock_efi_find_disk_part "$esp_mount")"; then
+        print_error "Could not determine the underlying disk/partition for the ESP at $esp_mount."
+        print_error "Run manually: efibootmgr --create --disk <disk> --part <N> --label \"$CPU_UNLOCK_EFI_LABEL\" --loader \"\\EFI\\BOOT\\$CPU_UNLOCK_EFI_BIN_NAME\""
+        return 1
+    fi
+    read -r disk part <<<"$disk_part"
+    print_info "ESP is on $disk, partition $part"
+
+    print_info "Installing gnu-efi..."
+    if command -v pacman >/dev/null 2>&1 && pacman -Si gnu-efi >/dev/null 2>&1; then
+        pacman -S --needed --noconfirm gnu-efi || { print_error "Failed to install gnu-efi via pacman."; return 1; }
+    else
+        aur_install gnu-efi || { print_error "Failed to install gnu-efi."; return 1; }
+    fi
+
+    local user_home
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    local build_dir="$user_home/.cache/bc250-toolkit/bc250-efi-core-unlock"
+
+    print_info "Cloning bc250-efi-core-unlock as $REAL_USER..."
+    sudo -u "$REAL_USER" mkdir -p "$(dirname "$build_dir")"
+    if [[ -d "$build_dir" ]]; then
+        print_info "Directory already exists — pulling latest changes..."
+        sudo -u "$REAL_USER" git -C "$build_dir" pull || { print_error "Failed to pull repository."; return 1; }
+    else
+        sudo -u "$REAL_USER" git clone "$CPU_UNLOCK_EFI_REPO_URL" "$build_dir" || { print_error "Failed to clone repository."; return 1; }
+    fi
+
+    print_info "Cloning yoppeh/efi dependency..."
+    if [[ -d "$build_dir/efi" ]]; then
+        sudo -u "$REAL_USER" git -C "$build_dir/efi" pull || { print_error "Failed to pull efi dependency."; return 1; }
+    else
+        sudo -u "$REAL_USER" git clone "$CPU_UNLOCK_EFI_YOPPEH_URL" "$build_dir/efi" || { print_error "Failed to clone efi dependency."; return 1; }
+    fi
+
+    print_info "Patching Makefile..."
+    sudo -u "$REAL_USER" sed -i 's/yoppeh-efi/efi/g' "$build_dir/Makefile"
+
+    print_info "Building with clang..."
+    if ! sudo -u "$REAL_USER" bash -c "cd '$build_dir' && make clang"; then
+        print_error "Build failed."
+        return 1
+    fi
+    if [[ ! -f "$build_dir/bc250-unlock.efi" ]]; then
+        print_error "Build did not produce bc250-unlock.efi."
+        return 1
+    fi
+
+    print_info "Installing to $esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME..."
+    mkdir -p "$esp_mount/EFI/BOOT"
+    cp "$build_dir/bc250-unlock.efi" "$esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME"
+
+    if ! confirm "Create a UEFI boot entry '$CPU_UNLOCK_EFI_LABEL' on $disk (partition $part)? This will typically become your default boot entry."; then
+        print_info "Cancelled before creating the boot entry."
+        print_info "The .efi file remains installed at $esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME if you want to register it manually later."
+        return 0
+    fi
+
+    print_info "Creating EFI boot entry via efibootmgr..."
+    if ! efibootmgr --create --disk "$disk" --part "$part" --label "$CPU_UNLOCK_EFI_LABEL" --loader "\\EFI\\BOOT\\$CPU_UNLOCK_EFI_BIN_NAME"; then
+        print_error "efibootmgr failed to create the boot entry."
+        return 1
+    fi
+
+    print_success "CPU Cores Unlock (EFI method) installed successfully!"
+    echo -e "  ${DIM}EFI binary:  $esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME${RESET}"
+    echo -e "  ${DIM}Boot entry:  $CPU_UNLOCK_EFI_LABEL${RESET}"
+    echo -e "  ${BOLD}${YELLOW}A reboot is required to apply.${RESET}\n"
+}
+
+run_revert_cpu_cores_unlock_efi() {
+    print_step "R-9" "Revert CPU Cores Unlock"
+
+    if ! cpu_unlock_efi_installed; then
+        print_info "No '$CPU_UNLOCK_EFI_LABEL' EFI boot entry found — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "This will remove the '$CPU_UNLOCK_EFI_LABEL' UEFI boot entry and its .efi file. Proceed?"; then
         print_info "Cancelled."
         return 0
     fi
 
-    # Remove the pacman hook
-    if [[ -f "$HOOK_FILE" ]]; then
-        print_info "Removing pacman hook..."
-        rm -f "$HOOK_FILE"
-        print_success "Pacman hook removed."
+    local bootnum
+    bootnum="$(efibootmgr | awk -v label="$CPU_UNLOCK_EFI_LABEL" '$0 ~ label {gsub(/[^0-9]/,"",$1); print $1; exit}')"
+    if [[ -n "$bootnum" ]]; then
+        print_info "Removing boot entry Boot$bootnum ($CPU_UNLOCK_EFI_LABEL)..."
+        efibootmgr -b "$bootnum" -B || print_error "Failed to remove boot entry Boot$bootnum — check manually with 'efibootmgr'."
     else
-        print_info "Pacman hook not found — skipping."
+        print_error "Could not determine the boot entry number for '$CPU_UNLOCK_EFI_LABEL' — remove manually with 'efibootmgr'."
     fi
 
-    # Remove the inject script
-    if [[ -f "$INJECT_SCRIPT" ]]; then
-        print_info "Removing inject script..."
-        rm -f "$INJECT_SCRIPT"
-        print_success "Inject script removed."
-    else
-        print_info "Inject script not found — skipping."
+    local esp_mount
+    if esp_mount="$(cpu_unlock_efi_find_esp)" && [[ -f "$esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME" ]]; then
+        print_info "Removing $esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME..."
+        rm -f "$esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME"
     fi
 
-    # Remove the ACPI module line from limine.conf
-    if [[ -f "$LIMINE_CONFIG" ]] && grep -q "$CPIO_NAME" "$LIMINE_CONFIG"; then
-        print_info "Removing ACPI module line from $LIMINE_CONFIG..."
-        sed -i "/${CPIO_NAME}/d" "$LIMINE_CONFIG"
-        print_success "ACPI module line removed from $LIMINE_CONFIG."
-    else
-        print_info "ACPI module line not found in $LIMINE_CONFIG — skipping."
+    local user_home
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    local build_dir="$user_home/.cache/bc250-toolkit/bc250-efi-core-unlock"
+    if [[ -d "$build_dir" ]]; then
+        print_info "Removing build directory..."
+        rm -rf "$build_dir"
     fi
 
-    # Remove the CPIO archive
-    if [[ -f "$CPIO_DEST" ]]; then
-        print_info "Removing ACPI CPIO archive..."
-        rm -f "$CPIO_DEST"
-        print_success "CPIO archive removed."
-    else
-        print_info "CPIO archive not found — skipping."
-    fi
+    print_success "CPU Cores Unlock (EFI method) removed."
+}
 
-    print_success "ACPI fix reverted. Reboot to apply."
-    if confirm "Reboot now?"; then
-        reboot
+# ---- CPU Cores Unlock submenu (both methods) ----
+
+# ==============================================================================
+# ACPI FIX (mendesrr/bc250-acpi-fix-updated-8c) + CPU GOVERNOR
+# ==============================================================================
+
+ACPI_OVERRIDE_DIR="/etc/initcpio/acpi_override"
+ACPI_CST_URL="https://github.com/mendesrr/bc250-acpi-fix-updated-8c/raw/refs/heads/main/SSDT-CST.aml"
+ACPI_PST_URL="https://github.com/mendesrr/bc250-acpi-fix-updated-8c/raw/refs/heads/main/SSDT-PST.aml"
+MKINITCPIO_CONF="/etc/mkinitcpio.conf"
+CPUPOWER_CONF="/etc/default/cpupower-service.conf"
+CPUPOWER_SERVICE="cpupower.service"
+
+acpi_fix_installed() {
+    [[ -f "$ACPI_OVERRIDE_DIR/SSDT-CST.aml" && -f "$ACPI_OVERRIDE_DIR/SSDT-PST.aml" ]] && \
+        grep -qE '^HOOKS=.*\bacpi_override\b' "$MKINITCPIO_CONF" 2>/dev/null
+}
+
+# Prints the live scaling_governor if all CPUs agree, "mixed" if they don't,
+# or nothing if it couldn't be read at all.
+cpupower_current_governor() {
+    local govs govcount
+    govs="$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort -u)"
+    [[ -n "$govs" ]] || return 1
+    govcount="$(printf '%s\n' "$govs" | wc -l)"
+    if [[ "$govcount" -eq 1 ]]; then
+        printf '%s' "$govs"
+    else
+        printf 'mixed'
     fi
 }
+
+run_install_acpi_fix() {
+    print_step "AS-1" "Installing ACPI Fix"
+
+    if acpi_fix_installed; then
+        print_info "ACPI Fix already installed — skipping."
+        return 0
+    fi
+
+    print_info "Creating $ACPI_OVERRIDE_DIR..."
+    mkdir -p "$ACPI_OVERRIDE_DIR"
+
+    print_info "Downloading SSDT-CST.aml and SSDT-PST.aml..."
+    if ! wget -nc -P "$ACPI_OVERRIDE_DIR" "$ACPI_CST_URL" "$ACPI_PST_URL"; then
+        print_error "Failed to download one or both ACPI override files."
+        return 1
+    fi
+    if [[ ! -f "$ACPI_OVERRIDE_DIR/SSDT-CST.aml" || ! -f "$ACPI_OVERRIDE_DIR/SSDT-PST.aml" ]]; then
+        print_error "Expected ACPI override files not found after download."
+        return 1
+    fi
+
+    if grep -qE '^HOOKS=.*\bacpi_override\b' "$MKINITCPIO_CONF"; then
+        print_info "acpi_override hook already present in $MKINITCPIO_CONF — skipping hook edit."
+    else
+        print_info "Adding acpi_override hook to $MKINITCPIO_CONF..."
+        sed -i '/^HOOKS=/ { /acpi_override/q; s/microcode/& acpi_override/; q }' "$MKINITCPIO_CONF"
+        if ! grep -qE '^HOOKS=.*\bacpi_override\b' "$MKINITCPIO_CONF"; then
+            print_error "Could not add the acpi_override hook automatically — no 'microcode' hook found to anchor next to."
+            print_error "Add 'acpi_override' to the HOOKS= line in $MKINITCPIO_CONF manually, then rebuild initramfs."
+            return 1
+        fi
+    fi
+
+    if ! initramfs_rebuild; then
+        print_error "Initramfs rebuild failed — check the output above."
+        return 1
+    fi
+
+    print_success "ACPI Fix installed successfully!"
+    echo -e "  ${BOLD}${YELLOW}A reboot is required to apply the ACPI override.${RESET}\n"
+}
+
+run_acpi_show_power_info() {
+    print_step "AS-2" "CPU Power Info"
+
+    if ! command -v cpupower &>/dev/null; then
+        print_error "cpupower is not installed."
+        return 1
+    fi
+
+    echo ""
+    print_section "cpupower idle-info"
+    cpupower idle-info || print_error "cpupower idle-info failed."
+    echo ""
+    print_section "cpupower frequency-info"
+    cpupower frequency-info || print_error "cpupower frequency-info failed."
+}
+
+run_set_cpu_governor() {
+    print_step "AS-3" "Set CPU Governor"
+
+    local current
+    if current="$(cpupower_current_governor)"; then
+        print_info "Current live governor: ${current}"
+    else
+        print_info "Could not read the current governor from sysfs."
+    fi
+
+    echo ""
+    print_item "1" "schedutil"   "Dynamic, kernel-driven scaling (default)"
+    print_item "2" "performance" "Locks CPUs at max frequency"
+    echo ""
+    print_item "0" "Cancel" ""
+    echo ""
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Select governor:${RESET} ")" gov_choice
+
+    local target_gov
+    case "$gov_choice" in
+        1) target_gov="schedutil" ;;
+        2) target_gov="performance" ;;
+        0) print_info "Cancelled."; return 0 ;;
+        *) print_error "Invalid selection."; return 1 ;;
+    esac
+
+    if ! confirm "Set CPU governor to '${target_gov}'?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    if [[ ! -f "$CPUPOWER_CONF" ]]; then
+        print_error "$CPUPOWER_CONF not found — is the 'cpupower' package/service installed?"
+        return 1
+    fi
+
+    print_info "Updating $CPUPOWER_CONF..."
+    if grep -qE '^GOVERNOR=' "$CPUPOWER_CONF"; then
+        sed -i "s/^GOVERNOR=.*/GOVERNOR='${target_gov}'/" "$CPUPOWER_CONF"
+    elif grep -qE '^#\s*GOVERNOR=' "$CPUPOWER_CONF"; then
+        sed -i "s/^#\s*GOVERNOR=.*/GOVERNOR='${target_gov}'/" "$CPUPOWER_CONF"
+    else
+        echo "GOVERNOR='${target_gov}'" >> "$CPUPOWER_CONF"
+    fi
+
+    if systemctl list-unit-files "$CPUPOWER_SERVICE" &>/dev/null; then
+        print_info "Restarting ${CPUPOWER_SERVICE}..."
+        systemctl enable "$CPUPOWER_SERVICE" &>/dev/null || true
+        if ! systemctl restart "$CPUPOWER_SERVICE"; then
+            print_error "Failed to restart $CPUPOWER_SERVICE — check: journalctl -u $CPUPOWER_SERVICE"
+            return 1
+        fi
+    else
+        print_error "$CPUPOWER_SERVICE not found — config was updated but not applied. Install/enable the cpupower service to apply it."
+        return 1
+    fi
+
+    print_success "CPU governor set to '${target_gov}'."
+    local new_current
+    if new_current="$(cpupower_current_governor)"; then
+        echo -e "  ${DIM}Live governor now reports: ${new_current}${RESET}\n"
+    fi
+}
+
+show_acpi_menu() {
+    print_banner
+    print_section "ACPI Fix"
+    echo -e "  ${DIM}SSDT idle/frequency table override (mendesrr/bc250-acpi-fix-updated-8c) plus CPU governor control.${RESET}\n"
+    local status_label
+    if acpi_fix_installed; then
+        status_label="${GREEN}installed${RESET}  ${DIM}($ACPI_OVERRIDE_DIR)${RESET}"
+    else
+        status_label="${DIM}not installed${RESET}"
+    fi
+    echo -e "  ${CYAN}Status${RESET}    ${status_label}"
+    local gov
+    if gov="$(cpupower_current_governor)"; then
+        echo -e "  ${CYAN}Governor${RESET}  ${BOLD}${WHITE}${gov}${RESET}"
+    else
+        echo -e "  ${CYAN}Governor${RESET}  ${DIM}unknown${RESET}"
+    fi
+    echo ""
+    print_item "1" "Install ACPI Fix"    "Downloads SSDT overrides, rebuilds initramfs"
+    print_item "2" "Show CPU Power Info" "cpupower idle-info / frequency-info"
+    print_item "3" "Set CPU Governor"    "Switch between schedutil and performance"
+    echo ""
+    print_item "0" "Back" ""
+    echo ""
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_acpi_menu() {
+    while true; do
+        show_acpi_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" acpi_choice
+
+        case "${acpi_choice^^}" in
+            1) run_install_acpi_fix;     press_enter ;;
+            2) run_acpi_show_power_info; press_enter ;;
+            3) run_set_cpu_governor;     press_enter ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$acpi_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+run_revert_acpi_fix() {
+    print_step "R-8" "Revert ACPI Fix"
+
+    if ! acpi_fix_installed && [[ ! -d "$ACPI_OVERRIDE_DIR" ]] && \
+       ! grep -qE '^HOOKS=.*\bacpi_override\b' "$MKINITCPIO_CONF" 2>/dev/null; then
+        print_info "ACPI Fix does not appear to be installed — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "This will remove the acpi_override hook, delete the SSDT override files, and rebuild initramfs. Proceed?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    if grep -qE '^HOOKS=.*\bacpi_override\b' "$MKINITCPIO_CONF" 2>/dev/null; then
+        print_info "Removing acpi_override hook from $MKINITCPIO_CONF..."
+        sed -i 's/ acpi_override//g' "$MKINITCPIO_CONF"
+    else
+        print_info "acpi_override hook not found in $MKINITCPIO_CONF — skipping."
+    fi
+
+    if [[ -d "$ACPI_OVERRIDE_DIR" ]]; then
+        print_info "Removing $ACPI_OVERRIDE_DIR..."
+        rm -rf "$ACPI_OVERRIDE_DIR"
+    fi
+
+    initramfs_rebuild || print_error "Initramfs rebuild failed — check the output above."
+
+    print_success "ACPI Fix removed."
+    echo -e "  ${BOLD}${YELLOW}A reboot is required to fully revert.${RESET}\n"
+    echo -e "  ${DIM}Note: this does not change your CPU governor setting — use 'Set CPU"
+    echo -e "  Governor' from the ACPI Fix menu if you also want to reset that.${RESET}\n"
+}
+
 # ==============================================================================
 # OVERCLOCK MENU (embedded from 07-overclock_menu.sh)
 # ==============================================================================
@@ -831,6 +1291,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 1500
@@ -873,6 +1337,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 1600
@@ -918,6 +1386,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 1750
@@ -969,6 +1441,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 1850
@@ -1020,6 +1496,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 2000
@@ -1074,6 +1554,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 2100
@@ -1134,6 +1618,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 2300
@@ -1209,6 +1697,10 @@ method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
+
+[dbus]
+enabled = true
+
 [frequency-range]
 min = 500
 max = 2350
@@ -1632,11 +2124,14 @@ run_overclock_menu() {
 
 
 run_revert_zswap() {
-    local CONF="/etc/default/limine"
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
     print_step "R-3" "Revert ZSWAP — Re-enabling ZRAM, removing swapfile"
 
-    if [[ ! -f "$CONF" ]]; then
-        print_error "File not found: $CONF"
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
         return 1
     fi
 
@@ -1663,17 +2158,10 @@ run_revert_zswap() {
         print_info "systemd.zram=0 not found — ZRAM already enabled."
     fi
 
-    # --- Remove lz4 from mkinitcpio ---
-    local MKINITCPIO="/etc/mkinitcpio.conf"
-    if grep -q 'lz4' "$MKINITCPIO"; then
-        print_info "Removing lz4 modules from initramfs..."
-        sed -i 's/ lz4_compress//g;s/ lz4//g' "$MKINITCPIO"
-        print_info "Rebuilding initramfs..."
-        mkinitcpio -P
-        print_info "Initramfs rebuilt."
-    else
-        print_info "lz4 not found in $MKINITCPIO — skipping."
-    fi
+    # --- Remove lz4 from initramfs ---
+    initramfs_remove_module lz4_compress || true
+    initramfs_remove_module lz4 || true
+    initramfs_rebuild
 
     # --- Disable and remove swapfile ---
     if swapon --show | grep -q '/var/swap/swapfile'; then
@@ -1720,8 +2208,8 @@ run_revert_zswap() {
         print_info "No swappiness config found — skipping."
     fi
 
-    print_info "Regenerating /boot/limine.conf..."
-    limine-update
+    print_info "Updating boot config..."
+    bootloader_update
     print_success "Revert complete! Reboot to restore ZRAM and disable ZSWAP."
     print_info "Note: ZRAM will not be active until after reboot."
     echo -e "  ${DIM}After reboot, verify with: systemctl is-active systemd-zram-setup@zram0.service${RESET}\n"
@@ -1729,13 +2217,17 @@ run_revert_zswap() {
 
 
 run_disable_mitigations() {
-    local CONF="/etc/default/limine"
-    print_step "07" "Disabling CPU Mitigations in $CONF"
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
+    print_step "07" "Disabling CPU Mitigations"
 
-    if [[ ! -f "$CONF" ]]; then
-        print_error "File not found: $CONF"
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
         return 1
     fi
+    print_info "Detected bootloader: $BOOTLOADER ($CONF)"
 
     if [[ ! -f "${CONF}.bak" ]]; then
         print_info "Creating original backup at ${CONF}.bak ..."
@@ -1745,15 +2237,19 @@ run_disable_mitigations() {
     fi
 
     if grep -q 'mitigations=off' "$CONF"; then
-        print_info "mitigations=off already present in $CONF — skipping."
+        print_info "mitigations=off already present — skipping."
         return 0
     fi
 
+    local cmdline_var
+    cmdline_var="$(bootloader_cmdline_var)"
+    local cmdline_var_esc
+    cmdline_var_esc="$(bootloader_cmdline_var_escaped)"
     print_info "Adding mitigations=off..."
-    sed -i '/^KERNEL_CMDLINE/s/"$/ mitigations=off"/' "$CONF"
+    sed -i "/^${cmdline_var_esc}/s/\"$/ mitigations=off\"/" "$CONF"
+
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        print_info "Regenerating /boot/limine.conf..."
-        limine-update
+        bootloader_update
     fi
     print_success "mitigations=off added. Reboot to apply."
     echo -e "  ${DIM}Note: this disables Spectre/Meltdown mitigations for a performance gain.${RESET}\n"
@@ -1763,7 +2259,10 @@ run_status() {
     print_banner
     print_section "System Status"
 
-    local LIMINE_CONF="/etc/default/limine"
+    local LIMINE_CONF
+    LIMINE_CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
     local CPU_CONF="/etc/bc250-smu-oc.conf"
     local GPU_CONF="/etc/cyan-skillfish-governor-smu/config.toml"
     local MKINITCPIO="/etc/mkinitcpio.conf"
@@ -1838,9 +2337,23 @@ run_status() {
     echo -e "  ${CYAN}GPU Service${RESET}       ${gpu_color}${gpu_svc_state}${RESET}"
     echo ""
 
-    # --- Compute Units ---
-    echo -e "  ${BOLD}${YELLOW}Compute Units${RESET}"
+    # --- Hardware Unlocks (CPU Cores / Compute Units) ---
+    echo -e "  ${BOLD}${YELLOW}Hardware Unlocks${RESET}"
     echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
+    local cpu_core_count cpu_core_color
+    cpu_core_count=$(nproc --all 2>/dev/null || echo "?")
+    if [[ "$cpu_core_count" == "16" ]]; then
+        cpu_core_color="$GREEN"
+    elif [[ "$cpu_core_count" == "12" ]]; then
+        cpu_core_color="$DIM"
+    else
+        cpu_core_color="$YELLOW"
+    fi
+    local unlock_method_tag=""
+    if cpu_unlock_efi_installed; then
+        unlock_method_tag=" ${DIM}[EFI entry]${RESET}"
+    fi
+    echo -e "  ${CYAN}CPU Cores${RESET}         ${cpu_core_color}${BOLD}${cpu_core_count}${RESET}  ${DIM}(12 stock, 16 unlocked)${RESET}${unlock_method_tag}"
     if cu_find_umr; then
         cu_select_umr_instance
         local cu_total=0 cu_idx cu_se cu_sh cu_spi_hex cu_spi_val cu_wgp cu_bit
@@ -1873,6 +2386,39 @@ run_status() {
         fi
     else
         echo -e "  ${CYAN}Active CUs${RESET}        ${DIM}umr not installed${RESET}"
+    fi
+    echo ""
+
+    # --- ACPI Fix / CPU Governor ---
+    echo -e "  ${BOLD}${YELLOW}ACPI Fix${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
+    if acpi_fix_installed; then
+        echo -e "  ${CYAN}Status${RESET}            ${GREEN}installed${RESET}  ${DIM}($ACPI_OVERRIDE_DIR)${RESET}"
+    else
+        echo -e "  ${CYAN}Status${RESET}            ${DIM}not installed${RESET}"
+    fi
+    local status_gov
+    if status_gov="$(cpupower_current_governor)"; then
+        echo -e "  ${CYAN}CPU Governor${RESET}      ${BOLD}${WHITE}${status_gov}${RESET}"
+    else
+        echo -e "  ${CYAN}CPU Governor${RESET}      ${DIM}unknown${RESET}"
+    fi
+    echo ""
+
+    # --- BC-250 Memory Config (bc250_memcfg) ---
+    echo -e "  ${BOLD}${YELLOW}Memory Config (bc250_memcfg)${RESET}"
+    echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
+    if memcfg_installed; then
+        echo -e "  ${CYAN}Tool${RESET}              ${GREEN}installed${RESET}  ${DIM}($MEMCFG_BIN)${RESET}"
+        local status_vram_size
+        status_vram_size="$(memcfg_current_uma_size)"
+        if [[ -n "$status_vram_size" ]]; then
+            echo -e "  ${CYAN}VRAM Size${RESET}         ${BOLD}${WHITE}${status_vram_size}MB${RESET}  ${DIM}(UMA_SIZE, current CMOS setting)${RESET}"
+        else
+            echo -e "  ${CYAN}VRAM Size${RESET}         ${DIM}unknown — see Initial Setup > BC-250 Memory Config${RESET}"
+        fi
+    else
+        echo -e "  ${CYAN}Tool${RESET}              ${DIM}not installed${RESET}"
     fi
     echo ""
 
@@ -1937,22 +2483,43 @@ run_status() {
 
     # --- Kernel Parameters ---
     echo -e "  ${BOLD}${YELLOW}Kernel Parameters${RESET}"
-    echo -e "  ${DIM}source: $LIMINE_CONF${RESET}"
+    echo -e "  ${DIM}bootloader: $BOOTLOADER — source: $LIMINE_CONF${RESET}"
     echo -e "  ${DIM}─────────────────────────────────────────────────────────────────────${RESET}"
 
     if [[ -f "$LIMINE_CONF" ]]; then
-        local loglevel mitigations_off zram_disabled zswap_conf lz4_initrd
+        local loglevel mitigations_off zram_disabled zswap_conf lz4_initrd ttm_ceiling
         loglevel=$(grep -o 'loglevel=[0-9]*' "$LIMINE_CONF" | head -1 || echo "not set")
         grep -q 'mitigations=off' "$LIMINE_CONF" && mitigations_off="off ${RED}(vulnerable)${RESET}" || mitigations_off="${GREEN}on (default)${RESET}"
         grep -q 'systemd\.zram=0' "$LIMINE_CONF" && zram_disabled="${RED}disabled${RESET}" || zram_disabled="${GREEN}enabled (default)${RESET}"
         grep -q 'zswap\.enabled=1' "$LIMINE_CONF" && zswap_conf="${GREEN}enabled${RESET}" || zswap_conf="${DIM}not set${RESET}"
-        grep -q 'lz4' "$MKINITCPIO" 2>/dev/null && lz4_initrd="${GREEN}yes${RESET}" || lz4_initrd="${DIM}no${RESET}"
+        local ttm_value
+        ttm_value="$(ttm_configured_pages_limit || true)"
+        if [[ -n "$ttm_value" ]]; then
+            ttm_ceiling="${GREEN}~$(ttm_pages_to_gb "$ttm_value")GB${RESET}  ${DIM}(ttm.pages_limit=${ttm_value})${RESET}"
+        else
+            ttm_ceiling="${DIM}not set (driver default, ~8.25GB w/ 512MB split)${RESET}"
+        fi
+        local initramfs_tool
+        initramfs_tool="$(detect_initramfs)"
+        case "$initramfs_tool" in
+            mkinitcpio)
+                local MKINITCPIO="/etc/mkinitcpio.conf"
+                grep -q 'lz4' "$MKINITCPIO" 2>/dev/null && lz4_initrd="${GREEN}yes${RESET}" || lz4_initrd="${DIM}no${RESET}"
+                ;;
+            dracut)
+                grep -rq 'lz4' /etc/dracut.conf.d/ 2>/dev/null && lz4_initrd="${GREEN}yes${RESET}" || lz4_initrd="${DIM}no${RESET}"
+                ;;
+            *)
+                lz4_initrd="${DIM}unknown${RESET}"
+                ;;
+        esac
 
         echo -e "  ${CYAN}loglevel${RESET}          ${loglevel}"
         echo -e "  ${CYAN}Mitigations${RESET}       ${mitigations_off}"
         echo -e "  ${CYAN}ZRAM (cmdline)${RESET}    ${zram_disabled}"
         echo -e "  ${CYAN}ZSWAP (cmdline)${RESET}   ${zswap_conf}"
         echo -e "  ${CYAN}lz4 in initramfs${RESET}  ${lz4_initrd}"
+        echo -e "  ${CYAN}VRAM Ceiling${RESET}      ${ttm_ceiling}"
     else
         echo -e "  ${RED}$LIMINE_CONF not found${RESET}"
     fi
@@ -1962,11 +2529,14 @@ run_status() {
 }
 
 run_revert_loglevel() {
-    local CONF="/etc/default/limine"
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
     print_step "R-4" "Revert loglevel — Restoring default"
 
-    if [[ ! -f "$CONF" ]]; then
-        print_error "File not found: $CONF"
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
         return 1
     fi
 
@@ -1986,17 +2556,19 @@ run_revert_loglevel() {
     fi
 
     sed -i 's/loglevel=[0-9]*/loglevel=3/g' "$CONF"
-    print_info "Regenerating /boot/limine.conf..."
-    limine-update
+    bootloader_update
     print_success "loglevel restored to 3. Reboot to apply."
 }
 
 run_revert_mitigations() {
-    local CONF="/etc/default/limine"
-    print_step "R-5" "Revert Mitigations — Re-enabling in $CONF"
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
+    print_step "R-5" "Revert Mitigations — Re-enabling"
 
-    if [[ ! -f "$CONF" ]]; then
-        print_error "File not found: $CONF"
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
         return 1
     fi
 
@@ -2012,9 +2584,36 @@ run_revert_mitigations() {
 
     print_info "Removing mitigations=off..."
     sed -i 's/ mitigations=off//g' "$CONF"
-    print_info "Regenerating /boot/limine.conf..."
-    limine-update
+    bootloader_update
     print_success "mitigations=off removed. Reboot to re-enable CPU security mitigations."
+}
+
+run_revert_ttm_pages_limit() {
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
+    print_step "R-8" "Revert Dynamic VRAM Ceiling — Removing ttm.pages_limit"
+
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
+        return 1
+    fi
+
+    if ! grep -q 'ttm\.pages_limit=' "$CONF"; then
+        print_info "ttm.pages_limit not found — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "This will remove ttm.pages_limit from $CONF. Proceed?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Removing ttm.pages_limit..."
+    sed -i 's/ ttm\.pages_limit=[0-9]*//g' "$CONF"
+    bootloader_update
+    print_success "ttm.pages_limit removed. Reboot to restore the driver default dynamic VRAM ceiling."
 }
 
 run_all() {
@@ -2063,9 +2662,8 @@ run_all() {
 
     # Re-enable and run the bootloader update once at the end
     SKIP_LIMINE_UPDATE=0
-    print_info "Regenerating /boot/limine.conf..."
-    if ! limine-update; then
-        print_error "Failed to update Limine. Please run manually."
+    if ! bootloader_update; then
+        print_error "Failed to update boot config. Please run manually."
         (( failed++ ))
     fi
 
@@ -2084,11 +2682,11 @@ run_all() {
 # Terminology mapping:
 #   WGP (Work Group Processor) → Compute Pair  (always 2 CUs)
 #   SE/SH rows                 → Row           (SE0.SH0 etc.)
-#   SPI dispatch               → Routing
-#   D+ / S+ / D!               → Default / Enabled / Blocked
-#   stock-dispatch             → Reset to Driver Default
-#   write-service-table        → Save Boot Profile
-#   apply-service              → Apply Saved Boot Profile
+#   SPI dispatch                → Routing
+#   D+ / S+ / D!                → Default / Enabled / Blocked
+#   stock-dispatch              → Reset to Driver Default
+#   write-service-table         → Save Boot Profile
+#   apply-service                → Apply Saved Boot Profile
 # ==============================================================================
 
 CU_BC250_PCI_ID="13fe"
@@ -2128,6 +2726,10 @@ cu_find_umr() {
     for p in /usr/bin/umr /usr/local/bin/umr /opt/umr/build/src/app/umr; do
         if [ -x "$p" ]; then CU_UMR="$p"; return 0; fi
     done
+    if p="$(command -v umr 2>/dev/null)" && [ -x "$p" ]; then
+        CU_UMR="$p"
+        return 0
+    fi
     return 1
 }
 
@@ -2749,12 +3351,15 @@ cu_install_service() {
     cat > "$CU_SERVICE_PATH" <<EOF
 [Unit]
 Description=BC-250 CU saved enumeration and dispatch
-After=systemd-udev-settle.service
+After=systemd-udev-settle.service cyan-skillfish-governor-smu.service
 Wants=systemd-udev-settle.service
 
 [Service]
 Type=oneshot
+Environment="BC250_CU_RETRY_ATTEMPTS=60"
+Environment="BC250_CU_RETRY_DELAY=1"
 EnvironmentFile=-$CU_SERVICE_CONF
+TimeoutStartSec=150s
 ExecStartPre=/usr/bin/bash -c 'for _ in {1..30}; do compgen -G "/dev/dri/renderD*" >/dev/null && exit 0; sleep 1; done; exit 1'
 ExecStart=$CU_SERVICE_BIN --yes apply-service
 RemainAfterExit=yes
@@ -2787,27 +3392,65 @@ cu_uninstall_service() {
 
 cu_install_umr() {
     if command -v pacman >/dev/null 2>&1 && pacman -Qi umr >/dev/null 2>&1; then
-        cu_info "umr is already installed."; return 0
+        cu_info "umr is already installed."
+        cu_find_umr && cu_info "Found at: $CU_UMR"
+        return 0
     fi
+
+    local installed=0
+
     if command -v pacman >/dev/null 2>&1 && pacman -Si umr >/dev/null 2>&1; then
-        cu_info "Installing umr with pacman..."; pacman -S --needed umr; return 0
-    fi
-    if aur_helper >/dev/null 2>&1; then
+        cu_info "Installing umr with pacman..."
+        if pacman -S --needed --noconfirm umr; then
+            installed=1
+        else
+            cu_die "pacman could not install umr — check the output above"
+            return 1
+        fi
+    elif aur_helper >/dev/null 2>&1; then
         cu_info "Installing umr via AUR helper..."
-        aur_install umr; return 0
-    fi
-    if command -v rpm-ostree >/dev/null 2>&1; then
+        if aur_install umr; then
+            installed=1
+        else
+            cu_die "AUR install of umr failed — check the build output above"
+            return 1
+        fi
+    elif command -v rpm-ostree >/dev/null 2>&1; then
         cu_warn "rpm-ostree layering is host-level and may affect immutable system upgrades."
         cu_info "Installing umr with rpm-ostree (reboot required)..."
-        rpm-ostree install umr && { cu_info "umr staged. Reboot then return here."; return 0; }
-        cu_die "rpm-ostree could not install umr"; return 1
-    fi
-    if command -v dnf >/dev/null 2>&1; then
+        if rpm-ostree install umr; then
+            cu_info "umr staged. Reboot then return here — it can't be verified until then."
+            return 0
+        else
+            cu_die "rpm-ostree could not install umr"
+            return 1
+        fi
+    elif command -v dnf >/dev/null 2>&1; then
         cu_info "Installing umr with dnf..."
-        dnf install -y umr && return 0
-        cu_die "dnf could not install umr"; return 1
+        if dnf install -y umr; then
+            installed=1
+        else
+            cu_die "dnf could not install umr"
+            return 1
+        fi
+    else
+        cu_die "could not install umr automatically — install shelly, paru, or yay first"
+        return 1
     fi
-    cu_die "could not install umr automatically — install shelly, paru, or yay first"
+
+    if [ "$installed" -eq 1 ]; then
+        CU_UMR=""   # clear any stale cached path so this re-searches fresh
+        if cu_find_umr; then
+            cu_info "umr installed successfully — found at: $CU_UMR"
+            return 0
+        else
+            cu_warn "The install command reported success, but umr could not be found"
+            cu_warn "afterward (checked /usr/bin/umr, /usr/local/bin/umr,"
+            cu_warn "/opt/umr/build/src/app/umr, and PATH). It may have installed to a"
+            cu_warn "non-standard location — check the install output above."
+            return 1
+        fi
+    fi
 }
 
 dz_warn() {
@@ -2851,8 +3494,8 @@ show_danger_zone_menu() {
     print_item  "5"  "Reset to Driver Default"   ""
     echo ""
     print_section "Boot Persistence"
-    print_item  "6"  "Save Boot Profile"         ""
-    print_item  "7"  "Install Boot Service"      ""
+    print_item  "6"  "Install Boot Service"      ""
+    print_item  "7"  "Save Boot Profile"         ""
     print_item  "8"  "Uninstall Boot Service"    ""
     echo ""
     print_item  "0"  "Back"                      ""
@@ -2872,12 +3515,310 @@ run_danger_zone_menu() {
             3) cu_table_editor ;;
             4) cu_enable_all;           press_enter ;;
             5) cu_stock_dispatch;       press_enter ;;
-            6) cu_write_service_table;  press_enter ;;
-            7) cu_install_service;      press_enter ;;
+            6) cu_install_service;      press_enter ;;
+            7) cu_write_service_table;  press_enter ;;
             8) cu_uninstall_service;    press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$dz_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ==============================================================================
+# BC-250 MEMORY CONFIG (bc250_memcfg — https://github.com/fanoush/bc250_memcfg)
+# ==============================================================================
+
+MEMCFG_REPO_URL="https://github.com/fanoush/bc250_memcfg.git"
+MEMCFG_BUILD_DIR="/tmp/bc250_memcfg_build"
+MEMCFG_BIN="/usr/local/bin/bc250memcfg"
+MEMCFG_VERSION_FILE="/usr/local/share/bc250-memcfg.commit"
+
+memcfg_installed() {
+    [[ -x "$MEMCFG_BIN" ]]
+}
+
+# Prints the remote HEAD commit hash, or empty string if it couldn't be reached
+memcfg_remote_commit() {
+    git ls-remote "$MEMCFG_REPO_URL" HEAD 2>/dev/null | awk '{print $1}'
+}
+
+memcfg_installed_commit() {
+    [[ -f "$MEMCFG_VERSION_FILE" ]] && cat "$MEMCFG_VERSION_FILE"
+}
+
+run_install_memcfg() {
+    print_step "AT-6" "Installing bc250_memcfg"
+
+    print_info "Checking for the latest version..."
+    local remote_commit
+    remote_commit="$(memcfg_remote_commit)"
+
+    if memcfg_installed; then
+        local installed_commit
+        installed_commit="$(memcfg_installed_commit)"
+        if [[ -z "$remote_commit" ]]; then
+            print_info "Could not reach GitHub to check for updates — keeping existing install at $MEMCFG_BIN."
+            return 0
+        elif [[ -n "$installed_commit" && "$installed_commit" == "$remote_commit" ]]; then
+            print_info "bc250_memcfg is already up to date ($MEMCFG_BIN)."
+            return 0
+        else
+            print_info "bc250_memcfg is installed at $MEMCFG_BIN, but a newer version is available upstream."
+            if ! confirm "Rebuild and reinstall the latest version?"; then
+                print_info "Keeping current install."
+                return 0
+            fi
+        fi
+    fi
+
+    print_info "Installing build dependencies: base-devel"
+    pacman -S --needed --noconfirm base-devel || { print_error "Failed to install build dependencies."; return 1; }
+
+    print_info "Cloning bc250_memcfg repository..."
+    rm -rf "$MEMCFG_BUILD_DIR"
+    if ! git clone "$MEMCFG_REPO_URL" "$MEMCFG_BUILD_DIR"; then
+        print_error "Failed to clone repository."
+        return 1
+    fi
+
+    print_info "Building bc250memcfg..."
+    if ! make -C "$MEMCFG_BUILD_DIR"; then
+        print_error "Build failed."
+        return 1
+    fi
+
+    # The Makefile's output binary name — fall back to searching the build dir
+    local built_bin="$MEMCFG_BUILD_DIR/bc250memcfg"
+    if [[ ! -x "$built_bin" ]]; then
+        built_bin="$(find "$MEMCFG_BUILD_DIR" -maxdepth 1 -type f -executable | head -1)"
+    fi
+    if [[ -z "$built_bin" || ! -x "$built_bin" ]]; then
+        print_error "Build did not produce an executable."
+        return 1
+    fi
+
+    print_info "Installing binary to $MEMCFG_BIN..."
+    install -m 0755 "$built_bin" "$MEMCFG_BIN"
+
+    # Record the commit we just built so future runs can detect updates
+    local built_commit
+    built_commit="$(git -C "$MEMCFG_BUILD_DIR" rev-parse HEAD 2>/dev/null || printf '%s' "$remote_commit")"
+    if [[ -n "$built_commit" ]]; then
+        mkdir -p "$(dirname "$MEMCFG_VERSION_FILE")"
+        echo "$built_commit" > "$MEMCFG_VERSION_FILE"
+    fi
+
+    rm -rf "$MEMCFG_BUILD_DIR"
+
+    print_success "bc250_memcfg installed successfully!"
+}
+
+memcfg_warn() {
+    echo ""
+    echo -e "  ${BOLD}${RED}⚠  WARNING: Direct BIOS CMOS Memory Configuration${RESET}"
+    echo ""
+    echo -e "  ${WHITE}This tool writes directly to the battery-backed CMOS RAM the BIOS"
+    echo -e "  uses for memory configuration (VRAM size, memory timings). Incorrect"
+    echo -e "  values can cause instability or a failure to boot."
+    echo ""
+    echo -e "  Changes only take effect after a reboot. To revert to defaults you"
+    echo -e "  must clear CMOS via the board jumper, or by removing the battery —"
+    echo -e "  this tool cannot undo its own changes.${RESET}"
+    echo ""
+    echo -e "  ${DIM}Type ${RESET}${BOLD}${YELLOW}yes${RESET}${DIM} to continue, or press Enter to cancel.${RESET}"
+    echo ""
+    read -rp "  → " mc_ack
+    [[ "${mc_ack,,}" == "yes" ]]
+}
+
+run_memcfg_show() {
+    print_step "AT-6" "Current Memory Configuration"
+    if ! memcfg_installed; then
+        print_error "bc250_memcfg is not installed. Run 'Install bc250_memcfg' first."
+        return 1
+    fi
+    "$MEMCFG_BIN"
+}
+
+# Best-effort parse of the current UMA_SIZE (VRAM size in MB) from the tool's
+# no-args output. The exact print format isn't documented upstream, so this
+# grabs the first number on whatever line mentions UMA_SIZE.
+memcfg_current_uma_size() {
+    memcfg_installed || return 1
+    "$MEMCFG_BIN" 2>/dev/null | grep -i 'UMA_SIZE' | head -1 | grep -oE '[0-9]+' | head -1
+}
+
+run_memcfg_set_uma_size() {
+    print_step "AT-6" "Set VRAM Size (UMA_SIZE)"
+    if ! memcfg_installed; then
+        print_error "bc250_memcfg is not installed. Run 'Install bc250_memcfg' first."
+        return 1
+    fi
+
+    memcfg_warn || { print_info "Cancelled."; return 0; }
+
+    echo ""
+    read -rp "$(echo -e "  ${BOLD}${WHITE}VRAM size in MB, >=256, aligned to 16MB steps (default: 512):${RESET} ")" uma_input
+    local uma_size
+    if [[ -z "$uma_input" ]]; then
+        uma_size="512"
+    elif [[ "$uma_input" =~ ^[0-9]+$ ]] && (( uma_input >= 256 )); then
+        uma_size="$uma_input"
+    else
+        print_error "Invalid size '$uma_input' — must be an integer >= 256."
+        return 1
+    fi
+
+    if ! confirm "Set UMA_SIZE to ${uma_size}MB? A reboot is required to apply."; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    "$MEMCFG_BIN" UMA_SIZE "$uma_size"
+    print_success "UMA_SIZE written. Reboot to apply."
+}
+
+# Reads the currently configured ttm.pages_limit value from the bootloader
+# cmdline config, if set. Prints nothing if not set or config unreadable.
+ttm_configured_pages_limit() {
+    local conf
+    conf="$(bootloader_conf)"
+    [[ -n "$conf" && -f "$conf" ]] || return 1
+    grep -o 'ttm\.pages_limit=[0-9]*' "$conf" | head -1 | cut -d= -f2
+}
+
+# Converts a ttm.pages_limit value (4KiB pages) to an approximate GB figure
+ttm_pages_to_gb() {
+    awk -v pages="$1" 'BEGIN{printf "%.1f", pages * 4 / 1024 / 1024}'
+}
+
+run_set_ttm_pages_limit() {
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
+    print_step "AT-7" "Raising Dynamic VRAM Ceiling — ttm.pages_limit"
+
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
+        return 1
+    fi
+    print_info "Detected bootloader: $BOOTLOADER ($CONF)"
+
+    echo ""
+    echo -e "  ${WHITE}With the 512MB VRAM split, the default dynamic VRAM ceiling is"
+    echo -e "  around 8.25GB, which some games can exceed and crash against."
+    echo -e "  This sets the ttm.pages_limit kernel parameter to raise that"
+    echo -e "  ceiling — similar headroom to a larger fixed split, while still"
+    echo -e "  returning unused VRAM to system RAM once a game closes.${RESET}"
+    echo ""
+
+    local existing
+    existing="$(ttm_configured_pages_limit || true)"
+    if [[ -n "$existing" ]]; then
+        print_info "Currently configured: ttm.pages_limit=${existing} (~$(ttm_pages_to_gb "$existing")GB)"
+    fi
+
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Desired max dynamic VRAM in GB (default: 12):${RESET} ")" vram_gb_input
+    local vram_gb
+    if [[ -z "$vram_gb_input" ]]; then
+        vram_gb="12"
+    elif [[ "$vram_gb_input" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v g="$vram_gb_input" 'BEGIN{exit !(g>0)}'; then
+        vram_gb="$vram_gb_input"
+    else
+        print_error "Invalid value '$vram_gb_input' — must be a positive number."
+        return 1
+    fi
+
+    local pages_limit
+    pages_limit=$(awk -v gb="$vram_gb" 'BEGIN{printf "%.0f", gb * 1024 * 1024 / 4}')
+
+    if ! confirm "Set ttm.pages_limit=${pages_limit} (~${vram_gb}GB dynamic VRAM ceiling)? Reboot required to apply."; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    if [[ ! -f "${CONF}.bak" ]]; then
+        print_info "Creating original backup at ${CONF}.bak ..."
+        cp "$CONF" "${CONF}.bak"
+    else
+        print_info "Backup already exists at ${CONF}.bak — preserving original."
+    fi
+
+    local cmdline_var
+    cmdline_var="$(bootloader_cmdline_var)"
+    local cmdline_var_esc
+    cmdline_var_esc="$(bootloader_cmdline_var_escaped)"
+
+    if grep -q 'ttm\.pages_limit=' "$CONF"; then
+        print_info "ttm.pages_limit= found. Updating value to ${pages_limit}..."
+        sed -i "s/ttm\.pages_limit=[0-9]*/ttm.pages_limit=${pages_limit}/g" "$CONF"
+    else
+        print_info "ttm.pages_limit= not found. Adding to $cmdline_var..."
+        sed -i "/^${cmdline_var_esc}/ s/\"$/ ttm.pages_limit=${pages_limit}\"/" "$CONF"
+    fi
+
+    if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
+        bootloader_update
+    fi
+    print_success "ttm.pages_limit set to ${pages_limit} (~${vram_gb}GB). Reboot to apply."
+    echo -e "  ${DIM}After reboot, verify with: cat /sys/module/ttm/parameters/pages_limit${RESET}\n"
+}
+
+show_memcfg_menu() {
+    print_banner
+    print_section "BC-250 Memory Config"
+    echo -e "  ${DIM}Configure BIOS CMOS memory settings via bc250_memcfg (https://github.com/fanoush/bc250_memcfg).${RESET}\n"
+    local status_label
+    if memcfg_installed; then
+        status_label="${GREEN}installed${RESET}  ${DIM}($MEMCFG_BIN)${RESET}"
+    else
+        status_label="${DIM}not installed${RESET}"
+    fi
+    echo -e "  ${CYAN}Status${RESET}      ${status_label}"
+    if memcfg_installed; then
+        local current_vram
+        current_vram="$(memcfg_current_uma_size)"
+        if [[ -n "$current_vram" ]]; then
+            echo -e "  ${CYAN}VRAM Size${RESET}   ${BOLD}${WHITE}${current_vram}MB${RESET}  ${DIM}(UMA_SIZE, current CMOS setting)${RESET}"
+        else
+            echo -e "  ${CYAN}VRAM Size${RESET}   ${DIM}unknown — see 'Show Current Config' for raw output${RESET}"
+        fi
+    fi
+    local ttm_current
+    ttm_current="$(ttm_configured_pages_limit || true)"
+    if [[ -n "$ttm_current" ]]; then
+        echo -e "  ${CYAN}VRAM Ceiling${RESET} ${BOLD}${WHITE}~$(ttm_pages_to_gb "$ttm_current")GB${RESET}  ${DIM}(ttm.pages_limit=${ttm_current}, cmdline)${RESET}"
+    else
+        echo -e "  ${CYAN}VRAM Ceiling${RESET} ${DIM}not set (driver default, ~8.25GB with 512MB split)${RESET}"
+    fi
+    echo -e "  ${DIM}(Re-running Install checks GitHub and offers to rebuild if a newer version exists.)${RESET}\n"
+    print_item "1" "Install bc250_memcfg"     "Build and install from source"
+    print_item "2" "Show Current Config"      "Print all tunable memory parameters"
+    print_item "3" "Set VRAM Size"            "Set UMA_SIZE (requires reboot)"
+    print_item "4" "Set Dynamic VRAM Ceiling" "ttm.pages_limit kernel param (requires reboot)"
+    echo ""
+    print_item "0" "Back" ""
+    echo ""
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_memcfg_menu() {
+    while true; do
+        show_memcfg_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" mc_choice
+
+        case "${mc_choice^^}" in
+            1) run_install_memcfg;        press_enter ;;
+            2) run_memcfg_show;           press_enter ;;
+            3) run_memcfg_set_uma_size;   press_enter ;;
+            4) run_set_ttm_pages_limit;   press_enter ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$mc_choice'"
                 sleep 1
                 ;;
         esac
@@ -2931,7 +3872,13 @@ run_revert_dolphinbar() {
 run_revert_cpu_governor() {
     print_step "R-1" "Revert CPU Governor — Removing bc250-smu-oc"
 
+    local user_home
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    local user_bin="$user_home/.local/bin"
+
     if ! systemctl is-enabled bc250-smu-oc.service &>/dev/null && \
+       [[ ! -x "$user_bin/bc250-detect" ]] && \
+       ! sudo -u "$REAL_USER" pipx list 2>/dev/null | grep -q 'bc250-smu-oc' && \
        ! pipx list 2>/dev/null | grep -q 'bc250-smu-oc'; then
         print_info "CPU governor does not appear to be installed — nothing to revert."
         return 0
@@ -2946,7 +3893,9 @@ run_revert_cpu_governor() {
     systemctl stop bc250-smu-oc.service 2>/dev/null || true
     systemctl disable bc250-smu-oc.service 2>/dev/null || true
 
-    print_info "Uninstalling via pipx..."
+    print_info "Uninstalling via pipx as $REAL_USER..."
+    sudo -u "$REAL_USER" pipx uninstall bc250-smu-oc 2>/dev/null || true
+    # Also try root's pipx, in case an older toolkit version installed it there
     pipx uninstall bc250-smu-oc 2>/dev/null || true
 
     if [[ -f "$CPU_DEST" ]]; then
@@ -2990,8 +3939,10 @@ show_revert_menu() {
     print_item  "3"  "Revert ZSWAP"            "Re-enable ZRAM, remove swapfile"
     print_item  "4"  "Revert loglevel"         "Restore loglevel to default (3)"
     print_item  "5"  "Revert Mitigations"      "Re-enable CPU security mitigations"
-    print_item  "6"  "Revert ACPI Fix"         "Remove ACPI fix and pacman hook"
-    print_item  "7"  "Revert DolphinBar"       "Remove DolphinBar udev rules"
+    print_item  "6"  "Revert DolphinBar"       "Remove DolphinBar udev rules"
+    print_item  "7"  "Revert VRAM Ceiling"     "Remove ttm.pages_limit kernel param"
+    print_item  "8"  "Revert ACPI Fix"         "Remove SSDT overrides & acpi_override hook"
+    print_item  "9"  "Revert CPU Cores Unlock" "Remove UEFI boot entry & .efi file"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -3004,13 +3955,15 @@ run_revert_menu() {
         read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" rev_choice
 
         case "${rev_choice^^}" in
-            1) run_revert_cpu_governor;       press_enter ;;
-            2) run_revert_gpu_governor;       press_enter ;;
-            3) run_revert_zswap;              press_enter ;;
-            4) run_revert_loglevel;           press_enter ;;
-            5) run_revert_mitigations;        press_enter ;;
-            6) run_revert_acpi_fix;           press_enter ;;
-            7) run_revert_dolphinbar;         press_enter ;;
+            1) run_revert_cpu_governor;         press_enter ;;
+            2) run_revert_gpu_governor;         press_enter ;;
+            3) run_revert_zswap;                press_enter ;;
+            4) run_revert_loglevel;             press_enter ;;
+            5) run_revert_mitigations;          press_enter ;;
+            6) run_revert_dolphinbar;           press_enter ;;
+            7) run_revert_ttm_pages_limit;      press_enter ;;
+            8) run_revert_acpi_fix;             press_enter ;;
+            9) run_revert_cpu_cores_unlock_efi; press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
@@ -3076,14 +4029,17 @@ show_initial_setup_menu() {
     print_item  "3"  "GPU Governor"            "cyan-skillfish GPU governor service"
     print_item  "4"  "Enable Swap"             "Btrfs swapfile, configurable"
     print_item  "5"  "ZRAM -> ZSWAP"           "Disable ZRAM, enable ZSWAP w/ lz4"
-    print_item  "6"  "Hide RDSEED Warning"     "Set loglevel=0 in /boot/limine.conf"
-    print_item  "7"  "Disable Mitigations"     "Add mitigations=off to limine.conf"
+    print_item  "6"  "Hide RDSEED Warning"     "Set loglevel=0 in bootloader config"
+    print_item  "7"  "Disable Mitigations"     "Add mitigations=off to bootloader config"
     echo ""
     print_item  "A"  "Run All (1-7)"           "Run all setup tasks in sequence"
     echo ""
     print_section "⚠  Manual Steps — not included in Run All"
-    print_item  "8"  "Compute Units Unlock"    ""
-    print_item  "9"  "Remove Deckify Kernel"   "Verify new kernel boots first"
+    print_item  "8"  "CPU Cores Unlock"        "6 → 8 CPU cores via EFI boot entry"
+    print_item  "9"  "GPU Compute Units Unlock" ""
+    print_item  "10" "ACPI Fix"                "SSDT override + CPU governor control"
+    print_item  "11" "BC-250 Memory Config"    "Configure VRAM size via bc250_memcfg"
+    print_item  "12" "Remove Deckify Kernel"   "Verify new kernel boots first"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -3104,8 +4060,11 @@ run_initial_setup_menu() {
             6) run_set_loglevel;              press_enter ;;
             7) run_disable_mitigations;       press_enter ;;
             A) run_all;                       press_enter ;;
-            8) run_danger_zone_menu ;;
-            9) run_remove_deckify_kernel;     press_enter ;;
+            8) run_cpu_cores_unlock_efi;       press_enter ;;
+            9) run_danger_zone_menu ;;
+            10) run_acpi_menu ;;
+            11) run_memcfg_menu ;;
+            12) run_remove_deckify_kernel;    press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$is_choice'"
@@ -3179,6 +4138,15 @@ run_experimental_menu() {
     done
 }
 
+run_reboot() {
+    if confirm "Reboot the system now?"; then
+        echo -e "\n  ${DIM}Rebooting...${RESET}\n"
+        systemctl reboot
+    else
+        print_info "Cancelled."
+    fi
+}
+
 show_menu() {
     print_banner
     print_section "Performance"
@@ -3192,6 +4160,7 @@ show_menu() {
     print_section "System"
     print_item  "S"  "Status"                "Current system summary"
     print_item  "U"  "Update Toolkit"        "Download latest version from GitHub"
+    print_item  "R"  "Reboot"                "Restart the system"
     print_item  "0"  "Exit"                  ""
     echo ""
     echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
@@ -3208,6 +4177,7 @@ while true; do
         4) run_revert_menu ;;
         S) run_status;        press_enter ;;
         U) run_update_toolkit ;;
+        R) run_reboot ;;
         0)
             echo -e "\n  ${DIM}Goodbye.${RESET}\n"
             exit 0
