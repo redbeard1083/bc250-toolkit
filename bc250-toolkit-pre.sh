@@ -147,6 +147,14 @@ if [[ "${1:-}" == "apply-service" ]] || [[ "${2:-}" == "apply-service" ]]; then
     exit 0
 fi
 
+# From here on we're in the interactive menu. Functions throughout this
+# script deliberately use 'return 1' to signal a recoverable error (print a
+# message, let the menu loop continue) — that's incompatible with 'set -e',
+# which would otherwise kill the entire script the moment any case-statement
+# action returns non-zero, before the user ever sees a chance to continue.
+# 'set -u' and pipefail stay on; only errexit is dropped here.
+set +e
+
 # Re-launch with sudo if not already root
 if [[ $EUID -ne 0 ]]; then
     exec sudo "$0" "$@"
@@ -198,7 +206,7 @@ aur_install() {
     fi
     print_info "Installing $package via $helper..."
     case "$helper" in
-        shelly) sudo -u "$REAL_USER" shelly aur install "$package" ;;
+        shelly) sudo -u "$REAL_USER" shelly install aur "$package" ;;
         paru)   sudo -u "$REAL_USER" paru -S --noconfirm "$package" ;;
         yay)    sudo -u "$REAL_USER" yay -S --noconfirm "$package" ;;
     esac
@@ -213,9 +221,9 @@ aur_remove() {
     fi
     print_info "Removing $package via $helper..."
     case "$helper" in
-        shelly) shelly remove "$package" ;;
-        paru)   paru -Rns --noconfirm "$package" 2>/dev/null || true ;;
-        yay)    yay -Rns --noconfirm "$package" 2>/dev/null || true ;;
+        shelly) sudo -u "$REAL_USER" shelly remove aur "$package" --no-confirm ;;
+        paru)   sudo -u "$REAL_USER" paru -Rns --noconfirm "$package" 2>/dev/null || true ;;
+        yay)    sudo -u "$REAL_USER" yay -Rns --noconfirm "$package" 2>/dev/null || true ;;
     esac
 }
 
@@ -472,9 +480,20 @@ run_gpu_governor() {
     fi
 
     print_info "Installing cyan-skillfish-governor-smu via AUR helper..."
-    aur_install cyan-skillfish-governor-smu
+    if ! aur_install cyan-skillfish-governor-smu; then
+        print_error "Failed to install cyan-skillfish-governor-smu — check the output above."
+        return 1
+    fi
+    if ! pacman -Qq cyan-skillfish-governor-smu &>/dev/null; then
+        print_error "The install command reported success, but cyan-skillfish-governor-smu is not actually installed — check the output above."
+        return 1
+    fi
+
     print_info "Enabling and starting systemd service..."
-    systemctl enable --now cyan-skillfish-governor-smu.service
+    if ! systemctl enable --now cyan-skillfish-governor-smu.service; then
+        print_error "Failed to enable/start the service — check: journalctl -u cyan-skillfish-governor-smu.service"
+        return 1
+    fi
     print_success "GPU Governor installed and started successfully!"
 }
 
@@ -805,251 +824,194 @@ run_remove_deckify_kernel() {
 }
 
 # ==============================================================================
-# CPU CORES UNLOCK (rw-r-r-0644/bc250-core-unlock)
+# CPU CORES UNLOCK — EFI Boot Entry method (Hexxeh/bc250-efi-core-unlock)
 # ==============================================================================
 
-CPU_UNLOCK_RAW_URL="https://raw.githubusercontent.com/rw-r-r-0644/bc250-core-unlock/main/bc250-unlock-cores.py"
-CPU_UNLOCK_SCRIPT_NAME="bc250-unlock-cores.py"
-CPU_UNLOCK_SERVICE_NAME="bc250-unlock-cores"
-CPU_UNLOCK_GOVERNOR_SERVICE="cyan-skillfish-governor-smu.service"
-CPU_UNLOCK_WRAPPER="/usr/local/bin/bc250-unlock-wrapper.sh"
-CPU_UNLOCK_STATE_DIR="/var/lib/bc250-unlock"
-CPU_UNLOCK_DROPIN_DIR="/etc/systemd/system/${CPU_UNLOCK_GOVERNOR_SERVICE}.d"
-CPU_UNLOCK_DROPIN_FILE="$CPU_UNLOCK_DROPIN_DIR/wait-for-core-unlock.conf"
+CPU_UNLOCK_EFI_REPO_URL="https://github.com/Hexxeh/bc250-efi-core-unlock"
+CPU_UNLOCK_EFI_YOPPEH_URL="https://github.com/yoppeh/efi"
+CPU_UNLOCK_EFI_LABEL="CoreUnlock"
+CPU_UNLOCK_EFI_BIN_NAME="COREUNLOCK.EFI"
 
-cpu_cores_unlock_installed() {
-    systemctl list-unit-files "${CPU_UNLOCK_SERVICE_NAME}.service" &>/dev/null
+cpu_unlock_efi_installed() {
+    efibootmgr 2>/dev/null | grep -q "$CPU_UNLOCK_EFI_LABEL"
 }
 
-cpu_cores_unlock_warn() {
+# Finds the EFI System Partition's mount point by checking common locations
+cpu_unlock_efi_find_esp() {
+    local mnt
+    for mnt in /boot/efi /efi /boot; do
+        if mountpoint -q "$mnt" 2>/dev/null && [[ -d "$mnt/EFI" ]]; then
+            printf '%s' "$mnt"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Prints "<disk> <partition-number>" for the ESP, e.g. "/dev/nvme0n1 1"
+cpu_unlock_efi_find_disk_part() {
+    local esp_mount="$1" esp_dev pkname partnum
+    esp_dev="$(findmnt -n -o SOURCE "$esp_mount" 2>/dev/null)"
+    [[ -n "$esp_dev" ]] || return 1
+    pkname="$(lsblk -rno PKNAME "$esp_dev" 2>/dev/null)"
+    partnum="$(lsblk -rno PARTN "$esp_dev" 2>/dev/null)"
+    [[ -n "$pkname" && -n "$partnum" ]] || return 1
+    printf '/dev/%s %s' "$pkname" "$partnum"
+}
+
+cpu_unlock_efi_warn() {
     echo ""
-    echo -e "  ${BOLD}${RED}⚠  WARNING: CPU CORES UNLOCK${RESET}"
+    echo -e "  ${BOLD}${RED}⚠  WARNING: CPU CORES UNLOCK — EFI BOOT ENTRY METHOD${RESET}"
     echo ""
-    echo -e "  ${WHITE}This installs a boot-time service that unlocks CPU cores the OEM"
-    echo -e "  disabled (6 stock → 8 unlocked), using an undocumented SMU mailbox"
-    echo -e "  write. This is not officially supported and could affect system"
-    echo -e "  stability. The unlock does not survive a full power-off, so this"
-    echo -e "  service re-applies it on every single boot, permanently."
+    echo -e "  ${WHITE}This is an alternative to the SMU mailbox service: instead of a boot-time"
+    echo -e "  systemd service, it builds a standalone EFI executable and registers it as"
+    echo -e "  a NEW UEFI FIRMWARE BOOT ENTRY (via efibootmgr), typically placed FIRST in"
+    echo -e "  your boot order. It runs before your OS bootloader, unlocks the cores, then"
+    echo -e "  chain-loads into your normal boot process."
     echo ""
-    echo -e "  On a cold boot where cores are still locked, the service will"
-    echo -e "  AUTOMATICALLY REBOOT YOUR SYSTEM ONCE, without asking, so the"
-    echo -e "  kernel can see the extra cores. This is expected, self-resolving"
-    echo -e "  behavior — but it does mean the system may reboot on its own"
-    echo -e "  shortly after this step completes or after your next cold start.${RESET}"
+    echo -e "  This modifies UEFI NVRAM boot entries directly, not just OS-level files."
+    echo -e "  Only proceed if you understand that.${RESET}"
     echo ""
     echo -e "  ${DIM}Type ${RESET}${BOLD}${YELLOW}unlock${RESET}${DIM} to accept and proceed, or press Enter to cancel.${RESET}"
     echo ""
-    read -rp "  → " cpu_unlock_ack
-    [[ "$cpu_unlock_ack" == "unlock" ]]
+    read -rp "  → " cpu_unlock_efi_ack
+    [[ "$cpu_unlock_efi_ack" == "unlock" ]]
 }
 
-run_cpu_cores_unlock() {
-    print_step "08" "Installing CPU Cores Unlock"
+run_cpu_cores_unlock_efi() {
+    print_step "08b" "Installing CPU Cores Unlock — EFI Boot Entry Method"
 
-    if cpu_cores_unlock_installed; then
-        print_info "CPU Cores Unlock service already installed — skipping."
+    if cpu_unlock_efi_installed; then
+        print_info "A '$CPU_UNLOCK_EFI_LABEL' EFI boot entry already exists — skipping."
         return 0
     fi
 
-    cpu_cores_unlock_warn || { print_info "Cancelled."; return 0; }
+    cpu_unlock_efi_warn || { print_info "Cancelled."; return 0; }
+
+    if ! command -v clang &>/dev/null; then
+        print_error "clang is not installed. Install it (e.g. 'pacman -S clang') and try again."
+        return 1
+    fi
+
+    print_info "Locating the EFI System Partition..."
+    local esp_mount
+    if ! esp_mount="$(cpu_unlock_efi_find_esp)"; then
+        print_error "Could not automatically locate the EFI System Partition (checked /boot/efi, /efi, /boot)."
+        return 1
+    fi
+    print_info "Found ESP at $esp_mount"
+
+    local disk_part disk part
+    if ! disk_part="$(cpu_unlock_efi_find_disk_part "$esp_mount")"; then
+        print_error "Could not determine the underlying disk/partition for the ESP at $esp_mount."
+        print_error "Run manually: efibootmgr --create --disk <disk> --part <N> --label \"$CPU_UNLOCK_EFI_LABEL\" --loader \"\\EFI\\BOOT\\$CPU_UNLOCK_EFI_BIN_NAME\""
+        return 1
+    fi
+    read -r disk part <<<"$disk_part"
+    print_info "ESP is on $disk, partition $part"
+
+    print_info "Installing gnu-efi..."
+    if command -v pacman >/dev/null 2>&1 && pacman -Si gnu-efi >/dev/null 2>&1; then
+        pacman -S --needed --noconfirm gnu-efi || { print_error "Failed to install gnu-efi via pacman."; return 1; }
+    else
+        aur_install gnu-efi || { print_error "Failed to install gnu-efi."; return 1; }
+    fi
 
     local user_home
     user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
-    if [[ -z "$user_home" || ! -d "$user_home" ]]; then
-        print_error "Could not resolve home directory for user '$REAL_USER'."
+    local build_dir="$user_home/.cache/bc250-toolkit/bc250-efi-core-unlock"
+
+    print_info "Cloning bc250-efi-core-unlock as $REAL_USER..."
+    sudo -u "$REAL_USER" mkdir -p "$(dirname "$build_dir")"
+    if [[ -d "$build_dir" ]]; then
+        print_info "Directory already exists — pulling latest changes..."
+        sudo -u "$REAL_USER" git -C "$build_dir" pull || { print_error "Failed to pull repository."; return 1; }
+    else
+        sudo -u "$REAL_USER" git clone "$CPU_UNLOCK_EFI_REPO_URL" "$build_dir" || { print_error "Failed to clone repository."; return 1; }
+    fi
+
+    print_info "Cloning yoppeh/efi dependency..."
+    if [[ -d "$build_dir/efi" ]]; then
+        sudo -u "$REAL_USER" git -C "$build_dir/efi" pull || { print_error "Failed to pull efi dependency."; return 1; }
+    else
+        sudo -u "$REAL_USER" git clone "$CPU_UNLOCK_EFI_YOPPEH_URL" "$build_dir/efi" || { print_error "Failed to clone efi dependency."; return 1; }
+    fi
+
+    print_info "Patching Makefile..."
+    sudo -u "$REAL_USER" sed -i 's/yoppeh-efi/efi/g' "$build_dir/Makefile"
+
+    print_info "Building with clang..."
+    if ! sudo -u "$REAL_USER" bash -c "cd '$build_dir' && make clang"; then
+        print_error "Build failed."
         return 1
     fi
-    local dest="$user_home/$CPU_UNLOCK_SCRIPT_NAME"
-
-    print_info "Downloading $CPU_UNLOCK_SCRIPT_NAME..."
-    if ! curl -fsSL "$CPU_UNLOCK_RAW_URL" -o "$dest"; then
-        print_error "Failed to download unlock script."
+    if [[ ! -f "$build_dir/bc250-unlock.efi" ]]; then
+        print_error "Build did not produce bc250-unlock.efi."
         return 1
     fi
-    chown "$REAL_USER":"$(id -gn "$REAL_USER")" "$dest"
-    chmod 755 "$dest"
 
-    print_info "Creating self-healing wrapper (auto-reboots once if a lock→unlock change occurred)..."
-    mkdir -p "$CPU_UNLOCK_STATE_DIR"
-    cat > "$CPU_UNLOCK_WRAPPER" <<'WRAPEOF'
-#!/usr/bin/env bash
-# Runs the unlock script. If it actually flipped the core mask (cold-boot
-# locked state -> unlocked), the kernel already enumerated CPUs earlier in
-# THIS boot and can't pick up the change without a reboot. So: trigger one
-# automatic reboot when needed, and do nothing otherwise (e.g. on a normal
-# warm reboot where the kernel already sees all threads).
-#
-# The reboot decision is based on the kernel-visible thread count rather
-# than parsing the unlock script's log text, since that text isn't a fixed
-# format (e.g. it prints a different line when the mailbox is already
-# unlocked vs. when it just changed it) and text-matching missed cases.
-#
-# A persistent counter guards against a reboot loop if the thread count
-# somehow never comes up (hardware/firmware issue) - it will try at most
-# once before giving up and logging an error instead of rebooting forever.
-# The counter is reset whenever the mailbox reports locked at the start of
-# a run, since that only happens right after a genuine full power cycle and
-# is always a fresh episode - this stops a stale counter from an unrelated
-# earlier boot from blocking a legitimate new reboot request.
+    print_info "Installing to $esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME..."
+    mkdir -p "$esp_mount/EFI/BOOT"
+    cp "$build_dir/bc250-unlock.efi" "$esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME"
 
-set -uo pipefail
-
-STATE_DIR="/var/lib/bc250-unlock"
-COUNT_FILE="$STATE_DIR/reboot-attempts"
-mkdir -p "$STATE_DIR"
-
-TARGET_THREADS=16
-FULL_MASK="0x000000FF"
-
-OUTPUT="$(python3 "__SCRIPT_PATH__" 2>&1)"
-STATUS=$?
-echo "$OUTPUT"
-
-if [[ $STATUS -ne 0 ]]; then
-    echo "bc250-unlock-wrapper: unlock script exited with status $STATUS, not rebooting."
-    exit 0   # don't fail the unit - governor should still start (Wants=, not Requires=)
-fi
-
-BEFORE=$(echo "$OUTPUT" | grep -oP 'core presence mask:\s*\K0x[0-9A-Fa-f]+' || true)
-
-if [[ -z "$BEFORE" ]]; then
-    echo "bc250-unlock-wrapper: could not parse mask value from output, not rebooting."
-    exit 0
-fi
-
-if [[ "$BEFORE" != "$FULL_MASK" ]]; then
-    # Mailbox reported locked at the start of this run - only happens right
-    # after a genuine full power cycle. Always a fresh episode.
-    echo 0 > "$COUNT_FILE"
-fi
-
-CURRENT_THREADS=$(nproc --all 2>/dev/null || echo 0)
-
-if [[ "$CURRENT_THREADS" -ge "$TARGET_THREADS" ]]; then
-    echo "bc250-unlock-wrapper: kernel already sees $CURRENT_THREADS threads - no reboot needed."
-    echo 0 > "$COUNT_FILE"
-    exit 0
-fi
-
-ATTEMPTS=0
-[[ -f "$COUNT_FILE" ]] && ATTEMPTS=$(cat "$COUNT_FILE" 2>/dev/null || echo 0)
-
-if [[ "$ATTEMPTS" -ge 1 ]]; then
-    echo "bc250-unlock-wrapper: cores unlocked in hardware but kernel still reports"
-    echo "$CURRENT_THREADS/$TARGET_THREADS threads, and a reboot already ran without"
-    echo "fixing it. Not rebooting again - manual check needed."
-    exit 0
-fi
-
-echo "bc250-unlock-wrapper: mask unlocked but kernel reports $CURRENT_THREADS/$TARGET_THREADS threads. Rebooting once to apply."
-echo $((ATTEMPTS + 1)) > "$COUNT_FILE"
-systemctl reboot
-WRAPEOF
-    sed -i "s|__SCRIPT_PATH__|${dest}|" "$CPU_UNLOCK_WRAPPER"
-    chown root:root "$CPU_UNLOCK_WRAPPER"
-    chmod 755 "$CPU_UNLOCK_WRAPPER"
-
-    print_info "Writing systemd service (runs as root at boot, before $CPU_UNLOCK_GOVERNOR_SERVICE)..."
-    cat > "/etc/systemd/system/${CPU_UNLOCK_SERVICE_NAME}.service" <<EOF
-[Unit]
-Description=Unlock BC-250 disabled CPU cores (SMU mailbox write)
-# Run before the SMU governor service so we don't race it for mailbox access
-Before=${CPU_UNLOCK_GOVERNOR_SERVICE}
-DefaultDependencies=no
-After=sysinit.target
-Before=basic.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=${CPU_UNLOCK_WRAPPER}
-
-[Install]
-WantedBy=sysinit.target
-EOF
-
-    print_info "Adding drop-in so $CPU_UNLOCK_GOVERNOR_SERVICE waits for the unlock to finish..."
-    mkdir -p "$CPU_UNLOCK_DROPIN_DIR"
-    cat > "$CPU_UNLOCK_DROPIN_FILE" <<EOF
-[Unit]
-# Prefer the core-unlock oneshot to run first (order after it), but do NOT
-# require it: if the unlock service is missing, masked, or fails, the
-# governor still starts normally. Wants= is a soft dependency - it pulls in
-# and waits for the unlock service when present, but never blocks on it.
-Wants=${CPU_UNLOCK_SERVICE_NAME}.service
-After=${CPU_UNLOCK_SERVICE_NAME}.service
-EOF
-
-    print_info "Reloading systemd and enabling services..."
-    systemctl daemon-reload
-    systemctl enable "${CPU_UNLOCK_SERVICE_NAME}.service"
-    if systemctl list-unit-files "$CPU_UNLOCK_GOVERNOR_SERVICE" &>/dev/null; then
-        systemctl enable "$CPU_UNLOCK_GOVERNOR_SERVICE" 2>/dev/null || true
-    fi
-
-    print_success "CPU Cores Unlock installed successfully!"
-    echo -e "  ${DIM}Script installed at:  $dest${RESET}"
-    echo -e "  ${DIM}Unlock service:       ${CPU_UNLOCK_SERVICE_NAME}.service (enabled, runs at every boot)${RESET}"
-    echo -e "  ${DIM}Governor drop-in at:  $CPU_UNLOCK_DROPIN_FILE${RESET}"
-    echo ""
-    echo -e "  ${WHITE}On the next COLD boot (full power off/on) with cores still locked,"
-    echo -e "  expect ONE automatic reboot triggered by the service itself — this"
-    echo -e "  is expected and self-resolving, not a crash.${RESET}"
-    echo -e "  ${DIM}Test now without rebooting: systemctl start ${CPU_UNLOCK_SERVICE_NAME}.service${RESET}\n"
-}
-
-run_revert_cpu_cores_unlock() {
-    print_step "R-9" "Revert CPU Cores Unlock"
-
-    if ! cpu_cores_unlock_installed && [[ ! -f "$CPU_UNLOCK_WRAPPER" ]]; then
-        print_info "CPU Cores Unlock does not appear to be installed — nothing to revert."
+    if ! confirm "Create a UEFI boot entry '$CPU_UNLOCK_EFI_LABEL' on $disk (partition $part)? This will typically become your default boot entry."; then
+        print_info "Cancelled before creating the boot entry."
+        print_info "The .efi file remains installed at $esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME if you want to register it manually later."
         return 0
     fi
 
-    if ! confirm "This will stop, disable, and remove the CPU Cores Unlock service and its files. Proceed?"; then
+    print_info "Creating EFI boot entry via efibootmgr..."
+    if ! efibootmgr --create --disk "$disk" --part "$part" --label "$CPU_UNLOCK_EFI_LABEL" --loader "\\EFI\\BOOT\\$CPU_UNLOCK_EFI_BIN_NAME"; then
+        print_error "efibootmgr failed to create the boot entry."
+        return 1
+    fi
+
+    print_success "CPU Cores Unlock (EFI method) installed successfully!"
+    echo -e "  ${DIM}EFI binary:  $esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME${RESET}"
+    echo -e "  ${DIM}Boot entry:  $CPU_UNLOCK_EFI_LABEL${RESET}"
+    echo -e "  ${BOLD}${YELLOW}A reboot is required to apply.${RESET}\n"
+}
+
+run_revert_cpu_cores_unlock_efi() {
+    print_step "R-9" "Revert CPU Cores Unlock"
+
+    if ! cpu_unlock_efi_installed; then
+        print_info "No '$CPU_UNLOCK_EFI_LABEL' EFI boot entry found — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "This will remove the '$CPU_UNLOCK_EFI_LABEL' UEFI boot entry and its .efi file. Proceed?"; then
         print_info "Cancelled."
         return 0
     fi
 
-    print_info "Stopping and disabling ${CPU_UNLOCK_SERVICE_NAME}.service..."
-    systemctl stop "${CPU_UNLOCK_SERVICE_NAME}.service" 2>/dev/null || true
-    systemctl disable "${CPU_UNLOCK_SERVICE_NAME}.service" 2>/dev/null || true
-
-    if [[ -f "/etc/systemd/system/${CPU_UNLOCK_SERVICE_NAME}.service" ]]; then
-        print_info "Removing service unit..."
-        rm -f "/etc/systemd/system/${CPU_UNLOCK_SERVICE_NAME}.service"
+    local bootnum
+    bootnum="$(efibootmgr | awk -v label="$CPU_UNLOCK_EFI_LABEL" '$0 ~ label {gsub(/[^0-9]/,"",$1); print $1; exit}')"
+    if [[ -n "$bootnum" ]]; then
+        print_info "Removing boot entry Boot$bootnum ($CPU_UNLOCK_EFI_LABEL)..."
+        efibootmgr -b "$bootnum" -B || print_error "Failed to remove boot entry Boot$bootnum — check manually with 'efibootmgr'."
+    else
+        print_error "Could not determine the boot entry number for '$CPU_UNLOCK_EFI_LABEL' — remove manually with 'efibootmgr'."
     fi
 
-    if [[ -f "$CPU_UNLOCK_DROPIN_FILE" ]]; then
-        print_info "Removing governor drop-in..."
-        rm -f "$CPU_UNLOCK_DROPIN_FILE"
-        rmdir --ignore-fail-on-non-empty "$CPU_UNLOCK_DROPIN_DIR" 2>/dev/null || true
-    fi
-
-    if [[ -f "$CPU_UNLOCK_WRAPPER" ]]; then
-        print_info "Removing wrapper script..."
-        rm -f "$CPU_UNLOCK_WRAPPER"
-    fi
-
-    if [[ -d "$CPU_UNLOCK_STATE_DIR" ]]; then
-        print_info "Removing state directory..."
-        rm -rf "$CPU_UNLOCK_STATE_DIR"
+    local esp_mount
+    if esp_mount="$(cpu_unlock_efi_find_esp)" && [[ -f "$esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME" ]]; then
+        print_info "Removing $esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME..."
+        rm -f "$esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME"
     fi
 
     local user_home
     user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
-    if [[ -n "$user_home" && -f "$user_home/$CPU_UNLOCK_SCRIPT_NAME" ]]; then
-        print_info "Removing downloaded unlock script from $REAL_USER's home..."
-        rm -f "$user_home/$CPU_UNLOCK_SCRIPT_NAME"
+    local build_dir="$user_home/.cache/bc250-toolkit/bc250-efi-core-unlock"
+    if [[ -d "$build_dir" ]]; then
+        print_info "Removing build directory..."
+        rm -rf "$build_dir"
     fi
 
-    systemctl daemon-reload
-
-    print_success "CPU Cores Unlock removed successfully."
-    echo -e "  ${DIM}Note: the unlock itself is volatile and only applied at boot, so cores"
-    echo -e "  will return to stock (6) on your next full power cycle. A warm reboot"
-    echo -e "  alone may still show 8 cores until a cold boot occurs.${RESET}\n"
+    print_success "CPU Cores Unlock (EFI method) removed."
 }
+
+# ---- CPU Cores Unlock submenu (both methods) ----
 
 # ==============================================================================
 # ACPI FIX (mendesrr/bc250-acpi-fix-updated-8c) + CPU GOVERNOR
@@ -1249,7 +1211,7 @@ run_acpi_menu() {
 }
 
 run_revert_acpi_fix() {
-    print_step "R-10" "Revert ACPI Fix"
+    print_step "R-8" "Revert ACPI Fix"
 
     if ! acpi_fix_installed && [[ ! -d "$ACPI_OVERRIDE_DIR" ]] && \
        ! grep -qE '^HOOKS=.*\bacpi_override\b' "$MKINITCPIO_CONF" 2>/dev/null; then
@@ -2387,7 +2349,11 @@ run_status() {
     else
         cpu_core_color="$YELLOW"
     fi
-    echo -e "  ${CYAN}CPU Cores${RESET}         ${cpu_core_color}${BOLD}${cpu_core_count}${RESET}  ${DIM}(12 stock, 16 unlocked)${RESET}"
+    local unlock_method_tag=""
+    if cpu_unlock_efi_installed; then
+        unlock_method_tag=" ${DIM}[EFI entry]${RESET}"
+    fi
+    echo -e "  ${CYAN}CPU Cores${RESET}         ${cpu_core_color}${BOLD}${cpu_core_count}${RESET}  ${DIM}(12 stock, 16 unlocked)${RESET}${unlock_method_tag}"
     if cu_find_umr; then
         cu_select_umr_instance
         local cu_total=0 cu_idx cu_se cu_sh cu_spi_hex cu_spi_val cu_wgp cu_bit
@@ -2760,6 +2726,10 @@ cu_find_umr() {
     for p in /usr/bin/umr /usr/local/bin/umr /opt/umr/build/src/app/umr; do
         if [ -x "$p" ]; then CU_UMR="$p"; return 0; fi
     done
+    if p="$(command -v umr 2>/dev/null)" && [ -x "$p" ]; then
+        CU_UMR="$p"
+        return 0
+    fi
     return 1
 }
 
@@ -3422,27 +3392,65 @@ cu_uninstall_service() {
 
 cu_install_umr() {
     if command -v pacman >/dev/null 2>&1 && pacman -Qi umr >/dev/null 2>&1; then
-        cu_info "umr is already installed."; return 0
+        cu_info "umr is already installed."
+        cu_find_umr && cu_info "Found at: $CU_UMR"
+        return 0
     fi
+
+    local installed=0
+
     if command -v pacman >/dev/null 2>&1 && pacman -Si umr >/dev/null 2>&1; then
-        cu_info "Installing umr with pacman..."; pacman -S --needed umr; return 0
-    fi
-    if aur_helper >/dev/null 2>&1; then
+        cu_info "Installing umr with pacman..."
+        if pacman -S --needed --noconfirm umr; then
+            installed=1
+        else
+            cu_die "pacman could not install umr — check the output above"
+            return 1
+        fi
+    elif aur_helper >/dev/null 2>&1; then
         cu_info "Installing umr via AUR helper..."
-        aur_install umr; return 0
-    fi
-    if command -v rpm-ostree >/dev/null 2>&1; then
+        if aur_install umr; then
+            installed=1
+        else
+            cu_die "AUR install of umr failed — check the build output above"
+            return 1
+        fi
+    elif command -v rpm-ostree >/dev/null 2>&1; then
         cu_warn "rpm-ostree layering is host-level and may affect immutable system upgrades."
         cu_info "Installing umr with rpm-ostree (reboot required)..."
-        rpm-ostree install umr && { cu_info "umr staged. Reboot then return here."; return 0; }
-        cu_die "rpm-ostree could not install umr"; return 1
-    fi
-    if command -v dnf >/dev/null 2>&1; then
+        if rpm-ostree install umr; then
+            cu_info "umr staged. Reboot then return here — it can't be verified until then."
+            return 0
+        else
+            cu_die "rpm-ostree could not install umr"
+            return 1
+        fi
+    elif command -v dnf >/dev/null 2>&1; then
         cu_info "Installing umr with dnf..."
-        dnf install -y umr && return 0
-        cu_die "dnf could not install umr"; return 1
+        if dnf install -y umr; then
+            installed=1
+        else
+            cu_die "dnf could not install umr"
+            return 1
+        fi
+    else
+        cu_die "could not install umr automatically — install shelly, paru, or yay first"
+        return 1
     fi
-    cu_die "could not install umr automatically — install shelly, paru, or yay first"
+
+    if [ "$installed" -eq 1 ]; then
+        CU_UMR=""   # clear any stale cached path so this re-searches fresh
+        if cu_find_umr; then
+            cu_info "umr installed successfully — found at: $CU_UMR"
+            return 0
+        else
+            cu_warn "The install command reported success, but umr could not be found"
+            cu_warn "afterward (checked /usr/bin/umr, /usr/local/bin/umr,"
+            cu_warn "/opt/umr/build/src/app/umr, and PATH). It may have installed to a"
+            cu_warn "non-standard location — check the install output above."
+            return 1
+        fi
+    fi
 }
 
 dz_warn() {
@@ -3486,8 +3494,8 @@ show_danger_zone_menu() {
     print_item  "5"  "Reset to Driver Default"   ""
     echo ""
     print_section "Boot Persistence"
-    print_item  "6"  "Save Boot Profile"         ""
-    print_item  "7"  "Install Boot Service"      ""
+    print_item  "6"  "Install Boot Service"      ""
+    print_item  "7"  "Save Boot Profile"         ""
     print_item  "8"  "Uninstall Boot Service"    ""
     echo ""
     print_item  "0"  "Back"                      ""
@@ -3507,8 +3515,8 @@ run_danger_zone_menu() {
             3) cu_table_editor ;;
             4) cu_enable_all;           press_enter ;;
             5) cu_stock_dispatch;       press_enter ;;
-            6) cu_write_service_table;  press_enter ;;
-            7) cu_install_service;      press_enter ;;
+            6) cu_install_service;      press_enter ;;
+            7) cu_write_service_table;  press_enter ;;
             8) cu_uninstall_service;    press_enter ;;
             0) return 0 ;;
             *)
@@ -3933,8 +3941,8 @@ show_revert_menu() {
     print_item  "5"  "Revert Mitigations"      "Re-enable CPU security mitigations"
     print_item  "6"  "Revert DolphinBar"       "Remove DolphinBar udev rules"
     print_item  "7"  "Revert VRAM Ceiling"     "Remove ttm.pages_limit kernel param"
-    print_item  "8"  "Revert CPU Cores Unlock" "Remove core unlock boot service"
-    print_item  "9"  "Revert ACPI Fix"         "Remove SSDT overrides & acpi_override hook"
+    print_item  "8"  "Revert ACPI Fix"         "Remove SSDT overrides & acpi_override hook"
+    print_item  "9"  "Revert CPU Cores Unlock" "Remove UEFI boot entry & .efi file"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -3947,15 +3955,15 @@ run_revert_menu() {
         read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" rev_choice
 
         case "${rev_choice^^}" in
-            1) run_revert_cpu_governor;       press_enter ;;
-            2) run_revert_gpu_governor;       press_enter ;;
-            3) run_revert_zswap;              press_enter ;;
-            4) run_revert_loglevel;           press_enter ;;
-            5) run_revert_mitigations;        press_enter ;;
-            6) run_revert_dolphinbar;         press_enter ;;
-            7) run_revert_ttm_pages_limit;    press_enter ;;
-            8) run_revert_cpu_cores_unlock;   press_enter ;;
-            9) run_revert_acpi_fix;           press_enter ;;
+            1) run_revert_cpu_governor;         press_enter ;;
+            2) run_revert_gpu_governor;         press_enter ;;
+            3) run_revert_zswap;                press_enter ;;
+            4) run_revert_loglevel;             press_enter ;;
+            5) run_revert_mitigations;          press_enter ;;
+            6) run_revert_dolphinbar;           press_enter ;;
+            7) run_revert_ttm_pages_limit;      press_enter ;;
+            8) run_revert_acpi_fix;             press_enter ;;
+            9) run_revert_cpu_cores_unlock_efi; press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
@@ -4027,9 +4035,9 @@ show_initial_setup_menu() {
     print_item  "A"  "Run All (1-7)"           "Run all setup tasks in sequence"
     echo ""
     print_section "⚠  Manual Steps — not included in Run All"
-    print_item  "8"  "CPU Cores Unlock"        "6 → 8 CPU cores via SMU mailbox write"
-    print_item  "9"  "ACPI Fix"                "SSDT override + CPU governor control"
-    print_item  "10" "Compute Units Unlock"    ""
+    print_item  "8"  "CPU Cores Unlock"        "6 → 8 CPU cores via EFI boot entry"
+    print_item  "9"  "GPU Compute Units Unlock" ""
+    print_item  "10" "ACPI Fix"                "SSDT override + CPU governor control"
     print_item  "11" "BC-250 Memory Config"    "Configure VRAM size via bc250_memcfg"
     print_item  "12" "Remove Deckify Kernel"   "Verify new kernel boots first"
     echo ""
@@ -4052,9 +4060,9 @@ run_initial_setup_menu() {
             6) run_set_loglevel;              press_enter ;;
             7) run_disable_mitigations;       press_enter ;;
             A) run_all;                       press_enter ;;
-            8) run_cpu_cores_unlock;          press_enter ;;
-            9) run_acpi_menu ;;
-            10) run_danger_zone_menu ;;
+            8) run_cpu_cores_unlock_efi;       press_enter ;;
+            9) run_danger_zone_menu ;;
+            10) run_acpi_menu ;;
             11) run_memcfg_menu ;;
             12) run_remove_deckify_kernel;    press_enter ;;
             0) return 0 ;;
