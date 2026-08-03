@@ -1048,6 +1048,10 @@ run_revert_cpu_cores_unlock_efi() {
     fi
 
     print_success "CPU Cores Unlock (EFI method) removed."
+    echo -e "  ${BOLD}${YELLOW}You must fully power off the system to complete the uninstall —"
+    echo -e "  a reboot is not enough. The unlock only clears itself on a genuine"
+    echo -e "  cold boot, so a warm reboot may still show unlocked cores until you"
+    echo -e "  power the system down completely and turn it back on.${RESET}\n"
 }
 
 # ---- CPU Cores Unlock submenu (both methods) ----
