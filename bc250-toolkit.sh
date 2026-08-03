@@ -188,42 +188,81 @@ BG_HEADER="\e[48;5;235m"
 # HELPERS
 # ==============================================================================
 
-# AUR helper — detects shelly, paru, or yay in that order
+# AUR helper — detects yay or paru in that order
 aur_helper() {
-    if command -v shelly >/dev/null 2>&1; then printf "shelly"
-    elif command -v paru >/dev/null 2>&1;  then printf "paru"
-    elif command -v yay >/dev/null 2>&1;   then printf "yay"
+    if command -v yay >/dev/null 2>&1; then printf "yay"
+    elif command -v paru >/dev/null 2>&1; then printf "paru"
     else return 1
     fi
 }
 
-aur_install() {
-    local package="$1"
-    local helper
-    if ! helper="$(aur_helper)"; then
-        print_error "No AUR helper found (shelly, paru, or yay). Please install one first."
+# Installs yay automatically if no AUR helper is present. Tries pacman
+# first (CachyOS ships yay directly in its own repos), falling back to
+# building it from the AUR as the real user if pacman doesn't have it.
+ensure_aur_helper() {
+    aur_helper >/dev/null 2>&1 && return 0
+
+    print_info "No AUR helper found — installing yay..."
+
+    if command -v pacman >/dev/null 2>&1 && pacman -Si yay >/dev/null 2>&1; then
+        if pacman -S --needed --noconfirm yay; then
+            aur_helper >/dev/null 2>&1 && return 0
+        fi
+        print_error "pacman could not install yay — check the output above."
         return 1
     fi
+
+    print_info "yay is not available via pacman — building it from the AUR..."
+    local user_home build_dir
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    build_dir="$user_home/.cache/bc250-toolkit/yay"
+
+    sudo -u "$REAL_USER" mkdir -p "$(dirname "$build_dir")"
+    if [[ -d "$build_dir" ]]; then
+        sudo -u "$REAL_USER" git -C "$build_dir" pull || { print_error "Failed to pull the yay repository."; return 1; }
+    else
+        sudo -u "$REAL_USER" git clone https://aur.archlinux.org/yay.git "$build_dir" || { print_error "Failed to clone the yay repository."; return 1; }
+    fi
+
+    if ! sudo -u "$REAL_USER" bash -c "cd '$build_dir' && makepkg -si --noconfirm"; then
+        print_error "Failed to build/install yay from source."
+        return 1
+    fi
+
+    if aur_helper >/dev/null 2>&1; then
+        return 0
+    fi
+    print_error "yay installation reported success but the binary could not be found afterward."
+    return 1
+}
+
+aur_install() {
+    local package="$1"
+    if ! ensure_aur_helper; then
+        print_error "No AUR helper available and automatic installation of yay failed."
+        return 1
+    fi
+    local helper
+    helper="$(aur_helper)"
     print_info "Installing $package via $helper..."
     case "$helper" in
-        shelly) sudo -u "$REAL_USER" shelly install aur "$package" ;;
-        paru)   sudo -u "$REAL_USER" paru -S --noconfirm "$package" ;;
-        yay)    sudo -u "$REAL_USER" yay -S --noconfirm "$package" ;;
+        yay)  sudo -u "$REAL_USER" yay -S --noconfirm "$package" ;;
+        paru) sudo -u "$REAL_USER" paru -S --noconfirm "$package" ;;
     esac
 }
 
 aur_remove() {
     local package="$1"
-    local helper
-    if ! helper="$(aur_helper)"; then
-        print_error "No AUR helper found (shelly, paru, or yay). Please install one first."
+    if ! ensure_aur_helper; then
+        print_error "No AUR helper available and automatic installation of yay failed."
         return 1
     fi
+    local helper
+    helper="$(aur_helper)"
     print_info "Removing $package via $helper..."
     case "$helper" in
-        shelly) sudo -u "$REAL_USER" shelly remove aur "$package" --no-confirm ;;
-        paru)   sudo -u "$REAL_USER" paru -Rns --noconfirm "$package" 2>/dev/null || true ;;
-        yay)    sudo -u "$REAL_USER" yay -Rns --noconfirm "$package" 2>/dev/null || true ;;
+        yay)  sudo -u "$REAL_USER" yay -Rns --noconfirm "$package" 2>/dev/null || true ;;
+        paru) sudo -u "$REAL_USER" paru -Rns --noconfirm "$package" 2>/dev/null || true ;;
     esac
 }
 
@@ -3407,7 +3446,7 @@ cu_install_umr() {
             cu_die "pacman could not install umr — check the output above"
             return 1
         fi
-    elif aur_helper >/dev/null 2>&1; then
+    elif ensure_aur_helper; then
         cu_info "Installing umr via AUR helper..."
         if aur_install umr; then
             installed=1
@@ -3434,7 +3473,7 @@ cu_install_umr() {
             return 1
         fi
     else
-        cu_die "could not install umr automatically — install shelly, paru, or yay first"
+        cu_die "could not install umr automatically — no pacman, AUR helper, rpm-ostree, or dnf available"
         return 1
     fi
 
@@ -4099,7 +4138,7 @@ run_install_protonup_qt() {
     if aur_install protonup-qt; then
         print_success "ProtonUp-Qt installed successfully."
     else
-        print_error "Installation failed. Make sure shelly, paru, or yay is installed and try again."
+        print_error "Installation failed — check the output above."
     fi
 }
 
