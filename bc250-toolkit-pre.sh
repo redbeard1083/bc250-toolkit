@@ -4132,6 +4132,14 @@ run_install_decky() {
 
 run_install_emudeck() {
     print_section "Install EmuDeck"
+
+    print_info "Installing fuse2 (required for EmuDeck's AppImage-based installer)..."
+    if ! pacman -S --needed --noconfirm fuse2; then
+        print_error "Failed to install fuse2 — EmuDeck's installer will likely fail with"
+        print_error "'AppImages require FUSE to run'. Check the output above."
+        return 1
+    fi
+
     print_info "Downloading and running EmuDeck installer as $REAL_USER..."
     echo ""
     sudo -u "$REAL_USER" bash -c 'curl -L https://raw.githubusercontent.com/dragoonDorise/EmuDeck/main/install.sh | bash'
