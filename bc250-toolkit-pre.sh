@@ -1135,7 +1135,7 @@ show_cpu_cores_unlock_menu() {
     echo -e "  ${CYAN}Permanent (EFI entry)${RESET}  ${permanent_status}"
     echo ""
     print_item "1" "Step 1: Test Unlock"    "Temporary — clears on full power off"
-    print_item "2" "Step 2: Make Permanent" "Installs EFI boot entry (requires PERMANENT confirmation)"
+    print_item "2" "Step 2: Make Permanent" "Installs EFI boot entry"
     echo ""
     print_item "0" "Back" ""
     echo ""
