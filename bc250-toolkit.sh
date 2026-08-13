@@ -528,6 +528,9 @@ run_gpu_governor() {
         return 1
     fi
 
+    print_info "Setting fix-freq to match current CPU core count..."
+    gpu_governor_apply_fix_freq || print_error "Could not set fix-freq in the default config — check it manually if GPU frequency reporting looks wrong."
+
     print_info "Enabling and starting systemd service..."
     if ! systemctl enable --now cyan-skillfish-governor-smu.service; then
         print_error "Failed to enable/start the service — check: journalctl -u cyan-skillfish-governor-smu.service"
@@ -863,6 +866,66 @@ run_remove_deckify_kernel() {
 }
 
 # ==============================================================================
+# CPU CORES UNLOCK — Step 1: Test Unlock (rw-r-r-0644/bc250-core-unlock)
+# ==============================================================================
+
+CPU_UNLOCK_TEST_URL="https://raw.githubusercontent.com/rw-r-r-0644/bc250-core-unlock/main/bc250-unlock-cores.py"
+CPU_UNLOCK_TEST_SCRIPT_NAME="bc250-unlock-cores.py"
+
+run_cpu_cores_test_unlock() {
+    print_step "08a" "CPU Cores Unlock — Step 1: Test Unlock (Temporary)"
+
+    echo ""
+    echo -e "  ${WHITE}This runs a one-time SMU mailbox write to unlock the extra CPU cores"
+    echo -e "  for THIS BOOT SESSION ONLY. Nothing is installed persistently — no"
+    echo -e "  service, no boot entry, nothing that survives on its own. The unlock"
+    echo -e "  clears itself the moment you fully power the system off (a reboot"
+    echo -e "  alone is NOT enough to clear it, since the SMU state can persist"
+    echo -e "  across a warm reboot).${RESET}"
+    echo ""
+    if ! confirm "Run the test unlock now?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    local user_home dest
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    if [[ -z "$user_home" || ! -d "$user_home" ]]; then
+        print_error "Could not resolve home directory for user '$REAL_USER'."
+        return 1
+    fi
+    dest="$user_home/$CPU_UNLOCK_TEST_SCRIPT_NAME"
+
+    print_info "Downloading $CPU_UNLOCK_TEST_SCRIPT_NAME..."
+    if ! curl -fsSL "$CPU_UNLOCK_TEST_URL" -o "$dest"; then
+        print_error "Failed to download the unlock script."
+        return 1
+    fi
+    chown "$REAL_USER":"$(id -gn "$REAL_USER")" "$dest"
+    chmod 755 "$dest"
+
+    print_info "Running the unlock script..."
+    echo ""
+    if ! python3 "$dest"; then
+        print_error "The unlock script exited with an error — check the output above."
+        return 1
+    fi
+
+    echo ""
+    print_success "Test unlock applied for this boot session."
+    echo -e "  ${BOLD}${YELLOW}Next steps:${RESET}"
+    echo -e "  ${WHITE}1. Reboot the system.${RESET}"
+    echo -e "  ${WHITE}2. Stress-test it under load on all cores for a while — watch for"
+    echo -e "     crashes, hangs, or instability.${RESET}"
+    echo -e "  ${WHITE}3. If the system does NOT boot, or is unstable: fully power off"
+    echo -e "     (not just reboot) and back on. This restores the stock 6-core"
+    echo -e "     configuration, since the unlock is volatile and only clears on a"
+    echo -e "     genuine cold boot.${RESET}"
+    echo -e "  ${WHITE}4. If everything is stable, come back here and run Step 2 (Make"
+    echo -e "     Permanent) to install the EFI boot entry.${RESET}\n"
+}
+
+# ==============================================================================
 # CPU CORES UNLOCK — EFI Boot Entry method (Hexxeh/bc250-efi-core-unlock)
 # ==============================================================================
 
@@ -900,25 +963,31 @@ cpu_unlock_efi_find_disk_part() {
 
 cpu_unlock_efi_warn() {
     echo ""
-    echo -e "  ${BOLD}${RED}⚠  WARNING: CPU CORES UNLOCK — EFI BOOT ENTRY METHOD${RESET}"
+    echo -e "  ${BOLD}${RED}⚠  WARNING: MAKING THE CPU CORE UNLOCK PERMANENT${RESET}"
     echo ""
-    echo -e "  ${WHITE}This is an alternative to the SMU mailbox service: instead of a boot-time"
-    echo -e "  systemd service, it builds a standalone EFI executable and registers it as"
-    echo -e "  a NEW UEFI FIRMWARE BOOT ENTRY (via efibootmgr), typically placed FIRST in"
-    echo -e "  your boot order. It runs before your OS bootloader, unlocks the cores, then"
-    echo -e "  chain-loads into your normal boot process."
+    echo -e "  ${WHITE}This installs a UEFI boot entry that force-enables the extra CPU cores"
+    echo -e "  on EVERY boot, before your OS bootloader even runs."
     echo ""
-    echo -e "  This modifies UEFI NVRAM boot entries directly, not just OS-level files."
-    echo -e "  Only proceed if you understand that.${RESET}"
+    echo -e "  If you have NOT already run Step 1 (Test Unlock) and confirmed your"
+    echo -e "  system boots reliably and stays stable under load with all cores"
+    echo -e "  active, proceeding here could leave your system UNABLE TO BOOT on"
+    echo -e "  every single startup — since the unlock now runs before the OS does,"
+    echo -e "  recovering from that may require removing the EFI boot entry from"
+    echo -e "  outside the OS entirely (e.g. a live USB or your BIOS/UEFI setup"
+    echo -e "  screen), not just a normal reboot or reinstall.${RESET}"
     echo ""
-    echo -e "  ${DIM}Type ${RESET}${BOLD}${YELLOW}unlock${RESET}${DIM} to accept and proceed, or press Enter to cancel.${RESET}"
+    echo -e "  ${YELLOW}Strongly recommended: run Step 1 first, reboot, and stress-test the"
+    echo -e "  system BEFORE making this permanent.${RESET}"
+    echo ""
+    echo -e "  ${DIM}Type ${RESET}${BOLD}${YELLOW}PERMANENT${RESET}${DIM} to confirm you understand the risk and want to proceed,"
+    echo -e "  or press Enter to cancel.${RESET}"
     echo ""
     read -rp "  → " cpu_unlock_efi_ack
-    [[ "$cpu_unlock_efi_ack" == "unlock" ]]
+    [[ "$cpu_unlock_efi_ack" == "PERMANENT" ]]
 }
 
 run_cpu_cores_unlock_efi() {
-    print_step "08b" "Installing CPU Cores Unlock — EFI Boot Entry Method"
+    print_step "08b" "CPU Cores Unlock — Step 2: Make Permanent (EFI Boot Entry)"
 
     if cpu_unlock_efi_installed; then
         print_info "A '$CPU_UNLOCK_EFI_LABEL' EFI boot entry already exists — skipping."
@@ -1054,7 +1123,44 @@ run_revert_cpu_cores_unlock_efi() {
     echo -e "  power the system down completely and turn it back on.${RESET}\n"
 }
 
-# ---- CPU Cores Unlock submenu (both methods) ----
+# ---- CPU Cores Unlock submenu (two-step process) ----
+
+show_cpu_cores_unlock_menu() {
+    print_banner
+    print_section "CPU Cores Unlock"
+    echo -e "  ${DIM}Two-step process: test the unlock temporarily first, then make it permanent once you've confirmed it's stable.${RESET}\n"
+    local permanent_status
+    if cpu_unlock_efi_installed; then
+        permanent_status="${GREEN}installed${RESET}"
+    else
+        permanent_status="${DIM}not installed${RESET}"
+    fi
+    echo -e "  ${CYAN}Permanent (EFI entry)${RESET}  ${permanent_status}"
+    echo ""
+    print_item "1" "Step 1: Test Unlock"    "Temporary — clears on full power off"
+    print_item "2" "Step 2: Make Permanent" "Installs EFI boot entry (requires PERMANENT confirmation)"
+    echo ""
+    print_item "0" "Back" ""
+    echo ""
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_cpu_cores_unlock_menu() {
+    while true; do
+        show_cpu_cores_unlock_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" cu_choice
+
+        case "${cu_choice^^}" in
+            1) run_cpu_cores_test_unlock; press_enter ;;
+            2) run_cpu_cores_unlock_efi;  press_enter ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$cu_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
 
 # ==============================================================================
 # ACPI FIX (mendesrr/bc250-acpi-fix-updated-8c) + CPU GOVERNOR
@@ -1823,11 +1929,47 @@ install_cpu() {
     fi
 }
 
+# Returns "true" if the system currently has 8 unlocked cores (16 threads
+# with SMT), "false" for stock 6-core (12 threads) or anything unexpected.
+gpu_governor_fix_freq_value() {
+    local cores
+    cores=$(nproc --all 2>/dev/null || echo 0)
+    if [[ "$cores" == "16" ]]; then
+        printf 'true'
+    else
+        printf 'false'
+    fi
+}
+
+# Ensures the given GPU governor config file has a fix-freq line matching
+# the current CPU core count — this fixes incorrect GPU frequency reporting
+# that only occurs with 8 cores unlocked (see filippor/cyan-skillfish-governor
+# commit be9537f). Updates an existing fix-freq line if present, otherwise
+# inserts one right after fix-metrics (matching upstream's own layout).
+gpu_governor_apply_fix_freq() {
+    local conf="${1:-$GPU_DEST}"
+    [[ -f "$conf" ]] || return 1
+
+    local fix_freq_value
+    fix_freq_value="$(gpu_governor_fix_freq_value)"
+
+    if grep -q '^fix-freq' "$conf"; then
+        sed -i "s/^fix-freq[[:space:]]*=.*/fix-freq = ${fix_freq_value}/" "$conf"
+    elif grep -q '^fix-metrics' "$conf"; then
+        sed -i "/^fix-metrics/a fix-freq = ${fix_freq_value}" "$conf"
+    else
+        return 1
+    fi
+}
+
 install_gpu() {
     # Check if a new temporary config was actually provided (for presets)
     if [[ -f "${1:-}" ]]; then
         cp "$1" "$GPU_DEST"
     fi
+
+    # Set fix-freq to match the current CPU core count (6 vs 8 unlocked)
+    gpu_governor_apply_fix_freq "$GPU_DEST"
 
     # Restart the service to load whatever is currently in $GPU_DEST
     systemctl restart "$GPU_SERVICE"
@@ -4078,7 +4220,7 @@ show_initial_setup_menu() {
     print_item  "A"  "Run All (1-7)"           "Run all setup tasks in sequence"
     echo ""
     print_section "⚠  Manual Steps — not included in Run All"
-    print_item  "8"  "CPU Cores Unlock"        "6 → 8 CPU cores via EFI boot entry"
+    print_item  "8"  "CPU Cores Unlock"        "6 → 8 CPU cores — test, then make permanent"
     print_item  "9"  "GPU Compute Units Unlock" ""
     print_item  "10" "ACPI Fix"                "SSDT override + CPU governor control"
     print_item  "11" "BC-250 Memory Config"    "Configure VRAM size via bc250_memcfg"
@@ -4103,7 +4245,7 @@ run_initial_setup_menu() {
             6) run_set_loglevel;              press_enter ;;
             7) run_disable_mitigations;       press_enter ;;
             A) run_all;                       press_enter ;;
-            8) run_cpu_cores_unlock_efi;       press_enter ;;
+            8) run_cpu_cores_unlock_menu ;;
             9) run_danger_zone_menu ;;
             10) run_acpi_menu ;;
             11) run_memcfg_menu ;;
