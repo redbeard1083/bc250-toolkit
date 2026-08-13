@@ -528,6 +528,9 @@ run_gpu_governor() {
         return 1
     fi
 
+    print_info "Setting fix-freq to match current CPU core count..."
+    gpu_governor_apply_fix_freq || print_error "Could not set fix-freq in the default config — check it manually if GPU frequency reporting looks wrong."
+
     print_info "Enabling and starting systemd service..."
     if ! systemctl enable --now cyan-skillfish-governor-smu.service; then
         print_error "Failed to enable/start the service — check: journalctl -u cyan-skillfish-governor-smu.service"
@@ -1135,7 +1138,7 @@ show_cpu_cores_unlock_menu() {
     echo -e "  ${CYAN}Permanent (EFI entry)${RESET}  ${permanent_status}"
     echo ""
     print_item "1" "Step 1: Test Unlock"    "Temporary — clears on full power off"
-    print_item "2" "Step 2: Make Permanent" "Installs EFI boot entry"
+    print_item "2" "Step 2: Make Permanent" "Installs EFI boot entry (requires PERMANENT confirmation)"
     echo ""
     print_item "0" "Back" ""
     echo ""
@@ -1926,11 +1929,47 @@ install_cpu() {
     fi
 }
 
+# Returns "true" if the system currently has 8 unlocked cores (16 threads
+# with SMT), "false" for stock 6-core (12 threads) or anything unexpected.
+gpu_governor_fix_freq_value() {
+    local cores
+    cores=$(nproc --all 2>/dev/null || echo 0)
+    if [[ "$cores" == "16" ]]; then
+        printf 'true'
+    else
+        printf 'false'
+    fi
+}
+
+# Ensures the given GPU governor config file has a fix-freq line matching
+# the current CPU core count — this fixes incorrect GPU frequency reporting
+# that only occurs with 8 cores unlocked (see filippor/cyan-skillfish-governor
+# commit be9537f). Updates an existing fix-freq line if present, otherwise
+# inserts one right after fix-metrics (matching upstream's own layout).
+gpu_governor_apply_fix_freq() {
+    local conf="${1:-$GPU_DEST}"
+    [[ -f "$conf" ]] || return 1
+
+    local fix_freq_value
+    fix_freq_value="$(gpu_governor_fix_freq_value)"
+
+    if grep -q '^fix-freq' "$conf"; then
+        sed -i "s/^fix-freq[[:space:]]*=.*/fix-freq = ${fix_freq_value}/" "$conf"
+    elif grep -q '^fix-metrics' "$conf"; then
+        sed -i "/^fix-metrics/a fix-freq = ${fix_freq_value}" "$conf"
+    else
+        return 1
+    fi
+}
+
 install_gpu() {
     # Check if a new temporary config was actually provided (for presets)
     if [[ -f "${1:-}" ]]; then
         cp "$1" "$GPU_DEST"
     fi
+
+    # Set fix-freq to match the current CPU core count (6 vs 8 unlocked)
+    gpu_governor_apply_fix_freq "$GPU_DEST"
 
     # Restart the service to load whatever is currently in $GPU_DEST
     systemctl restart "$GPU_SERVICE"
