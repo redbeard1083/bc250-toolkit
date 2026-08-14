@@ -20,6 +20,7 @@ It does the following:
 9. Set vram split and ttm pages: https://github.com/fanoush/bc250_memcfg
 10. Unlock CPU Cores: https://github.com/rw-r-r-0644/bc250-core-unlock , https://github.com/Hexxeh/bc250-efi-core-unlock
 11. Install ACPI Fix: https://github.com/mendesrr/bc250-acpi-fix-updated-8c
+12. Install custom BC-250 kernel: https://github.com/MastaG/linux-cachyos-bc250
 
 In desktop mode run the below in the terminal(Konsole):
 <pre>
