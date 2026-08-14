@@ -4,7 +4,7 @@ Setup script for BC250 on CachyOS
 
 Disclaimer:  I am not responsible for any damages caused by use of this script.  Please review it to make sure the overclocking configs are compatible with your board. Unlocking compute units will increase power draw and heat.  You are responsible for your own power and cooling setups.  Misuse of this script could cause physical damage to your board.
 
-### **Must be using Limine boot loader for all functions in the script to work.**  (Grub support added in the pre-release version, but needs testing.)
+### **Must be using Limine boot loader for all functions in the script to work.**  (Grub support has been added, but needs testing.)
 
 This script will allow easy setup of the BC-250 on CachyOS.  It has been tested with the handheld edition, but should also work on any CachyOs version as long as the Limine bootloader is used.  Inspired by the similar script for Bazzite:  https://github.com/NexGen-3D-Printing/SteamMachine
 
