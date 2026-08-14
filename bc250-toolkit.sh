@@ -866,6 +866,222 @@ run_remove_deckify_kernel() {
 }
 
 # ==============================================================================
+# BC-250 CACHYOS KERNEL (MastaG/linux-cachyos-bc250)
+# ==============================================================================
+
+BC250_KERNEL_REPO_NAME="bc250-cachyos"
+BC250_KERNEL_REPO_SERVER="https://github.com/MastaG/linux-cachyos-bc250/releases/download/repo"
+PACMAN_CONF="/etc/pacman.conf"
+
+# Each entry's headers package is always "<name>-headers"
+BC250_KERNEL_VARIANT_PKGS=("linux-cachyos-bc250" "linux-cachyos-bore-bc250" "linux-cachyos-rc-bc250")
+BC250_KERNEL_VARIANT_LABELS=("Standard" "BORE scheduler" "Release Candidate (RC)")
+BC250_KERNEL_VARIANT_DESCS=(
+    "linux-cachyos-bc250 — tracks upstream stable"
+    "linux-cachyos-bore-bc250 — BORE scheduler, GCC-compiled"
+    "linux-cachyos-rc-bc250 — tracks upstream release candidates"
+)
+
+bc250_kernel_repo_configured() {
+    grep -q "^\[${BC250_KERNEL_REPO_NAME}\]" "$PACMAN_CONF" 2>/dev/null
+}
+
+bc250_kernel_warn() {
+    echo ""
+    echo -e "  ${BOLD}${RED}⚠  WARNING: UNSIGNED THIRD-PARTY PACMAN REPOSITORY${RESET}"
+    echo ""
+    echo -e "  ${WHITE}This adds a third-party pacman repository (MastaG/linux-cachyos-bc250)"
+    echo -e "  to $PACMAN_CONF, providing BC-250-specific CachyOS kernel variants with"
+    echo -e "  cherry-picked patches for correct CPU/GPU telemetry on 6- and 8-core"
+    echo -e "  configurations, plus a display audio quirk fix."
+    echo ""
+    echo -e "  This repository is currently UNSIGNED (SigLevel = Optional TrustAll)"
+    echo -e "  per its own documentation — packages are not cryptographically"
+    echo -e "  verified beyond normal HTTPS/GitHub trust. Only proceed if you trust"
+    echo -e "  this project and its build pipeline.${RESET}"
+    echo ""
+    echo -e "  ${DIM}Type ${RESET}${BOLD}${YELLOW}yes${RESET}${DIM} to continue, or press Enter to cancel.${RESET}"
+    echo ""
+    read -rp "  → " bc250_kernel_ack
+    [[ "${bc250_kernel_ack,,}" == "yes" ]]
+}
+
+run_install_bc250_kernel() {
+    print_step "13" "Installing BC-250 CachyOS Kernel"
+
+    bc250_kernel_warn || { print_info "Cancelled."; return 0; }
+
+    echo ""
+    print_section "Select Kernel Variant"
+    local i pkg marker
+    for i in "${!BC250_KERNEL_VARIANT_LABELS[@]}"; do
+        pkg="${BC250_KERNEL_VARIANT_PKGS[$i]}"
+        marker=""
+        pacman -Qq "$pkg" &>/dev/null && marker="  ${GREEN}(installed)${RESET}"
+        print_item "$((i+1))" "${BC250_KERNEL_VARIANT_LABELS[$i]}${marker}" "${BC250_KERNEL_VARIANT_DESCS[$i]}"
+    done
+    echo ""
+    print_item "0" "Cancel" ""
+    echo ""
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Select variant:${RESET} ")" variant_choice
+
+    if [[ "$variant_choice" == "0" ]]; then
+        print_info "Cancelled."
+        return 0
+    fi
+    if ! [[ "$variant_choice" =~ ^[0-9]+$ ]] || \
+       (( variant_choice < 1 || variant_choice > ${#BC250_KERNEL_VARIANT_PKGS[@]} )); then
+        print_error "Invalid selection: '$variant_choice'"
+        return 1
+    fi
+
+    local idx=$((variant_choice - 1))
+    local target_pkg="${BC250_KERNEL_VARIANT_PKGS[$idx]}"
+    local target_headers="${target_pkg}-headers"
+    local target_label="${BC250_KERNEL_VARIANT_LABELS[$idx]}"
+
+    if pacman -Qq "$target_pkg" &>/dev/null; then
+        print_info "$target_pkg is already installed — skipping."
+        return 0
+    fi
+
+    if ! bc250_kernel_repo_configured; then
+        print_info "Adding [$BC250_KERNEL_REPO_NAME] repository to $PACMAN_CONF..."
+        if [[ ! -f "${PACMAN_CONF}.bak" ]]; then
+            print_info "Creating original backup at ${PACMAN_CONF}.bak ..."
+            cp "$PACMAN_CONF" "${PACMAN_CONF}.bak"
+        fi
+        {
+            echo ""
+            echo "[$BC250_KERNEL_REPO_NAME]"
+            echo "SigLevel = Optional TrustAll"
+            echo "Server = $BC250_KERNEL_REPO_SERVER"
+        } >> "$PACMAN_CONF"
+    else
+        print_info "[$BC250_KERNEL_REPO_NAME] repository already configured — skipping."
+    fi
+
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    print_info "Installing $target_pkg and $target_headers ($target_label)..."
+    if ! pacman -S --needed --noconfirm "$target_pkg" "$target_headers"; then
+        print_error "Failed to install the BC-250 kernel — check the output above."
+        return 1
+    fi
+
+    if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
+        if ! bootloader_update; then
+            print_error "Boot config update failed — you may need to update it manually before rebooting."
+            return 1
+        fi
+    fi
+
+    print_success "$target_label BC-250 CachyOS kernel installed successfully!"
+    echo ""
+    echo -e "  ${BOLD}${YELLOW}Next steps:${RESET}"
+    echo -e "  ${WHITE}1. Reboot your system.${RESET}"
+    echo -e "  ${WHITE}2. At the boot menu, select the '$target_pkg' entry.${RESET}"
+    echo -e "  ${WHITE}3. Verify the system boots correctly (check with: uname -r).${RESET}"
+    echo -e "  ${WHITE}4. Keep your previous kernel installed as a fallback until you're"
+    echo -e "     confident — this toolkit will not remove it automatically.${RESET}"
+    echo -e "  ${WHITE}5. This kernel updates through your normal 'pacman -Syu' — no"
+    echo -e "     special action is needed here going forward.${RESET}\n"
+}
+
+run_revert_bc250_kernel() {
+    print_step "R-10" "Revert BC-250 CachyOS Kernel"
+
+    local -a installed_pkgs=()
+    local pkg
+    for pkg in "${BC250_KERNEL_VARIANT_PKGS[@]}"; do
+        pacman -Qq "$pkg" &>/dev/null && installed_pkgs+=("$pkg")
+    done
+
+    if [[ "${#installed_pkgs[@]}" -eq 0 ]] && ! bc250_kernel_repo_configured; then
+        print_info "No BC-250 CachyOS kernel variant appears to be installed — nothing to revert."
+        return 0
+    fi
+
+    local -a to_remove=()
+    if [[ "${#installed_pkgs[@]}" -eq 1 ]]; then
+        to_remove=("${installed_pkgs[0]}")
+        print_info "Found installed: ${installed_pkgs[0]}"
+    elif [[ "${#installed_pkgs[@]}" -gt 1 ]]; then
+        echo ""
+        print_section "Multiple BC-250 kernel variants installed"
+        local i
+        for i in "${!installed_pkgs[@]}"; do
+            print_item "$((i+1))" "${installed_pkgs[$i]}" ""
+        done
+        print_item "A" "All of the above" ""
+        echo ""
+        print_item "0" "Cancel" ""
+        echo ""
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Select which to remove:${RESET} ")" remove_choice
+        case "${remove_choice^^}" in
+            A) to_remove=("${installed_pkgs[@]}") ;;
+            0) print_info "Cancelled."; return 0 ;;
+            *)
+                if [[ "$remove_choice" =~ ^[0-9]+$ ]] && \
+                   (( remove_choice >= 1 && remove_choice <= ${#installed_pkgs[@]} )); then
+                    to_remove=("${installed_pkgs[$((remove_choice-1))]}")
+                else
+                    print_error "Invalid selection: '$remove_choice'"
+                    return 1
+                fi
+                ;;
+        esac
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}${RED}⚠  Only proceed if you have already rebooted into another kernel and confirmed it works.${RESET}"
+    echo ""
+
+    if [[ "${#to_remove[@]}" -gt 0 ]]; then
+        local -a full_pkg_list=()
+        for pkg in "${to_remove[@]}"; do
+            full_pkg_list+=("$pkg" "${pkg}-headers")
+        done
+        if ! confirm "Remove ${full_pkg_list[*]}?"; then
+            print_info "Cancelled."
+            return 0
+        fi
+        print_info "Removing ${full_pkg_list[*]}..."
+        if ! pacman -Rs --noconfirm "${full_pkg_list[@]}" 2>/dev/null; then
+            print_error "Failed to remove one or more packages — check pacman output above."
+            return 1
+        fi
+    fi
+
+    if bc250_kernel_repo_configured; then
+        local any_remaining=0
+        for pkg in "${BC250_KERNEL_VARIANT_PKGS[@]}"; do
+            pacman -Qq "$pkg" &>/dev/null && any_remaining=1
+        done
+        if [[ "$any_remaining" -eq 0 ]]; then
+            if confirm "No BC-250 kernel variants remain installed. Also remove the [$BC250_KERNEL_REPO_NAME] repository from $PACMAN_CONF? (This also removes access to its Mesa/Vulkan packages.)"; then
+                print_info "Removing [$BC250_KERNEL_REPO_NAME] repository from $PACMAN_CONF..."
+                sed -i "/^\[${BC250_KERNEL_REPO_NAME}\]$/,+2d" "$PACMAN_CONF"
+                print_info "Refreshing pacman databases..."
+                pacman -Syy || true
+            fi
+        else
+            print_info "Other BC-250 kernel variants remain installed — keeping the [$BC250_KERNEL_REPO_NAME] repository configured."
+        fi
+    fi
+
+    if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
+        bootloader_update || print_error "Boot config update failed — boot menu may need manual attention."
+    fi
+
+    print_success "BC-250 CachyOS kernel removed."
+}
+
+# ==============================================================================
 # CPU CORES UNLOCK — Step 1: Test Unlock (rw-r-r-0644/bc250-core-unlock)
 # ==============================================================================
 
@@ -4128,6 +4344,7 @@ show_revert_menu() {
     print_item  "7"  "Revert VRAM Ceiling"     "Remove ttm.pages_limit kernel param"
     print_item  "8"  "Revert ACPI Fix"         "Remove SSDT overrides & acpi_override hook"
     print_item  "9"  "Revert CPU Cores Unlock" "Remove UEFI boot entry & .efi file"
+    print_item  "10" "Revert BC-250 Kernel"    "Remove kernel & repo from pacman.conf"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -4149,6 +4366,7 @@ run_revert_menu() {
             7) run_revert_ttm_pages_limit;      press_enter ;;
             8) run_revert_acpi_fix;             press_enter ;;
             9) run_revert_cpu_cores_unlock_efi; press_enter ;;
+            10) run_revert_bc250_kernel;        press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
@@ -4225,6 +4443,7 @@ show_initial_setup_menu() {
     print_item  "10" "ACPI Fix"                "SSDT override + CPU governor control"
     print_item  "11" "BC-250 Memory Config"    "Configure VRAM size via bc250_memcfg"
     print_item  "12" "Remove Deckify Kernel"   "Verify new kernel boots first"
+    print_item  "13" "Install BC-250 Kernel"   "Standard, BORE, or RC — unsigned repo"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -4250,6 +4469,7 @@ run_initial_setup_menu() {
             10) run_acpi_menu ;;
             11) run_memcfg_menu ;;
             12) run_remove_deckify_kernel;    press_enter ;;
+            13) run_install_bc250_kernel;     press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$is_choice'"
