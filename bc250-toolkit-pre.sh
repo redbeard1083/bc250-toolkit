@@ -1647,7 +1647,7 @@ WPEOF
 run_revert_ac3_surround() {
     print_step "R-11" "Reverting HDMI AC-3 Surround Encoding"
 
-    if [[ ! -f "$AC3_UDEV_RULE" && ! -f "$AC3_WP_CONF" ]]; then
+    if [[ ! -f "$AC3_UDEV_RULE" && ! -f "$AC3_WP_CONF" && ! -f "$AC3_ACP_PROFILE_FILE" ]]; then
         print_info "AC-3 Surround Encoding is not installed — nothing to revert."
         return 0
     fi
@@ -1662,6 +1662,11 @@ run_revert_ac3_surround() {
     udevadm trigger /sys/class/sound/card0 2>/dev/null || true
 
     rm -f "$AC3_WP_CONF"
+
+    if [[ -f "$AC3_ACP_PROFILE_FILE" ]]; then
+        print_info "Removing $AC3_ACP_PROFILE_FILE..."
+        rm -f "$AC3_ACP_PROFILE_FILE"
+    fi
 
     ac3_run_as_user "systemctl --user restart wireplumber"
     sleep 3
