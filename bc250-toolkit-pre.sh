@@ -1379,6 +1379,393 @@ run_cpu_cores_unlock_menu() {
 }
 
 # ==============================================================================
+# HDMI AC-3 SURROUND ENCODING (5.1 Dolby Digital via ALSA a52 + WirePlumber ACP)
+# ==============================================================================
+
+AC3_UDEV_RULE="/etc/udev/rules.d/91-ac3-audio.rules"
+AC3_REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+AC3_WP_CONF_DIR="$AC3_REAL_HOME/.config/wireplumber/wireplumber.conf.d"
+AC3_WP_CONF="$AC3_WP_CONF_DIR/ac3-profile.conf"
+AC3_ACP_PROFILE_DIR="/usr/share/alsa-card-profile/mixer/profile-sets"
+AC3_ACP_PROFILE_FILE="$AC3_ACP_PROFILE_DIR/hdmi-ac3.conf"
+
+# Runs a command as the real user with the session bus/runtime dir it needs
+# for systemctl --user and pactl to work correctly from this root script.
+ac3_run_as_user() {
+    local cmd="$1"
+    local user_uid
+    user_uid=$(id -u "$REAL_USER")
+    sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$user_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$user_uid/bus" bash -c "$cmd"
+}
+
+# Creates hdmi-ac3.conf if it doesn't exist. On SteamOS this file ships with
+# the OS; on CachyOS/Arch it generally doesn't, so we create it ourselves with
+# the standard AC-3 profile mappings.
+ac3_create_hdmi_profile_set() {
+    if [[ -f "$AC3_ACP_PROFILE_FILE" ]]; then
+        return 0
+    fi
+
+    print_info "Creating $AC3_ACP_PROFILE_FILE (not found on this system)..."
+    mkdir -p "$AC3_ACP_PROFILE_DIR"
+
+    cat > "$AC3_ACP_PROFILE_FILE" << 'ACPEOF'
+; Profile set with HDMI/AC3 profiles.
+; Enables AC-3 (Dolby Digital) encoding via the ALSA a52 plugin.
+; The a52 plugin encodes 6-channel PCM to AC-3 in real-time using libavcodec.
+
+.include default.conf
+
+[Mapping hdmi-ac3-surround]
+description = Digital Surround 5.1 (HDMI/AC3)
+device-strings = plug:{SLAVE="a52:%f,'hw:%f,3'"}
+paths-output = hdmi-output-0
+channel-map = front-left,front-right,rear-left,rear-right,front-center,lfe
+priority = 1
+direction = output
+
+[Mapping hdmi-ac3-surround-extra1]
+description = Digital Surround 5.1 (HDMI 2/AC3)
+device-strings = plug:{SLAVE="a52:%f,'hw:%f,7'"}
+paths-output = hdmi-output-1
+channel-map = front-left,front-right,rear-left,rear-right,front-center,lfe
+priority = 1
+direction = output
+
+[Mapping hdmi-ac3-surround-extra2]
+description = Digital Surround 5.1 (HDMI 3/AC3)
+device-strings = plug:{SLAVE="a52:%f,'hw:%f,8'"}
+paths-output = hdmi-output-2
+channel-map = front-left,front-right,rear-left,rear-right,front-center,lfe
+priority = 1
+direction = output
+
+[Mapping hdmi-ac3-surround-extra3]
+description = Digital Surround 5.1 (HDMI 4/AC3)
+device-strings = plug:{SLAVE="a52:%f,'hw:%f,9'"}
+paths-output = hdmi-output-3
+channel-map = front-left,front-right,rear-left,rear-right,front-center,lfe
+priority = 1
+direction = output
+
+[Mapping hdmi-ac3-surround-extra4]
+description = Digital Surround 5.1 (HDMI 5/AC3)
+device-strings = plug:{SLAVE="a52:%f,'hw:%f,10'"}
+paths-output = hdmi-output-4
+channel-map = front-left,front-right,rear-left,rear-right,front-center,lfe
+priority = 1
+direction = output
+
+[Mapping hdmi-ac3-surround-extra5]
+description = Digital Surround 5.1 (HDMI 6/AC3)
+device-strings = plug:{SLAVE="a52:%f,'hw:%f,11'"}
+paths-output = hdmi-output-5
+channel-map = front-left,front-right,rear-left,rear-right,front-center,lfe
+priority = 1
+direction = output
+
+[Mapping hdmi-ac3-surround-extra6]
+description = Digital Surround 5.1 (HDMI 7/AC3)
+device-strings = plug:{SLAVE="a52:%f,'hw:%f,12'"}
+paths-output = hdmi-output-6
+channel-map = front-left,front-right,rear-left,rear-right,front-center,lfe
+priority = 1
+direction = output
+
+[Mapping hdmi-ac3-surround-extra7]
+description = Digital Surround 5.1 (HDMI 8/AC3)
+device-strings = plug:{SLAVE="a52:%f,'hw:%f,13'"}
+paths-output = hdmi-output-7
+channel-map = front-left,front-right,rear-left,rear-right,front-center,lfe
+priority = 1
+direction = output
+
+[Mapping hdmi-ac3-surround-extra8]
+description = Digital Surround 5.1 (HDMI 9/AC3)
+device-strings = plug:{SLAVE="a52:%f,'hw:%f,14'"}
+paths-output = hdmi-output-8
+channel-map = front-left,front-right,rear-left,rear-right,front-center,lfe
+priority = 1
+direction = output
+
+[Mapping hdmi-ac3-surround-extra9]
+description = Digital Surround 5.1 (HDMI 10/AC3)
+device-strings = plug:{SLAVE="a52:%f,'hw:%f,15'"}
+paths-output = hdmi-output-9
+channel-map = front-left,front-right,rear-left,rear-right,front-center,lfe
+priority = 1
+direction = output
+
+[Mapping hdmi-ac3-surround-extra10]
+description = Digital Surround 5.1 (HDMI 11/AC3)
+device-strings = plug:{SLAVE="a52:%f,'hw:%f,16'"}
+paths-output = hdmi-output-10
+channel-map = front-left,front-right,rear-left,rear-right,front-center,lfe
+priority = 1
+direction = output
+
+[Profile output:hdmi-ac3-surround]
+description = Digital Surround 5.1 (HDMI/AC3) Output
+output-mappings = hdmi-ac3-surround
+priority = 100
+skip-probe = no
+
+[Profile output:hdmi-ac3-surround-extra1]
+description = Digital Surround 5.1 (HDMI 2/AC3) Output
+output-mappings = hdmi-ac3-surround-extra1
+priority = 100
+skip-probe = no
+
+[Profile output:hdmi-ac3-surround-extra2]
+description = Digital Surround 5.1 (HDMI 3/AC3) Output
+output-mappings = hdmi-ac3-surround-extra2
+priority = 100
+skip-probe = no
+
+[Profile output:hdmi-ac3-surround-extra3]
+description = Digital Surround 5.1 (HDMI 4/AC3) Output
+output-mappings = hdmi-ac3-surround-extra3
+priority = 100
+skip-probe = no
+ACPEOF
+
+    print_info "Created hdmi-ac3.conf profile set."
+}
+
+run_install_ac3_surround() {
+    print_step "14" "Installing HDMI AC-3 Surround Encoding (Dolby Digital)"
+
+    echo -e "  ${DIM}Enables AC-3 (Dolby Digital) encoding over HDMI/DP for 5.1 surround${RESET}"
+    echo -e "  ${DIM}via eARC. Bypasses TV LPCM downmix — receiver gets true 5.1 DD.${RESET}"
+    echo -e "  ${DIM}Zero added latency, minimal CPU overhead (native a52 encoding).${RESET}"
+    echo -e "  ${DIM}After installing, select the AC-3 sink in your desktop audio settings.${RESET}"
+    echo ""
+
+    local -a missing=()
+    [[ -f /usr/lib/alsa-lib/libasound_module_pcm_a52.so ]] || missing+=("alsa-plugins")
+    compgen -G "/usr/lib/libavcodec.so*" >/dev/null || missing+=("ffmpeg")
+    if (( ${#missing[@]} > 0 )); then
+        print_info "Installing missing dependencies: ${missing[*]}"
+        if ! pacman -S --needed --noconfirm "${missing[@]}"; then
+            print_error "Failed to install dependencies: ${missing[*]}"
+            return 1
+        fi
+    fi
+
+    if ! grep -q -iE "hdmi|displayport|hda" /proc/asound/cards 2>/dev/null; then
+        print_error "No HDMI/DP audio hardware found in /proc/asound/cards."
+        return 1
+    fi
+
+    if ! confirm "Continue with AC-3 Surround Encoding installation?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    ac3_create_hdmi_profile_set
+
+    print_info "Installing udev rule for ACP_PROFILE_SET=hdmi-ac3.conf..."
+    echo 'SUBSYSTEM=="sound", KERNEL=="card0", ENV{ACP_PROFILE_SET}="hdmi-ac3.conf"' > "$AC3_UDEV_RULE"
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger /sys/class/sound/card0 2>/dev/null || true
+
+    print_info "Installing WirePlumber config for AC-3 profiles..."
+    mkdir -p "$AC3_WP_CONF_DIR"
+    cat > "$AC3_WP_CONF" << 'WPEOF'
+monitor.alsa.rules = [
+  {
+    matches = [
+      {
+        device.name = "~alsa_card.pci-.*"
+      }
+    ]
+    actions = {
+      update-props = {
+        api.acp.disable-pro-audio = true
+        device.profile-set = "hdmi-ac3.conf"
+        device.routes.default-sink-volume = 1.0
+      }
+    }
+  },
+  {
+    matches = [
+      {
+        node.name = "~alsa_output.pci-.*hdmi.*"
+      }
+    ]
+    actions = {
+      update-props = {
+        session.suspend-timeout-seconds = 3600
+      }
+    }
+  },
+  {
+    matches = [
+      {
+        node.name = "~alsa_output.pci-.*hdmi.*"
+        alsa.name = "~a52.*"
+      }
+    ]
+    actions = {
+      update-props = {
+        api.alsa.start-delay = 1536
+      }
+    }
+  }
+]
+WPEOF
+    chown -R "$REAL_USER":"$REAL_USER" "$AC3_WP_CONF_DIR" 2>/dev/null || true
+
+    print_info "Restarting WirePlumber and activating AC-3 output..."
+    ac3_run_as_user "systemctl --user restart wireplumber"
+    sleep 2
+
+    local card_name ac3_sink
+    card_name=$(ac3_run_as_user "pactl list cards short | awk '{print \$2}' | head -1")
+
+    if [[ -n "$card_name" ]]; then
+        ac3_run_as_user "pactl set-card-profile \"$card_name\" output:hdmi-ac3-surround" || true
+    fi
+
+    ac3_sink=$(ac3_run_as_user "pactl list sinks short | grep 'hdmi-ac3-surround' | awk '{print \$2}'")
+
+    if [[ -n "$ac3_sink" ]]; then
+        ac3_run_as_user "pactl set-default-sink \"$ac3_sink\""
+        print_success "AC-3 Surround Encoding installed!"
+        print_info "Active default sink:"
+        ac3_run_as_user "pactl get-default-sink"
+        echo ""
+        print_info "Your receiver should show Dolby Digital when audio plays."
+        print_info "The sink stays active for 1 hour after last sound to prevent PCM fallback."
+    else
+        print_error "AC-3 profile command executed, but no matching AC-3 sink was found."
+        print_info "Check available profiles with: pactl list cards"
+        return 1
+    fi
+}
+
+run_revert_ac3_surround() {
+    print_step "R-11" "Reverting HDMI AC-3 Surround Encoding"
+
+    if [[ ! -f "$AC3_UDEV_RULE" && ! -f "$AC3_WP_CONF" ]]; then
+        print_info "AC-3 Surround Encoding is not installed — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "This will restore the default HDMI stereo profile. Proceed?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    rm -f "$AC3_UDEV_RULE"
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger /sys/class/sound/card0 2>/dev/null || true
+
+    rm -f "$AC3_WP_CONF"
+
+    ac3_run_as_user "systemctl --user restart wireplumber"
+    sleep 3
+
+    local card_name stereo_sink
+    card_name=$(ac3_run_as_user "pactl list cards short | awk '{print \$2}' | head -1")
+
+    if [[ -n "$card_name" ]]; then
+        ac3_run_as_user "pactl set-card-profile \"$card_name\" output:hdmi-stereo" || true
+        sleep 1
+    fi
+
+    stereo_sink=$(ac3_run_as_user "pactl list sinks short | grep 'hdmi-stereo' | awk '{print \$2}'")
+    if [[ -n "$stereo_sink" ]]; then
+        ac3_run_as_user "pactl set-default-sink \"$stereo_sink\""
+    fi
+
+    print_success "AC-3 Surround Encoding reverted. HDMI stereo profile restored."
+}
+
+run_ac3_surround_status() {
+    print_step "14" "HDMI AC-3 Surround Encoding Status"
+    echo ""
+
+    if [[ -f "$AC3_UDEV_RULE" ]]; then
+        print_info "Udev rule: ${GREEN}installed${RESET} ($AC3_UDEV_RULE)"
+    else
+        print_info "Udev rule: ${DIM}not installed${RESET}"
+    fi
+
+    if [[ -f "$AC3_WP_CONF" ]]; then
+        print_info "WirePlumber config: ${GREEN}installed${RESET} ($AC3_WP_CONF)"
+    else
+        print_info "WirePlumber config: ${DIM}not installed${RESET}"
+    fi
+
+    if [[ -f "$AC3_ACP_PROFILE_FILE" ]]; then
+        print_info "ACP profile set: ${GREEN}present${RESET} ($AC3_ACP_PROFILE_FILE)"
+    else
+        print_info "ACP profile set: ${DIM}not found${RESET}"
+    fi
+
+    echo ""
+
+    local card_name active_profile default_sink ac3_profiles
+    card_name=$(ac3_run_as_user "pactl list cards short | awk '{print \$2}' | head -1")
+    if [[ -n "$card_name" ]]; then
+        active_profile=$(ac3_run_as_user "pactl list cards" | grep -A20 "Name: $card_name" | grep "Active Profile" | awk -F': ' '{print $2}')
+        print_info "Card: $card_name"
+        print_info "Active profile: ${active_profile:-unknown}"
+    else
+        print_error "No audio card found."
+    fi
+
+    default_sink=$(ac3_run_as_user "pactl get-default-sink" 2>/dev/null || true)
+    if [[ -n "$default_sink" ]]; then
+        print_info "Default sink: $default_sink"
+    fi
+
+    ac3_profiles=$(ac3_run_as_user "pactl list cards" 2>/dev/null | grep "hdmi-ac3" | head -5 || true)
+    if [[ -n "$ac3_profiles" ]]; then
+        echo ""
+        print_info "Available AC-3 profiles:"
+        echo "$ac3_profiles" | sed 's/^/    /'
+    fi
+}
+
+show_ac3_surround_menu() {
+    print_banner
+    print_section "5.1 Surround Sound (AC-3 over HDMI)"
+    echo -e "  ${DIM}Real-time Dolby Digital 5.1 encoding over HDMI/DP via the ALSA a52 plugin.${RESET}\n"
+    local status_label
+    if [[ -f "$AC3_UDEV_RULE" && -f "$AC3_WP_CONF" ]]; then
+        status_label="${GREEN}installed${RESET}"
+    else
+        status_label="${DIM}not installed${RESET}"
+    fi
+    echo -e "  ${CYAN}Status${RESET}  ${status_label}\n"
+    print_item "1" "Install 5.1 Surround Sound (AC-3)" "Enables Dolby Digital encoding over HDMI"
+    print_item "2" "Show Status"                       "Check current profile/sink state"
+    echo ""
+    print_item "0" "Back" ""
+    echo ""
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_ac3_surround_menu() {
+    while true; do
+        show_ac3_surround_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" ac3_choice
+
+        case "${ac3_choice^^}" in
+            1) run_install_ac3_surround; press_enter ;;
+            2) run_ac3_surround_status;  press_enter ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$ac3_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ==============================================================================
 # ACPI FIX (mendesrr/bc250-acpi-fix-updated-8c) + CPU GOVERNOR
 # ==============================================================================
 
@@ -4345,6 +4732,7 @@ show_revert_menu() {
     print_item  "8"  "Revert ACPI Fix"         "Remove SSDT overrides & acpi_override hook"
     print_item  "9"  "Revert CPU Cores Unlock" "Remove UEFI boot entry & .efi file"
     print_item  "10" "Revert BC-250 Kernel"    "Remove kernel & repo from pacman.conf"
+    print_item  "11" "Revert 5.1 Surround Sound" "Restore default HDMI stereo profile"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -4367,6 +4755,7 @@ run_revert_menu() {
             8) run_revert_acpi_fix;             press_enter ;;
             9) run_revert_cpu_cores_unlock_efi; press_enter ;;
             10) run_revert_bc250_kernel;        press_enter ;;
+            11) run_revert_ac3_surround;        press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
@@ -4444,6 +4833,7 @@ show_initial_setup_menu() {
     print_item  "11" "BC-250 Memory Config"    "Configure VRAM size via bc250_memcfg"
     print_item  "12" "Remove Deckify Kernel"   "Verify new kernel boots first"
     print_item  "13" "Install BC-250 Kernel"   "Standard, BORE, or RC — unsigned repo"
+    print_item  "14" "5.1 Surround Sound"      "AC-3 Dolby Digital encoding over HDMI"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -4470,6 +4860,7 @@ run_initial_setup_menu() {
             11) run_memcfg_menu ;;
             12) run_remove_deckify_kernel;    press_enter ;;
             13) run_install_bc250_kernel;     press_enter ;;
+            14) run_ac3_surround_menu ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$is_choice'"
