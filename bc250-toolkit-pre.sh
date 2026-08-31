@@ -136,8 +136,15 @@ if [[ "${1:-}" == "apply-service" ]] || [[ "${2:-}" == "apply-service" ]]; then
         cu_write_reg_bank "$CU_REG_SPI" "$(cu_hex_mask "${target_masks[$_idx]}")" "$_se" "$_sh"
         _union=$((_union | target_masks[_idx]))
     done
+    # Failing hard here (rather than warn-and-continue) is intentional: this
+    # is the write that protects unlocked WGPs from being power-gated back
+    # down when idle. If it doesn't take, dispatch routing can look correct
+    # while CUs still get gated away later — so a dropped RLC write is
+    # treated as a boot failure, which surfaces as
+    # 'systemctl is-failed bc250-cu-live-manager.service', instead of the
+    # unit silently reporting success.
     cu_try_write_reg_global "$CU_REG_RLC" "$(cu_hex_mask "$_union")" || \
-        cu_warn "could not write $CU_REG_RLC"
+        cu_die "could not write $CU_REG_RLC — WGP dispatch was set, but the always-on protection was not; CUs may get power-gated back down later."
 
     _total=0
     for _idx in 0 1 2 3; do
@@ -297,6 +304,11 @@ bootloader_update() {
             return 1
             ;;
     esac
+    # Bootloader regeneration can rewrite BootOrder and displace the
+    # CoreUnlock EFI entry (see cpu_unlock_efi_pin_first_in_boot_order for
+    # why). Re-assert it every time, regardless of which bootloader ran —
+    # this is a no-op if CoreUnlock isn't installed.
+    cpu_unlock_efi_pin_first_in_boot_order
 }
 
 bootloader_cmdline_var() {
@@ -1152,6 +1164,46 @@ CPU_UNLOCK_EFI_BIN_NAME="COREUNLOCK.EFI"
 
 cpu_unlock_efi_installed() {
     efibootmgr 2>/dev/null | grep -q "$CPU_UNLOCK_EFI_LABEL"
+}
+
+# Re-pins the CoreUnlock EFI boot entry to the front of BootOrder, preserving
+# the relative order of everything else. No-op if CoreUnlock isn't installed,
+# or if it's already first.
+#
+# Why this exists: efibootmgr --create typically prepends a new entry to
+# BootOrder, so CoreUnlock starts out first. But bootloader regeneration
+# tools (limine-update, grub-install, etc.) can rewrite BootOrder and put
+# their own entry — or the generic \EFI\BOOT\BOOTX64.EFI fallback — back in
+# front, silently bumping CoreUnlock out of the boot path. When that
+# happens, firmware boots straight past the unlock and the OS comes up at
+# the stock core count, with no error anywhere (the EFI binary genuinely
+# never runs, so there's nothing to log). Called from bootloader_update()
+# after every boot config regeneration so this can't silently drift.
+cpu_unlock_efi_pin_first_in_boot_order() {
+    cpu_unlock_efi_installed || return 0
+
+    local bootnum current_order
+    bootnum="$(efibootmgr | awk -v label="$CPU_UNLOCK_EFI_LABEL" '$0 ~ label {gsub(/[^0-9]/,"",$1); print $1; exit}')"
+    [[ -n "$bootnum" ]] || return 0
+
+    current_order="$(efibootmgr | awk -F': ' '/^BootOrder:/ {print $2}')"
+    [[ -n "$current_order" ]] || return 0
+
+    # Already first — nothing to do.
+    [[ "${current_order%%,*}" == "$bootnum" ]] && return 0
+
+    local new_order="$bootnum" entry
+    IFS=',' read -ra _bo_entries <<<"$current_order"
+    for entry in "${_bo_entries[@]}"; do
+        [[ "$entry" == "$bootnum" ]] && continue
+        new_order+=",$entry"
+    done
+
+    if efibootmgr -o "$new_order" >/dev/null 2>&1; then
+        print_info "Re-pinned '$CPU_UNLOCK_EFI_LABEL' to the front of BootOrder (was displaced by the boot config update)"
+    else
+        print_error "Could not update BootOrder to keep '$CPU_UNLOCK_EFI_LABEL' first — check manually with 'efibootmgr'"
+    fi
 }
 
 # Finds the EFI System Partition's mount point by checking common locations
@@ -4160,6 +4212,7 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+
     rm -f "$CU_OLD_UDEV_RULE"
     systemctl daemon-reload
     systemctl enable "$CU_SERVICE_NAME"
@@ -4179,6 +4232,10 @@ cu_uninstall_service() {
     systemctl disable --now "$CU_SERVICE_NAME" >/dev/null 2>&1 || true
     rm -f "$CU_SERVICE_PATH" "$CU_SERVICE_BIN" "/var/usrlocal/bin/bc250-cu-live-manager" \
           "$CU_SERVICE_CONF" "$CU_OLD_UDEV_RULE"
+    # Best-effort cleanup of the failure-capture service from older toolkit
+    # versions, in case it's still installed on this system.
+    systemctl disable "bc250-cu-failure-capture.service" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/bc250-cu-failure-capture.service" "/usr/local/bin/bc250-cu-failure-capture"
     systemctl daemon-reload
     cu_info "Boot service removed"
 }
