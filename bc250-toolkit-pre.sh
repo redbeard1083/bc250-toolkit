@@ -177,19 +177,19 @@ SKIP_LIMINE_UPDATE=0
 # COLORS & FORMATTING
 # ==============================================================================
 
-RESET="\e[0m"
-BOLD="\e[1m"
-DIM="\e[2m"
+RESET=$'\e[0m'
+BOLD=$'\e[1m'
+DIM=$'\e[2m'
 
-RED="\e[31m"
-GREEN="\e[32m"
-YELLOW="\e[33m"
-CYAN="\e[36m"
-WHITE="\e[97m"
-BLUE="\e[34m"
-MAGENTA="\e[35m"
+RED=$'\e[31m'
+GREEN=$'\e[32m'
+YELLOW=$'\e[33m'
+CYAN=$'\e[36m'
+WHITE=$'\e[97m'
+BLUE=$'\e[34m'
+MAGENTA=$'\e[35m'
 
-BG_HEADER="\e[48;5;235m"
+BG_HEADER=$'\e[48;5;235m'
 
 # ==============================================================================
 # HELPERS
@@ -952,44 +952,86 @@ run_install_bc250_kernel() {
     local target_headers="${target_pkg}-headers"
     local target_label="${BC250_KERNEL_VARIANT_LABELS[$idx]}"
 
+    local already_installed=0
     if pacman -Qq "$target_pkg" &>/dev/null; then
-        print_info "$target_pkg is already installed — skipping."
-        return 0
+        print_info "$target_pkg is already installed — skipping package installation."
+        already_installed=1
     fi
 
-    if ! bc250_kernel_repo_configured; then
-        print_info "Adding [$BC250_KERNEL_REPO_NAME] repository to $PACMAN_CONF..."
-        if [[ ! -f "${PACMAN_CONF}.bak" ]]; then
-            print_info "Creating original backup at ${PACMAN_CONF}.bak ..."
-            cp "$PACMAN_CONF" "${PACMAN_CONF}.bak"
+    echo ""
+    local enable_metrics_fix=0
+    if confirm "Add amdgpu.cs_legacy_8core_metrics=1 to the boot cmdline? Fixes scrambled GPU/APU telemetry on this kernel (only relevant if you monitor those sensors)."; then
+        enable_metrics_fix=1
+    fi
+
+    if [[ "$already_installed" -eq 0 ]]; then
+        if ! bc250_kernel_repo_configured; then
+            print_info "Adding [$BC250_KERNEL_REPO_NAME] repository to $PACMAN_CONF..."
+            if [[ ! -f "${PACMAN_CONF}.bak" ]]; then
+                print_info "Creating original backup at ${PACMAN_CONF}.bak ..."
+                cp "$PACMAN_CONF" "${PACMAN_CONF}.bak"
+            fi
+            # Insert above the first real repo section (e.g. [core]) rather than
+            # appending at the end. Pacman resolves same-named packages by
+            # first-listed-repo-wins, so putting bc250-cachyos below the stock
+            # repos would let a same-named stock package silently shadow ours.
+            # [options] isn't a repo section, so skip past it if present.
+            local repo_block insert_line
+            repo_block="$(printf '[%s]\nSigLevel = Optional TrustAll\nServer = %s\n' \
+                "$BC250_KERNEL_REPO_NAME" "$BC250_KERNEL_REPO_SERVER")"
+            insert_line="$(awk '/^\[options\]/{o=1;next} o && /^\[/{print NR; exit} !o && /^\[/{print NR; exit}' "$PACMAN_CONF")"
+            if [[ -n "$insert_line" ]]; then
+                awk -v line="$insert_line" -v block="$repo_block" \
+                    'NR==line{printf "%s\n\n", block} {print}' "$PACMAN_CONF" > "${PACMAN_CONF}.tmp" \
+                    && mv "${PACMAN_CONF}.tmp" "$PACMAN_CONF"
+            else
+                # No existing repo section found (unusual) — fall back to appending.
+                {
+                    echo ""
+                    printf '%s' "$repo_block"
+                } >> "$PACMAN_CONF"
+            fi
+        else
+            print_info "[$BC250_KERNEL_REPO_NAME] repository already configured — skipping."
         fi
-        {
-            echo ""
-            echo "[$BC250_KERNEL_REPO_NAME]"
-            echo "SigLevel = Optional TrustAll"
-            echo "Server = $BC250_KERNEL_REPO_SERVER"
-        } >> "$PACMAN_CONF"
-    else
-        print_info "[$BC250_KERNEL_REPO_NAME] repository already configured — skipping."
-    fi
 
-    print_info "Refreshing pacman databases..."
-    if ! pacman -Syy; then
-        print_error "Failed to refresh pacman databases — check the output above."
-        return 1
-    fi
-
-    print_info "Installing $target_pkg and $target_headers ($target_label)..."
-    if ! pacman -S --needed --noconfirm "$target_pkg" "$target_headers"; then
-        print_error "Failed to install the BC-250 kernel — check the output above."
-        return 1
-    fi
-
-    if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        if ! bootloader_update; then
-            print_error "Boot config update failed — you may need to update it manually before rebooting."
+        print_info "Refreshing pacman databases..."
+        if ! pacman -Syy; then
+            print_error "Failed to refresh pacman databases — check the output above."
             return 1
         fi
+
+        print_info "Installing $target_pkg and $target_headers ($target_label)..."
+        if ! pacman -S --needed --noconfirm "$target_pkg" "$target_headers"; then
+            print_error "Failed to install the BC-250 kernel — check the output above."
+            return 1
+        fi
+
+        if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
+            if ! bootloader_update; then
+                print_error "Boot config update failed — you may need to update it manually before rebooting."
+                return 1
+            fi
+        fi
+
+        # All three BC-250 kernel variants (Standard/BORE/RC) build the nct6687
+        # fan/sensor driver in-tree, but it isn't loaded automatically. Enable it
+        # at boot so fan/sensor readout works without a manual `modprobe` each time.
+        print_info "Enabling nct6687 fan/sensor driver at boot..."
+        if printf '%s\n' 'nct6687' > /etc/modules-load.d/nct6687.conf; then
+            print_success "nct6687 will load automatically on next boot."
+        else
+            print_error "Failed to write /etc/modules-load.d/nct6687.conf — enable the nct6687 module manually."
+        fi
+    fi
+
+    if [[ "$enable_metrics_fix" -eq 1 ]]; then
+        run_enable_cs_legacy_8core_metrics
+    fi
+
+    if [[ "$already_installed" -eq 1 ]]; then
+        print_success "Done."
+        return 0
     fi
 
     print_success "$target_label BC-250 CachyOS kernel installed successfully!"
@@ -1069,11 +1111,12 @@ run_revert_bc250_kernel() {
         fi
     fi
 
+    local any_remaining=0
+    for pkg in "${BC250_KERNEL_VARIANT_PKGS[@]}"; do
+        pacman -Qq "$pkg" &>/dev/null && any_remaining=1
+    done
+
     if bc250_kernel_repo_configured; then
-        local any_remaining=0
-        for pkg in "${BC250_KERNEL_VARIANT_PKGS[@]}"; do
-            pacman -Qq "$pkg" &>/dev/null && any_remaining=1
-        done
         if [[ "$any_remaining" -eq 0 ]]; then
             if confirm "No BC-250 kernel variants remain installed. Also remove the [$BC250_KERNEL_REPO_NAME] repository from $PACMAN_CONF? (This also removes access to its Mesa/Vulkan packages.)"; then
                 print_info "Removing [$BC250_KERNEL_REPO_NAME] repository from $PACMAN_CONF..."
@@ -1084,6 +1127,26 @@ run_revert_bc250_kernel() {
         else
             print_info "Other BC-250 kernel variants remain installed — keeping the [$BC250_KERNEL_REPO_NAME] repository configured."
         fi
+    fi
+
+    # nct6687 is built in-tree by the BC-250 kernel variants; if none remain
+    # installed, the running/fallback kernel likely won't have it, so remove
+    # the boot-time module load to avoid a harmless-but-confusing
+    # systemd-modules-load failure.
+    if [[ "$any_remaining" -eq 0 && -f /etc/modules-load.d/nct6687.conf ]]; then
+        print_info "Removing nct6687 boot-time module load (no BC-250 kernel variants remain)..."
+        rm -f /etc/modules-load.d/nct6687.conf
+    fi
+
+    # amdgpu.cs_legacy_8core_metrics=1 only does anything on the BC-250
+    # kernel's amdgpu build; if none remain installed, clean it up from the
+    # bootloader cmdline too so a stale, meaningless flag doesn't linger.
+    local KCONF
+    KCONF="$(bootloader_conf)"
+    if [[ "$any_remaining" -eq 0 && -n "$KCONF" && -f "$KCONF" ]] && \
+       grep -q 'amdgpu.cs_legacy_8core_metrics=1' "$KCONF"; then
+        print_info "Removing amdgpu.cs_legacy_8core_metrics=1 (no BC-250 kernel variants remain)..."
+        sed -i 's/ amdgpu.cs_legacy_8core_metrics=1//g' "$KCONF"
     fi
 
     if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
@@ -1428,6 +1491,71 @@ run_cpu_cores_unlock_menu() {
                 ;;
         esac
     done
+}
+
+# Checks whether any BC-250 CachyOS kernel variant package is installed.
+# amdgpu.cs_legacy_8core_metrics=1 only does anything on that kernel's
+# amdgpu build — its the one carrying the legacy-metrics patch. On any
+# other kernel (Deckify, stock CachyOS, etc.) the flag is simply ignored,
+# so this is required, not merely relevant.
+bc250_kernel_variant_installed() {
+    local pkg
+    for pkg in "${BC250_KERNEL_VARIANT_PKGS[@]}"; do
+        pacman -Qq "$pkg" &>/dev/null && return 0
+    done
+    return 1
+}
+
+# Kernel parameter fix for scrambled GPU/APU telemetry when running the
+# BC-250 CachyOS kernel. Stock firmware has no metrics table slot for some
+# of the extra-core data, so without this flag tools reading those sensors
+# get scrambled values instead of merely incomplete ones. Requires the
+# BC-250 kernel (option 13) — the flag is a no-op on any other kernel.
+run_enable_cs_legacy_8core_metrics() {
+    print_step "13b" "Enabling 8-Core Metrics Reporting"
+
+    if ! bc250_kernel_variant_installed; then
+        print_error "This requires the BC-250 CachyOS kernel — install it first via"
+        print_error "Initial Setup > Install BC-250 Kernel (option 13). The flag is a"
+        print_error "no-op on any other kernel."
+        return 1
+    fi
+
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
+
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
+        return 1
+    fi
+    print_info "Detected bootloader: $BOOTLOADER ($CONF)"
+
+    if [[ ! -f "${CONF}.bak" ]]; then
+        print_info "Creating original backup at ${CONF}.bak ..."
+        cp "$CONF" "${CONF}.bak"
+    else
+        print_info "Backup already exists at ${CONF}.bak — preserving original."
+    fi
+
+    if grep -q 'amdgpu.cs_legacy_8core_metrics=1' "$CONF"; then
+        print_info "amdgpu.cs_legacy_8core_metrics=1 already present — skipping."
+        return 0
+    fi
+
+    local cmdline_var cmdline_var_esc
+    cmdline_var="$(bootloader_cmdline_var)"
+    cmdline_var_esc="$(bootloader_cmdline_var_escaped)"
+    print_info "Adding amdgpu.cs_legacy_8core_metrics=1..."
+    sed -i "/^${cmdline_var_esc}/s/\"\$/ amdgpu.cs_legacy_8core_metrics=1\"/" "$CONF"
+
+    if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
+        bootloader_update
+    fi
+    print_success "amdgpu.cs_legacy_8core_metrics=1 added. Reboot to apply."
+    echo -e "  ${DIM}Corrects scrambled GPU/APU telemetry on the BC-250 kernel. Some sensor${RESET}"
+    echo -e "  ${DIM}slots still won't be reported — stock firmware has no table slot for them.${RESET}\n"
 }
 
 # ==============================================================================
@@ -3433,6 +3561,34 @@ run_revert_mitigations() {
     print_success "mitigations=off removed. Reboot to re-enable CPU security mitigations."
 }
 
+run_revert_cs_legacy_8core_metrics() {
+    local CONF
+    CONF="$(bootloader_conf)"
+    local BOOTLOADER
+    BOOTLOADER="$(detect_bootloader)"
+    print_step "R-12" "Revert 8-Core Metrics Fix"
+
+    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
+        print_error "Bootloader config not found. Supported: Limine, GRUB."
+        return 1
+    fi
+
+    if ! confirm "This will remove amdgpu.cs_legacy_8core_metrics=1 from $CONF. Proceed?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    if ! grep -q 'amdgpu.cs_legacy_8core_metrics=1' "$CONF"; then
+        print_info "amdgpu.cs_legacy_8core_metrics=1 not found — nothing to revert."
+        return 0
+    fi
+
+    print_info "Removing amdgpu.cs_legacy_8core_metrics=1..."
+    sed -i 's/ amdgpu.cs_legacy_8core_metrics=1//g' "$CONF"
+    bootloader_update
+    print_success "amdgpu.cs_legacy_8core_metrics=1 removed. Reboot to apply."
+}
+
 run_revert_ttm_pages_limit() {
     local CONF
     CONF="$(bootloader_conf)"
@@ -4795,6 +4951,7 @@ show_revert_menu() {
     print_item  "9"  "Revert CPU Cores Unlock" "Remove UEFI boot entry & .efi file"
     print_item  "10" "Revert BC-250 Kernel"    "Remove kernel & repo from pacman.conf"
     print_item  "11" "Revert 5.1 Surround Sound" "Restore default HDMI stereo profile"
+    print_item  "12" "Revert 8-Core Metrics Fix" "Remove amdgpu.cs_legacy_8core_metrics kernel param"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -4818,6 +4975,7 @@ run_revert_menu() {
             9) run_revert_cpu_cores_unlock_efi; press_enter ;;
             10) run_revert_bc250_kernel;        press_enter ;;
             11) run_revert_ac3_surround;        press_enter ;;
+            12) run_revert_cs_legacy_8core_metrics; press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
