@@ -1007,6 +1007,24 @@ run_install_bc250_kernel() {
             return 1
         fi
 
+        # The [$BC250_KERNEL_REPO_NAME] repo also ships updated Mesa/Vulkan
+        # packages alongside the kernel. Pacman has no "upgrade only from
+        # this repo" mode — pulling those in safely means a full system
+        # update, not a targeted install of just the mesa packages (that
+        # would be a partial upgrade, which risks a broken/inconsistent
+        # library state). Ask before running it since it can also update
+        # unrelated packages system-wide.
+        if confirm "Run a full system update now (pacman -Syu)? This also pulls the updated Mesa/Vulkan drivers from the [$BC250_KERNEL_REPO_NAME] repo."; then
+            print_info "Running full system update..."
+            if ! pacman -Syu --noconfirm; then
+                print_error "System update failed — check the output above. You can re-run 'pacman -Syu' manually later."
+            else
+                print_success "System update complete."
+            fi
+        else
+            print_info "Skipped system update — run 'pacman -Syu' manually later to get the updated Mesa/Vulkan drivers."
+        fi
+
         if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
             if ! bootloader_update; then
                 print_error "Boot config update failed — you may need to update it manually before rebooting."
