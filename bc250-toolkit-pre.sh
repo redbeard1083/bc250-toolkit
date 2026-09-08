@@ -1141,6 +1141,7 @@ run_revert_bc250_kernel() {
                 sed -i "/^\[${BC250_KERNEL_REPO_NAME}\]$/,+2d" "$PACMAN_CONF"
                 print_info "Refreshing pacman databases..."
                 pacman -Syy || true
+                run_revert_bc250_mesa
             fi
         else
             print_info "Other BC-250 kernel variants remain installed — keeping the [$BC250_KERNEL_REPO_NAME] repository configured."
@@ -1172,6 +1173,57 @@ run_revert_bc250_kernel() {
     fi
 
     print_success "BC-250 CachyOS kernel removed."
+}
+
+run_revert_bc250_mesa() {
+    print_step "R-13" "Revert Mesa/Vulkan to stock versions"
+
+    if bc250_kernel_repo_configured; then
+        print_error "[$BC250_KERNEL_REPO_NAME] repository is still configured — remove it first (Revert BC-250 Kernel) before reverting Mesa/Vulkan."
+        return 1
+    fi
+
+    # Pacman doesn't record which repo a package was installed from, so we
+    # can't just ask "what came from bc250-cachyos?". Instead, once that repo
+    # is gone from pacman.conf, we find every currently-installed
+    # mesa/vulkan-family package by name and reinstall it — pacman will now
+    # resolve each one against whatever repo remains configured (stock
+    # Arch/CachyOS), which is exactly the "back to the main version" result.
+    # Unlike 'pacman -Syu' (which only ever moves forward), a targeted
+    # 'pacman -S <pkg>' will happily install an older sync-db version over a
+    # newer installed one, which is what actually undoes the custom build.
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    local -a mesa_pkgs=()
+    mapfile -t mesa_pkgs < <(pacman -Qq | grep -E '^(lib32-)?(mesa|opencl-mesa|vulkan-)' || true)
+
+    if [[ "${#mesa_pkgs[@]}" -eq 0 ]]; then
+        print_info "No Mesa/Vulkan packages found installed — nothing to revert."
+        return 0
+    fi
+
+    echo ""
+    print_info "These installed packages will be reinstalled from your currently configured repos:"
+    printf '    %s\n' "${mesa_pkgs[@]}"
+    echo ""
+    if ! confirm "Proceed? Packages with no equivalent in a remaining repo (e.g. AUR-only -git/testing builds) will fail individually and can be removed manually afterward."; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Reinstalling Mesa/Vulkan packages from stock repos..."
+    if pacman -S --noconfirm "${mesa_pkgs[@]}"; then
+        print_success "Mesa/Vulkan packages reverted to your configured repos' versions."
+    else
+        print_error "One or more packages could not be reinstalled — check the output above."
+        print_info "This usually means a package (e.g. mesa-git, vulkan-radeon-testing) only ever existed in the [$BC250_KERNEL_REPO_NAME] repo and has no stock equivalent."
+        print_info "Remove those manually with 'pacman -R <pkg>' if you no longer want them, or reinstall the rest individually."
+        return 1
+    fi
 }
 
 # ==============================================================================
@@ -4970,6 +5022,7 @@ show_revert_menu() {
     print_item  "10" "Revert BC-250 Kernel"    "Remove kernel & repo from pacman.conf"
     print_item  "11" "Revert 5.1 Surround Sound" "Restore default HDMI stereo profile"
     print_item  "12" "Revert 8-Core Metrics Fix" "Remove amdgpu.cs_legacy_8core_metrics kernel param"
+    print_item  "13" "Revert Mesa/Vulkan"      "Reinstall Mesa/Vulkan from stock repos (repo must be removed first)"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -4994,6 +5047,7 @@ run_revert_menu() {
             10) run_revert_bc250_kernel;        press_enter ;;
             11) run_revert_ac3_surround;        press_enter ;;
             12) run_revert_cs_legacy_8core_metrics; press_enter ;;
+            13) run_revert_bc250_mesa;           press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
