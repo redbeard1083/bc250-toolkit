@@ -1165,6 +1165,31 @@ run_install_bc250_protonge() {
     print_success "protonge-latest-bc250 installed."
 }
 
+run_install_bc250_dual_audio() {
+    print_step "MR-7" "Install bc250-dual-audio"
+
+    bc250_repo_require || return 1
+
+    if pacman -Qq bc250-dual-audio &>/dev/null; then
+        print_info "bc250-dual-audio is already installed — skipping."
+        return 0
+    fi
+
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    print_info "Installing bc250-dual-audio..."
+    if ! pacman -S --needed --noconfirm bc250-dual-audio; then
+        print_error "Failed to install bc250-dual-audio — check the output above."
+        return 1
+    fi
+
+    print_success "bc250-dual-audio installed."
+}
+
 # Patches the cyan-skillfish-governor-smu config so GPU usage/frequency are
 # handled entirely by kernel-mode reporting instead of direct SMU access.
 # Only correct on a modified/patched BIOS + this repo's kernel, which expose
@@ -1275,6 +1300,7 @@ show_mastag_repo_menu() {
     print_item "4" "Install proton-cachyos-native-bc250" ""
     print_item "5" "Install protonge-latest-bc250"       ""
     print_item "6" "Patch GPU Config (Modified BIOS)"    "Switch cyan-skillfish-governor-smu to kernel mode"
+    print_item "7" "Install bc250-dual-audio"             ""
     echo ""
     print_item "0" "Back" ""
     echo ""
@@ -1293,6 +1319,7 @@ run_mastag_repo_menu() {
             4) run_install_bc250_proton_cachyos;           press_enter ;;
             5) run_install_bc250_protonge;                 press_enter ;;
             6) run_patch_bc250_gpu_config_modified_bios;   press_enter ;;
+            7) run_install_bc250_dual_audio;               press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$mr_choice'"
@@ -1530,6 +1557,28 @@ run_revert_bc250_protonge() {
     print_success "protonge-latest-bc250 removed."
 }
 
+run_revert_bc250_dual_audio() {
+    print_step "RMR-7" "Revert bc250-dual-audio"
+
+    if ! pacman -Qq bc250-dual-audio &>/dev/null; then
+        print_info "bc250-dual-audio is not installed — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "Remove bc250-dual-audio?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Removing bc250-dual-audio..."
+    if ! pacman -Rs --noconfirm bc250-dual-audio; then
+        print_error "Failed to remove bc250-dual-audio — check the output above."
+        return 1
+    fi
+
+    print_success "bc250-dual-audio removed."
+}
+
 show_revert_mastag_repo_menu() {
     print_banner
     print_section "Revert MastaG's Repo"
@@ -1547,6 +1596,7 @@ show_revert_mastag_repo_menu() {
     print_item "4" "Revert proton-cachyos-native-bc250" ""
     print_item "5" "Revert protonge-latest-bc250"       ""
     print_item "6" "Revert 8-Core Metrics Fix"          "Remove amdgpu.cs_legacy_8core_metrics kernel param"
+    print_item "7" "Revert bc250-dual-audio"            ""
     echo ""
     print_item "0" "Back" ""
     echo ""
@@ -1565,6 +1615,7 @@ run_revert_mastag_repo_menu() {
             4) run_revert_bc250_proton_cachyos;      press_enter ;;
             5) run_revert_bc250_protonge;            press_enter ;;
             6) run_revert_cs_legacy_8core_metrics;   press_enter ;;
+            7) run_revert_bc250_dual_audio;          press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$rmr_choice'"
