@@ -1546,6 +1546,7 @@ show_revert_mastag_repo_menu() {
     print_item "3" "Revert Mesa/Vulkan"                 "Reinstall from stock repos (repo must be removed first)"
     print_item "4" "Revert proton-cachyos-native-bc250" ""
     print_item "5" "Revert protonge-latest-bc250"       ""
+    print_item "6" "Revert 8-Core Metrics Fix"          "Remove amdgpu.cs_legacy_8core_metrics kernel param"
     echo ""
     print_item "0" "Back" ""
     echo ""
@@ -1558,11 +1559,12 @@ run_revert_mastag_repo_menu() {
         read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" rmr_choice
 
         case "${rmr_choice^^}" in
-            1) run_revert_bc250_repo;           press_enter ;;
-            2) run_revert_bc250_kernel;         press_enter ;;
-            3) run_revert_bc250_mesa;           press_enter ;;
-            4) run_revert_bc250_proton_cachyos; press_enter ;;
-            5) run_revert_bc250_protonge;       press_enter ;;
+            1) run_revert_bc250_repo;               press_enter ;;
+            2) run_revert_bc250_kernel;              press_enter ;;
+            3) run_revert_bc250_mesa;                press_enter ;;
+            4) run_revert_bc250_proton_cachyos;      press_enter ;;
+            5) run_revert_bc250_protonge;            press_enter ;;
+            6) run_revert_cs_legacy_8core_metrics;   press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$rmr_choice'"
