@@ -898,6 +898,19 @@ bc250_kernel_repo_configured() {
     grep -q "^\[${BC250_KERNEL_REPO_NAME}\]" "$PACMAN_CONF" 2>/dev/null
 }
 
+# Used by every task in the MastaG's Repo submenu except the repo install
+# itself — the repo is a hard prerequisite for kernel/mesa/proton installs,
+# but we don't auto-add it on their behalf; we point the user at the
+# dedicated "Install Repo" task instead so the repo add always happens
+# through one reviewable path.
+bc250_repo_require() {
+    if ! bc250_kernel_repo_configured; then
+        print_error "[$BC250_KERNEL_REPO_NAME] repository is not configured — run 'Install Repo' first (MastaG's Repo > option 1)."
+        return 1
+    fi
+    return 0
+}
+
 bc250_kernel_warn() {
     echo ""
     echo -e "  ${BOLD}${RED}⚠  WARNING: UNSIGNED THIRD-PARTY PACMAN REPOSITORY${RESET}"
@@ -918,10 +931,55 @@ bc250_kernel_warn() {
     [[ "${bc250_kernel_ack,,}" == "yes" ]]
 }
 
-run_install_bc250_kernel() {
-    print_step "13" "Installing BC-250 CachyOS Kernel"
+run_install_bc250_repo() {
+    print_step "MR-1" "Install Repo (MastaG's BC-250 CachyOS repo)"
+
+    if bc250_kernel_repo_configured; then
+        print_info "[$BC250_KERNEL_REPO_NAME] repository is already configured — skipping."
+        return 0
+    fi
 
     bc250_kernel_warn || { print_info "Cancelled."; return 0; }
+
+    print_info "Adding [$BC250_KERNEL_REPO_NAME] repository to $PACMAN_CONF..."
+    if [[ ! -f "${PACMAN_CONF}.bak" ]]; then
+        print_info "Creating original backup at ${PACMAN_CONF}.bak ..."
+        cp "$PACMAN_CONF" "${PACMAN_CONF}.bak"
+    fi
+    # Insert above the first real repo section (e.g. [core]) rather than
+    # appending at the end. Pacman resolves same-named packages by
+    # first-listed-repo-wins, so putting bc250-cachyos below the stock
+    # repos would let a same-named stock package silently shadow ours.
+    # [options] isn't a repo section, so skip past it if present.
+    local repo_block insert_line
+    repo_block="$(printf '[%s]\nSigLevel = Optional TrustAll\nServer = %s\n' \
+        "$BC250_KERNEL_REPO_NAME" "$BC250_KERNEL_REPO_SERVER")"
+    insert_line="$(awk '/^\[options\]/{o=1;next} o && /^\[/{print NR; exit} !o && /^\[/{print NR; exit}' "$PACMAN_CONF")"
+    if [[ -n "$insert_line" ]]; then
+        awk -v line="$insert_line" -v block="$repo_block" \
+            'NR==line{printf "%s\n\n", block} {print}' "$PACMAN_CONF" > "${PACMAN_CONF}.tmp" \
+            && mv "${PACMAN_CONF}.tmp" "$PACMAN_CONF"
+    else
+        # No existing repo section found (unusual) — fall back to appending.
+        {
+            echo ""
+            printf '%s' "$repo_block"
+        } >> "$PACMAN_CONF"
+    fi
+
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    print_success "[$BC250_KERNEL_REPO_NAME] repository installed."
+}
+
+run_install_bc250_kernel() {
+    print_step "MR-2" "Install Kernel"
+
+    bc250_repo_require || return 1
 
     echo ""
     print_section "Select Kernel Variant"
@@ -965,36 +1023,6 @@ run_install_bc250_kernel() {
     fi
 
     if [[ "$already_installed" -eq 0 ]]; then
-        if ! bc250_kernel_repo_configured; then
-            print_info "Adding [$BC250_KERNEL_REPO_NAME] repository to $PACMAN_CONF..."
-            if [[ ! -f "${PACMAN_CONF}.bak" ]]; then
-                print_info "Creating original backup at ${PACMAN_CONF}.bak ..."
-                cp "$PACMAN_CONF" "${PACMAN_CONF}.bak"
-            fi
-            # Insert above the first real repo section (e.g. [core]) rather than
-            # appending at the end. Pacman resolves same-named packages by
-            # first-listed-repo-wins, so putting bc250-cachyos below the stock
-            # repos would let a same-named stock package silently shadow ours.
-            # [options] isn't a repo section, so skip past it if present.
-            local repo_block insert_line
-            repo_block="$(printf '[%s]\nSigLevel = Optional TrustAll\nServer = %s\n' \
-                "$BC250_KERNEL_REPO_NAME" "$BC250_KERNEL_REPO_SERVER")"
-            insert_line="$(awk '/^\[options\]/{o=1;next} o && /^\[/{print NR; exit} !o && /^\[/{print NR; exit}' "$PACMAN_CONF")"
-            if [[ -n "$insert_line" ]]; then
-                awk -v line="$insert_line" -v block="$repo_block" \
-                    'NR==line{printf "%s\n\n", block} {print}' "$PACMAN_CONF" > "${PACMAN_CONF}.tmp" \
-                    && mv "${PACMAN_CONF}.tmp" "$PACMAN_CONF"
-            else
-                # No existing repo section found (unusual) — fall back to appending.
-                {
-                    echo ""
-                    printf '%s' "$repo_block"
-                } >> "$PACMAN_CONF"
-            fi
-        else
-            print_info "[$BC250_KERNEL_REPO_NAME] repository already configured — skipping."
-        fi
-
         print_info "Refreshing pacman databases..."
         if ! pacman -Syy; then
             print_error "Failed to refresh pacman databases — check the output above."
@@ -1005,24 +1033,6 @@ run_install_bc250_kernel() {
         if ! pacman -S --needed --noconfirm "$target_pkg" "$target_headers"; then
             print_error "Failed to install the BC-250 kernel — check the output above."
             return 1
-        fi
-
-        # The [$BC250_KERNEL_REPO_NAME] repo also ships updated Mesa/Vulkan
-        # packages alongside the kernel. Pacman has no "upgrade only from
-        # this repo" mode — pulling those in safely means a full system
-        # update, not a targeted install of just the mesa packages (that
-        # would be a partial upgrade, which risks a broken/inconsistent
-        # library state). Ask before running it since it can also update
-        # unrelated packages system-wide.
-        if confirm "Run a full system update now (pacman -Syu)? This also pulls the updated Mesa/Vulkan drivers from the [$BC250_KERNEL_REPO_NAME] repo."; then
-            print_info "Running full system update..."
-            if ! pacman -Syu --noconfirm; then
-                print_error "System update failed — check the output above. You can re-run 'pacman -Syu' manually later."
-            else
-                print_success "System update complete."
-            fi
-        else
-            print_info "Skipped system update — run 'pacman -Syu' manually later to get the updated Mesa/Vulkan drivers."
         fi
 
         if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
@@ -1064,8 +1074,177 @@ run_install_bc250_kernel() {
     echo -e "     special action is needed here going forward.${RESET}\n"
 }
 
+# The set of Mesa/Vulkan/OpenCL packages relevant to this AMD APU — deliberately
+# narrower than the repo's full published set (which mirrors every upstream
+# Mesa driver, including Intel/Nouveau/Broadcom/etc. that don't apply here).
+BC250_MESA_PKGS=(
+    "mesa" "lib32-mesa"
+    "vulkan-radeon" "lib32-vulkan-radeon"
+    "opencl-mesa" "lib32-opencl-mesa"
+    "vulkan-mesa-layers" "lib32-vulkan-mesa-layers"
+    "vulkan-mesa-implicit-layers" "lib32-vulkan-mesa-implicit-layers"
+)
+
+run_install_bc250_mesa() {
+    print_step "MR-3" "Install Mesa/Vulkan"
+
+    bc250_repo_require || return 1
+
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    echo ""
+    print_info "This installs the BC-250-patched Mesa/RADV build (mesh/task shaders,"
+    print_info "compute queue, GFX10.3 promotion) from [$BC250_KERNEL_REPO_NAME]:"
+    printf '    %s\n' "${BC250_MESA_PKGS[@]}"
+    echo ""
+    if ! confirm "Proceed? Note: pacman resolves each of these against whichever configured repo lists it, so if any stock package is somehow newer it may win instead."; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Installing ${BC250_MESA_PKGS[*]}..."
+    if ! pacman -S --needed --noconfirm "${BC250_MESA_PKGS[@]}"; then
+        print_error "Failed to install one or more Mesa/Vulkan packages — check the output above."
+        return 1
+    fi
+
+    print_success "Mesa/Vulkan installed from [$BC250_KERNEL_REPO_NAME]."
+}
+
+run_install_bc250_proton_cachyos() {
+    print_step "MR-4" "Install proton-cachyos-native-bc250"
+
+    bc250_repo_require || return 1
+
+    if pacman -Qq proton-cachyos-native-bc250 &>/dev/null; then
+        print_info "proton-cachyos-native-bc250 is already installed — skipping."
+        return 0
+    fi
+
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    print_info "Installing proton-cachyos-native-bc250..."
+    if ! pacman -S --needed --noconfirm proton-cachyos-native-bc250; then
+        print_error "Failed to install proton-cachyos-native-bc250 — check the output above."
+        return 1
+    fi
+
+    print_success "proton-cachyos-native-bc250 installed."
+}
+
+run_install_bc250_protonge() {
+    print_step "MR-5" "Install protonge-latest-bc250"
+
+    bc250_repo_require || return 1
+
+    if pacman -Qq protonge-latest-bc250 &>/dev/null; then
+        print_info "protonge-latest-bc250 is already installed — skipping."
+        return 0
+    fi
+
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    print_info "Installing protonge-latest-bc250..."
+    if ! pacman -S --needed --noconfirm protonge-latest-bc250; then
+        print_error "Failed to install protonge-latest-bc250 — check the output above."
+        return 1
+    fi
+
+    print_success "protonge-latest-bc250 installed."
+}
+
+show_mastag_repo_menu() {
+    print_banner
+    print_section "MastaG's Repo (linux-cachyos-bc250)"
+    echo -e "  ${DIM}BC-250-specific kernel, Mesa/Vulkan, and Proton builds — unsigned repo.${RESET}\n"
+    local repo_status
+    if bc250_kernel_repo_configured; then
+        repo_status="${GREEN}configured${RESET}"
+    else
+        repo_status="${DIM}not configured${RESET}"
+    fi
+    echo -e "  ${CYAN}Repo status${RESET}  ${repo_status}\n"
+    print_item "1" "Install Repo"                       "Prerequisite — adds [$BC250_KERNEL_REPO_NAME] to pacman.conf"
+    print_item "2" "Install Kernel"                      "Standard, BORE, or RC kernel variant"
+    print_item "3" "Install Mesa/Vulkan"                 "BC-250-patched Mesa/RADV build"
+    print_item "4" "Install proton-cachyos-native-bc250" ""
+    print_item "5" "Install protonge-latest-bc250"       ""
+    echo ""
+    print_item "0" "Back" ""
+    echo ""
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_mastag_repo_menu() {
+    while true; do
+        show_mastag_repo_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" mr_choice
+
+        case "${mr_choice^^}" in
+            1) run_install_bc250_repo;           press_enter ;;
+            2) run_install_bc250_kernel;         press_enter ;;
+            3) run_install_bc250_mesa;           press_enter ;;
+            4) run_install_bc250_proton_cachyos; press_enter ;;
+            5) run_install_bc250_protonge;       press_enter ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$mr_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+run_revert_bc250_repo() {
+    print_step "RMR-1" "Revert Repo (remove [$BC250_KERNEL_REPO_NAME])"
+
+    if ! bc250_kernel_repo_configured; then
+        print_info "[$BC250_KERNEL_REPO_NAME] repository is not configured — nothing to revert."
+        return 0
+    fi
+
+    local any_installed=0
+    local pkg
+    for pkg in "${BC250_KERNEL_VARIANT_PKGS[@]}" proton-cachyos-native-bc250 protonge-latest-bc250; do
+        pacman -Qq "$pkg" &>/dev/null && any_installed=1
+    done
+
+    if [[ "$any_installed" -eq 1 ]]; then
+        echo ""
+        echo -e "  ${BOLD}${YELLOW}⚠  Packages from this repo (kernel and/or Proton builds) are still installed.${RESET}"
+        echo -e "  ${WHITE}Removing the repo won't uninstall them, but they'll stop receiving updates"
+        echo -e "  through it. Consider reverting those first (Revert Kernel / Revert Proton) if"
+        echo -e "  you want a full removal.${RESET}"
+        echo ""
+    fi
+
+    if ! confirm "Remove the [$BC250_KERNEL_REPO_NAME] repository from $PACMAN_CONF?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Removing [$BC250_KERNEL_REPO_NAME] repository from $PACMAN_CONF..."
+    sed -i "/^\[${BC250_KERNEL_REPO_NAME}\]$/,+2d" "$PACMAN_CONF"
+    print_info "Refreshing pacman databases..."
+    pacman -Syy || true
+
+    print_success "[$BC250_KERNEL_REPO_NAME] repository removed."
+}
+
 run_revert_bc250_kernel() {
-    print_step "R-10" "Revert BC-250 CachyOS Kernel"
+    print_step "RMR-2" "Revert Kernel"
 
     local -a installed_pkgs=()
     local pkg
@@ -1073,7 +1252,7 @@ run_revert_bc250_kernel() {
         pacman -Qq "$pkg" &>/dev/null && installed_pkgs+=("$pkg")
     done
 
-    if [[ "${#installed_pkgs[@]}" -eq 0 ]] && ! bc250_kernel_repo_configured; then
+    if [[ "${#installed_pkgs[@]}" -eq 0 ]]; then
         print_info "No BC-250 CachyOS kernel variant appears to be installed — nothing to revert."
         return 0
     fi
@@ -1134,20 +1313,6 @@ run_revert_bc250_kernel() {
         pacman -Qq "$pkg" &>/dev/null && any_remaining=1
     done
 
-    if bc250_kernel_repo_configured; then
-        if [[ "$any_remaining" -eq 0 ]]; then
-            if confirm "No BC-250 kernel variants remain installed. Also remove the [$BC250_KERNEL_REPO_NAME] repository from $PACMAN_CONF? (This also removes access to its Mesa/Vulkan packages.)"; then
-                print_info "Removing [$BC250_KERNEL_REPO_NAME] repository from $PACMAN_CONF..."
-                sed -i "/^\[${BC250_KERNEL_REPO_NAME}\]$/,+2d" "$PACMAN_CONF"
-                print_info "Refreshing pacman databases..."
-                pacman -Syy || true
-                run_revert_bc250_mesa
-            fi
-        else
-            print_info "Other BC-250 kernel variants remain installed — keeping the [$BC250_KERNEL_REPO_NAME] repository configured."
-        fi
-    fi
-
     # nct6687 is built in-tree by the BC-250 kernel variants; if none remain
     # installed, the running/fallback kernel likely won't have it, so remove
     # the boot-time module load to avoid a harmless-but-confusing
@@ -1176,10 +1341,10 @@ run_revert_bc250_kernel() {
 }
 
 run_revert_bc250_mesa() {
-    print_step "R-13" "Revert Mesa/Vulkan to stock versions"
+    print_step "RMR-3" "Revert Mesa/Vulkan to stock versions"
 
     if bc250_kernel_repo_configured; then
-        print_error "[$BC250_KERNEL_REPO_NAME] repository is still configured — remove it first (Revert BC-250 Kernel) before reverting Mesa/Vulkan."
+        print_error "[$BC250_KERNEL_REPO_NAME] repository is still configured — remove it first (Revert Repo) before reverting Mesa/Vulkan."
         return 1
     fi
 
@@ -1224,6 +1389,92 @@ run_revert_bc250_mesa() {
         print_info "Remove those manually with 'pacman -R <pkg>' if you no longer want them, or reinstall the rest individually."
         return 1
     fi
+}
+
+run_revert_bc250_proton_cachyos() {
+    print_step "RMR-4" "Revert proton-cachyos-native-bc250"
+
+    if ! pacman -Qq proton-cachyos-native-bc250 &>/dev/null; then
+        print_info "proton-cachyos-native-bc250 is not installed — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "Remove proton-cachyos-native-bc250?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Removing proton-cachyos-native-bc250..."
+    if ! pacman -Rs --noconfirm proton-cachyos-native-bc250; then
+        print_error "Failed to remove proton-cachyos-native-bc250 — check the output above."
+        return 1
+    fi
+
+    print_success "proton-cachyos-native-bc250 removed."
+}
+
+run_revert_bc250_protonge() {
+    print_step "RMR-5" "Revert protonge-latest-bc250"
+
+    if ! pacman -Qq protonge-latest-bc250 &>/dev/null; then
+        print_info "protonge-latest-bc250 is not installed — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "Remove protonge-latest-bc250?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Removing protonge-latest-bc250..."
+    if ! pacman -Rs --noconfirm protonge-latest-bc250; then
+        print_error "Failed to remove protonge-latest-bc250 — check the output above."
+        return 1
+    fi
+
+    print_success "protonge-latest-bc250 removed."
+}
+
+show_revert_mastag_repo_menu() {
+    print_banner
+    print_section "Revert MastaG's Repo"
+    echo -e "  ${DIM}Undo kernel, Mesa/Vulkan, and Proton packages from [$BC250_KERNEL_REPO_NAME].${RESET}\n"
+    local repo_status
+    if bc250_kernel_repo_configured; then
+        repo_status="${GREEN}configured${RESET}"
+    else
+        repo_status="${DIM}not configured${RESET}"
+    fi
+    echo -e "  ${CYAN}Repo status${RESET}  ${repo_status}\n"
+    print_item "1" "Revert Repo"                       "Remove [$BC250_KERNEL_REPO_NAME] from pacman.conf"
+    print_item "2" "Revert Kernel"                      "Remove installed BC-250 kernel variant(s)"
+    print_item "3" "Revert Mesa/Vulkan"                 "Reinstall from stock repos (repo must be removed first)"
+    print_item "4" "Revert proton-cachyos-native-bc250" ""
+    print_item "5" "Revert protonge-latest-bc250"       ""
+    echo ""
+    print_item "0" "Back" ""
+    echo ""
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_revert_mastag_repo_menu() {
+    while true; do
+        show_revert_mastag_repo_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" rmr_choice
+
+        case "${rmr_choice^^}" in
+            1) run_revert_bc250_repo;           press_enter ;;
+            2) run_revert_bc250_kernel;         press_enter ;;
+            3) run_revert_bc250_mesa;           press_enter ;;
+            4) run_revert_bc250_proton_cachyos; press_enter ;;
+            5) run_revert_bc250_protonge;       press_enter ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$rmr_choice'"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 # ==============================================================================
@@ -1580,13 +1831,14 @@ bc250_kernel_variant_installed() {
 # BC-250 CachyOS kernel. Stock firmware has no metrics table slot for some
 # of the extra-core data, so without this flag tools reading those sensors
 # get scrambled values instead of merely incomplete ones. Requires the
-# BC-250 kernel (option 13) — the flag is a no-op on any other kernel.
+# BC-250 kernel (Initial Setup > MastaG's Repo > Install Kernel) — the flag
+# is a no-op on any other kernel.
 run_enable_cs_legacy_8core_metrics() {
     print_step "13b" "Enabling 8-Core Metrics Reporting"
 
     if ! bc250_kernel_variant_installed; then
         print_error "This requires the BC-250 CachyOS kernel — install it first via"
-        print_error "Initial Setup > Install BC-250 Kernel (option 13). The flag is a"
+        print_error "Initial Setup > MastaG's Repo > Install Kernel. The flag is a"
         print_error "no-op on any other kernel."
         return 1
     fi
@@ -5019,10 +5271,9 @@ show_revert_menu() {
     print_item  "7"  "Revert VRAM Ceiling"     "Remove ttm.pages_limit kernel param"
     print_item  "8"  "Revert ACPI Fix"         "Remove SSDT overrides & acpi_override hook"
     print_item  "9"  "Revert CPU Cores Unlock" "Remove UEFI boot entry & .efi file"
-    print_item  "10" "Revert BC-250 Kernel"    "Remove kernel & repo from pacman.conf"
+    print_item  "10" "Revert MastaG's Repo"   "Kernel, Mesa/Vulkan, Proton — submenu"
     print_item  "11" "Revert 5.1 Surround Sound" "Restore default HDMI stereo profile"
     print_item  "12" "Revert 8-Core Metrics Fix" "Remove amdgpu.cs_legacy_8core_metrics kernel param"
-    print_item  "13" "Revert Mesa/Vulkan"      "Reinstall Mesa/Vulkan from stock repos (repo must be removed first)"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -5044,10 +5295,9 @@ run_revert_menu() {
             7) run_revert_ttm_pages_limit;      press_enter ;;
             8) run_revert_acpi_fix;             press_enter ;;
             9) run_revert_cpu_cores_unlock_efi; press_enter ;;
-            10) run_revert_bc250_kernel;        press_enter ;;
+            10) run_revert_mastag_repo_menu ;;
             11) run_revert_ac3_surround;        press_enter ;;
             12) run_revert_cs_legacy_8core_metrics; press_enter ;;
-            13) run_revert_bc250_mesa;           press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
@@ -5124,7 +5374,7 @@ show_initial_setup_menu() {
     print_item  "10" "ACPI Fix"                "SSDT override + CPU governor control"
     print_item  "11" "BC-250 Memory Config"    "Configure VRAM size via bc250_memcfg"
     print_item  "12" "Remove Deckify Kernel"   "Verify new kernel boots first"
-    print_item  "13" "Install BC-250 Kernel"   "Standard, BORE, or RC — unsigned repo"
+    print_item  "13" "MastaG's Repo"          "Kernel, Mesa/Vulkan, Proton — unsigned repo"
     print_item  "14" "5.1 Surround Sound"      "AC-3 Dolby Digital encoding over HDMI"
     echo ""
     print_item  "0"  "Back"                    ""
@@ -5151,7 +5401,7 @@ run_initial_setup_menu() {
             10) run_acpi_menu ;;
             11) run_memcfg_menu ;;
             12) run_remove_deckify_kernel;    press_enter ;;
-            13) run_install_bc250_kernel;     press_enter ;;
+            13) run_mastag_repo_menu ;;
             14) run_ac3_surround_menu ;;
             0) return 0 ;;
             *)
