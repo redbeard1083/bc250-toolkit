@@ -1198,7 +1198,7 @@ run_install_bc250_dual_audio() {
 # available via the kernel, so the governor would be left unable to read
 # usage or set frequency correctly.
 run_patch_bc250_gpu_config_modified_bios() {
-    print_step "MR-6" "Patch GPU Config for Modified BIOS (kernel mode)"
+    print_step "MR-6" "Patch GPU Governor for Modified BIOS"
 
     if [[ ! -f "$GPU_DEST" ]]; then
         print_error "cyan-skillfish-governor-smu config not found at $GPU_DEST — install GPU Governor first (Initial Setup > GPU Governor)."
@@ -1299,8 +1299,8 @@ show_mastag_repo_menu() {
     print_item "3" "Install Mesa/Vulkan"                 "BC-250-patched Mesa/RADV build"
     print_item "4" "Install proton-cachyos-native-bc250" ""
     print_item "5" "Install protonge-latest-bc250"       ""
-    print_item "6" "Patch GPU Config (Modified BIOS)"    "Switch cyan-skillfish-governor-smu to kernel mode"
-    print_item "7" "Install bc250-dual-audio"             ""
+    print_item "6" "Patch GPU Governor for Modified BIOS" "Switches usage & frequency control from SMU to kernel-reported values"
+    print_item "7" "Install bc250-dual-audio"             "5.1 surround audio support"
     echo ""
     print_item "0" "Back" ""
     echo ""
@@ -1596,7 +1596,7 @@ show_revert_mastag_repo_menu() {
     print_item "4" "Revert proton-cachyos-native-bc250" ""
     print_item "5" "Revert protonge-latest-bc250"       ""
     print_item "6" "Revert 8-Core Metrics Fix"          "Remove amdgpu.cs_legacy_8core_metrics kernel param"
-    print_item "7" "Revert bc250-dual-audio"            ""
+    print_item "7" "Revert bc250-dual-audio"            "5.1 surround audio support"
     echo ""
     print_item "0" "Back" ""
     echo ""
