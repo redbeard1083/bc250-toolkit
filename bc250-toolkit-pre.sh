@@ -1165,6 +1165,99 @@ run_install_bc250_protonge() {
     print_success "protonge-latest-bc250 installed."
 }
 
+# Patches the cyan-skillfish-governor-smu config so GPU usage/frequency are
+# handled entirely by kernel-mode reporting instead of direct SMU access.
+# Only correct on a modified/patched BIOS + this repo's kernel, which expose
+# gpu_busy_percent and GPU Metrics natively (see "Included BC-250 patches" in
+# the linux-cachyos-bc250 README) — on stock BIOS/firmware this data isn't
+# available via the kernel, so the governor would be left unable to read
+# usage or set frequency correctly.
+run_patch_bc250_gpu_config_modified_bios() {
+    print_step "MR-6" "Patch GPU Config for Modified BIOS (kernel mode)"
+
+    if [[ ! -f "$GPU_DEST" ]]; then
+        print_error "cyan-skillfish-governor-smu config not found at $GPU_DEST — install GPU Governor first (Initial Setup > GPU Governor)."
+        return 1
+    fi
+
+    if ! bc250_kernel_variant_installed; then
+        echo ""
+        echo -e "  ${BOLD}${YELLOW}⚠  No BC-250 CachyOS kernel variant is currently installed.${RESET}"
+        echo -e "  ${WHITE}Kernel-mode GPU reporting depends on patches only present in that"
+        echo -e "  kernel — this will likely not work correctly without it.${RESET}"
+        echo ""
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}${YELLOW}⚠  This is for a modified/patched BIOS only.${RESET}"
+    echo -e "  ${WHITE}It switches the GPU governor from direct SMU access to kernel-mode"
+    echo -e "  usage/frequency reporting:${RESET}"
+    echo ""
+    echo -e "    ${CYAN}[gpu-usage]${RESET}"
+    echo -e "    fix-metrics = false"
+    echo -e "    fix-freq = false"
+    echo -e "    method = \"kernel\""
+    echo -e "    ${CYAN}[gpu]${RESET}"
+    echo -e "    set-method = \"kernel\""
+    echo ""
+    echo -e "  ${WHITE}Only apply this if your BIOS mod actually exposes kernel-mode GPU"
+    echo -e "  telemetry — applying it on a stock/unmodified BIOS may leave the"
+    echo -e "  governor unable to read GPU usage or set frequency correctly.${RESET}"
+    echo ""
+    if ! confirm "Proceed with patching $GPU_DEST for kernel mode?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Backing up current config to ${GPU_DEST}.bak..."
+    if ! cp "$GPU_DEST" "${GPU_DEST}.bak"; then
+        print_error "Failed to back up $GPU_DEST — aborting before making changes."
+        return 1
+    fi
+
+    # [gpu-usage] fix-metrics
+    if grep -q '^fix-metrics' "$GPU_DEST"; then
+        sed -i 's/^fix-metrics[[:space:]]*=.*/fix-metrics = false/' "$GPU_DEST"
+    else
+        print_error "Could not find 'fix-metrics' in $GPU_DEST — config doesn't match the expected layout. No changes applied beyond the backup."
+        return 1
+    fi
+
+    # [gpu-usage] fix-freq — update if present, otherwise insert right after
+    # fix-metrics (matching upstream's own layout, same as gpu_governor_apply_fix_freq).
+    if grep -q '^fix-freq' "$GPU_DEST"; then
+        sed -i 's/^fix-freq[[:space:]]*=.*/fix-freq = false/' "$GPU_DEST"
+    else
+        sed -i '/^fix-metrics/a fix-freq = false' "$GPU_DEST"
+    fi
+
+    # [gpu-usage] method — anchored so it can't accidentally match "set-method" below.
+    if grep -q '^method[[:space:]]*=' "$GPU_DEST"; then
+        sed -i 's/^method[[:space:]]*=.*/method = "kernel"/' "$GPU_DEST"
+    else
+        print_error "Could not find 'method' under [gpu-usage] in $GPU_DEST — config doesn't match the expected layout. Restore from ${GPU_DEST}.bak if needed."
+        return 1
+    fi
+
+    # [gpu] set-method
+    if grep -q '^set-method[[:space:]]*=' "$GPU_DEST"; then
+        sed -i 's/^set-method[[:space:]]*=.*/set-method = "kernel"/' "$GPU_DEST"
+    else
+        print_error "Could not find 'set-method' under [gpu] in $GPU_DEST — config doesn't match the expected layout. Restore from ${GPU_DEST}.bak if needed."
+        return 1
+    fi
+
+    print_info "Restarting $GPU_SERVICE..."
+    systemctl restart "$GPU_SERVICE"
+    if systemctl is-active --quiet "$GPU_SERVICE"; then
+        print_success "GPU config patched for kernel mode and service restarted successfully."
+    else
+        print_error "GPU service failed to start after patching! Check: journalctl -u $GPU_SERVICE"
+        print_info "Restore the previous config with: cp ${GPU_DEST}.bak $GPU_DEST && systemctl restart $GPU_SERVICE"
+        return 1
+    fi
+}
+
 show_mastag_repo_menu() {
     print_banner
     print_section "MastaG's Repo (linux-cachyos-bc250)"
@@ -1181,6 +1274,7 @@ show_mastag_repo_menu() {
     print_item "3" "Install Mesa/Vulkan"                 "BC-250-patched Mesa/RADV build"
     print_item "4" "Install proton-cachyos-native-bc250" ""
     print_item "5" "Install protonge-latest-bc250"       ""
+    print_item "6" "Patch GPU Config (Modified BIOS)"    "Switch cyan-skillfish-governor-smu to kernel mode"
     echo ""
     print_item "0" "Back" ""
     echo ""
@@ -1193,11 +1287,12 @@ run_mastag_repo_menu() {
         read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" mr_choice
 
         case "${mr_choice^^}" in
-            1) run_install_bc250_repo;           press_enter ;;
-            2) run_install_bc250_kernel;         press_enter ;;
-            3) run_install_bc250_mesa;           press_enter ;;
-            4) run_install_bc250_proton_cachyos; press_enter ;;
-            5) run_install_bc250_protonge;       press_enter ;;
+            1) run_install_bc250_repo;                    press_enter ;;
+            2) run_install_bc250_kernel;                  press_enter ;;
+            3) run_install_bc250_mesa;                     press_enter ;;
+            4) run_install_bc250_proton_cachyos;           press_enter ;;
+            5) run_install_bc250_protonge;                 press_enter ;;
+            6) run_patch_bc250_gpu_config_modified_bios;   press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$mr_choice'"
