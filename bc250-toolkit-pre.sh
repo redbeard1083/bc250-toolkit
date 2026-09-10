@@ -689,6 +689,26 @@ run_disable_zram_enable_zswap() {
         print_info "systemd.zram=0 added."
     fi
 
+    # The systemd.zram=0 cmdline flag alone doesn't stop the zram-generator
+    # from regenerating systemd-zram-setup@zram0.service on every boot —
+    # it'll keep retrying and failing (visible in dmesg). The unit has to be
+    # masked, not just disabled, or it comes right back.
+    if systemctl is-enabled systemd-zram-setup@zram0.service &>/dev/null || \
+       [[ "$(systemctl is-active systemd-zram-setup@zram0.service 2>/dev/null)" != "inactive" ]]; then
+        print_info "Stopping systemd-zram-setup@zram0.service..."
+        systemctl stop systemd-zram-setup@zram0.service 2>/dev/null || true
+    fi
+    if [[ "$(systemctl is-enabled systemd-zram-setup@zram0.service 2>/dev/null)" != "masked" ]]; then
+        print_info "Masking systemd-zram-setup@zram0.service..."
+        if systemctl mask systemd-zram-setup@zram0.service; then
+            print_info "systemd-zram-setup@zram0.service masked."
+        else
+            print_error "Failed to mask systemd-zram-setup@zram0.service — check the output above."
+        fi
+    else
+        print_info "systemd-zram-setup@zram0.service already masked — skipping."
+    fi
+
     # --- Enable ZSWAP ---
     if grep -q 'zswap\.enabled=1' "$CONF"; then
         print_info "ZSWAP already enabled in $CONF — skipping."
@@ -3599,6 +3619,17 @@ run_revert_zswap() {
         print_info "ZRAM re-enabled."
     else
         print_info "systemd.zram=0 not found — ZRAM already enabled."
+    fi
+
+    # Undo the mask from run_disable_zram_enable_zswap so the zram-generator
+    # can create and start the unit again on next boot.
+    if [[ "$(systemctl is-enabled systemd-zram-setup@zram0.service 2>/dev/null)" == "masked" ]]; then
+        print_info "Unmasking systemd-zram-setup@zram0.service..."
+        if systemctl unmask systemd-zram-setup@zram0.service; then
+            print_info "systemd-zram-setup@zram0.service unmasked."
+        else
+            print_error "Failed to unmask systemd-zram-setup@zram0.service — check the output above."
+        fi
     fi
 
     # --- Remove lz4 from initramfs ---
