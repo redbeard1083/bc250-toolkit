@@ -21,7 +21,8 @@ It does the following:
 10. Unlock CPU Cores: https://github.com/rw-r-r-0644/bc250-core-unlock , https://github.com/Hexxeh/bc250-efi-core-unlock
 11. Install ACPI Fix: https://github.com/mendesrr/bc250-acpi-fix-updated-8c
 12. Install custom BC-250 kernel: https://github.com/MastaG/linux-cachyos-bc250
-13. Enable 5.1 AC3 audio over DP/HDMI (pre-release): https://github.com/rpf16rj/bc250-steamos-real-toolkit/tree/main/extras/hdmi-ac3-encoding
+13. Enable 5.1 AC3 audio over DP/HDMI: https://github.com/rpf16rj/bc250-steamos-real-toolkit/tree/main/extras/hdmi-ac3-encoding
+14. Disable default CachyOS Handheld edition scheduler (~7-8% FPS boost in Cyperpunk 2077, for exmaple)(Thanks to oblique99 for pointing this out).
 
 In desktop mode run the below in the terminal(Konsole):
 <pre>
