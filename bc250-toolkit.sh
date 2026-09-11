@@ -5059,7 +5059,7 @@ dz_warn() {
 
 show_danger_zone_menu() {
     print_banner
-    print_section "⚠  Experimental/Danger Zone — Compute Units Unlock"
+    print_section "⚠  Compute Units Unlock"
     echo -e "  ${DIM}Direct hardware register access. Read the status dashboard before making changes.${RESET}\n"
     print_section "Prerequisites"
     print_item  "1"  "Install umr"              ""
