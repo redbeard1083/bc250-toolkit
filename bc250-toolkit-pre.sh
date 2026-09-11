@@ -5032,7 +5032,7 @@ cu_install_umr() {
 
 dz_warn() {
     echo ""
-    echo -e "  ${BOLD}${RED}⚠  EXPERIMENTAL / DANGER ZONE${RESET}"
+    echo -e "  ${BOLD}${RED}⚠  WARNING${RESET}"
     echo ""
     echo -e "  ${WHITE}This section gives direct access to low-level GPU hardware registers."
     echo -e "  Writing incorrect values can freeze the GPU, crash the system, or"
@@ -5625,9 +5625,11 @@ show_initial_setup_menu() {
     print_item  "10" "ACPI Fix"                "SSDT override + CPU governor control"
     print_item  "11" "BC-250 Memory Config"    "Configure VRAM size via bc250_memcfg"
     print_item  "12" "Remove Deckify Kernel"   "Verify new kernel boots first"
-    print_item  "13" "MastaG's Repo"          "Kernel, Mesa/Vulkan, Proton — unsigned repo"
-    print_item  "14" "5.1 Surround Sound"      "AC-3 Dolby Digital encoding over HDMI"
-    print_item  "15" "Disable Default Scheduler" "Stop & disable scx_loader — kernel falls back to BORE/EEVDF"
+    print_item  "13" "5.1 Surround Sound"      "AC-3 Dolby Digital encoding over HDMI"
+    print_item  "14" "Disable Default Scheduler" "Stop & disable scx_loader — kernel falls back to BORE/EEVDF"
+    echo ""
+    print_section "MastaG's Repo"
+    print_item  "15" "MastaG's Repo"          "Kernel, Mesa/Vulkan, Proton — unsigned repo"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -5653,9 +5655,9 @@ run_initial_setup_menu() {
             10) run_acpi_menu ;;
             11) run_memcfg_menu ;;
             12) run_remove_deckify_kernel;    press_enter ;;
-            13) run_mastag_repo_menu ;;
-            14) run_ac3_surround_menu ;;
-            15) run_disable_scx_default_scheduler; press_enter ;;
+            13) run_ac3_surround_menu ;;
+            14) run_disable_scx_default_scheduler; press_enter ;;
+            15) run_mastag_repo_menu ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$is_choice'"
