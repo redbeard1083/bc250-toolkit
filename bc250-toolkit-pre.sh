@@ -3729,6 +3729,48 @@ run_disable_mitigations() {
     echo -e "  ${DIM}Note: this disables Spectre/Meltdown mitigations for a performance gain.${RESET}\n"
 }
 
+# CachyOS ships sched-ext (scx_loader + scxctl), which can run a BPF scheduler
+# (e.g. scx_bpfland, scx_lavd) in place of the kernel's built-in scheduler
+# (BORE/EEVDF). This is the terminal equivalent of the SCX Manager GUI's
+# "Disable the current scheduler" button — but scoped to survive reboot:
+# 'scxctl stop' alone only stops the scheduler for this session; scx_loader
+# will load its configured default_sched again on next boot. Disabling the
+# service itself is what makes it stick.
+run_disable_scx_default_scheduler() {
+    print_step "15" "Disabling Default Scheduler (sched-ext)"
+
+    if ! command -v scxctl &>/dev/null; then
+        print_error "scxctl not found — install it first with: sudo pacman -S scx-tools"
+        return 1
+    fi
+
+    if ! systemctl list-unit-files scx_loader.service &>/dev/null; then
+        print_info "scx_loader.service not found — no sched-ext scheduler is configured. Nothing to disable."
+        return 0
+    fi
+
+    if systemctl is-active --quiet scx_loader.service; then
+        local current_sched
+        current_sched="$(scxctl get 2>/dev/null || echo unknown)"
+        print_info "Currently active: $current_sched"
+    else
+        print_info "scx_loader.service is not currently running."
+    fi
+
+    if ! confirm "Disable sched-ext and permanently stop scx_loader.service? The kernel's built-in scheduler (BORE/EEVDF) will take over, now and after reboot."; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Stopping and disabling scx_loader.service..."
+    if ! systemctl disable --now scx_loader.service; then
+        print_error "Failed to disable scx_loader.service — check the output above."
+        return 1
+    fi
+
+    print_success "sched-ext disabled — the kernel's built-in scheduler will be used, including after reboot."
+}
+
 run_status() {
     print_banner
     print_section "System Status"
@@ -4060,6 +4102,34 @@ run_revert_mitigations() {
     sed -i 's/ mitigations=off//g' "$CONF"
     bootloader_update
     print_success "mitigations=off removed. Reboot to re-enable CPU security mitigations."
+}
+
+run_revert_scx_default_scheduler() {
+    print_step "R-13" "Revert Disable Default Scheduler"
+
+    if ! systemctl list-unit-files scx_loader.service &>/dev/null; then
+        print_info "scx_loader.service not found — nothing to revert."
+        return 0
+    fi
+
+    if systemctl is-enabled --quiet scx_loader.service 2>/dev/null && \
+       systemctl is-active --quiet scx_loader.service; then
+        print_info "scx_loader.service is already enabled and running — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "Re-enable and start scx_loader.service, restoring sched-ext scheduling?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Enabling and starting scx_loader.service..."
+    if ! systemctl enable --now scx_loader.service; then
+        print_error "Failed to enable scx_loader.service — check the output above."
+        return 1
+    fi
+
+    print_success "sched-ext re-enabled — scx_loader will load the configured default scheduler again."
 }
 
 run_revert_cs_legacy_8core_metrics() {
@@ -5453,6 +5523,7 @@ show_revert_menu() {
     print_item  "10" "Revert MastaG's Repo"   "Kernel, Mesa/Vulkan, Proton — submenu"
     print_item  "11" "Revert 5.1 Surround Sound" "Restore default HDMI stereo profile"
     print_item  "12" "Revert 8-Core Metrics Fix" "Remove amdgpu.cs_legacy_8core_metrics kernel param"
+    print_item  "13" "Revert Disable Default Scheduler" "Re-enable scx_loader.service"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -5477,6 +5548,7 @@ run_revert_menu() {
             10) run_revert_mastag_repo_menu ;;
             11) run_revert_ac3_surround;        press_enter ;;
             12) run_revert_cs_legacy_8core_metrics; press_enter ;;
+            13) run_revert_scx_default_scheduler; press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
@@ -5555,6 +5627,7 @@ show_initial_setup_menu() {
     print_item  "12" "Remove Deckify Kernel"   "Verify new kernel boots first"
     print_item  "13" "MastaG's Repo"          "Kernel, Mesa/Vulkan, Proton — unsigned repo"
     print_item  "14" "5.1 Surround Sound"      "AC-3 Dolby Digital encoding over HDMI"
+    print_item  "15" "Disable Default Scheduler" "Stop & disable scx_loader — kernel falls back to BORE/EEVDF"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -5582,6 +5655,7 @@ run_initial_setup_menu() {
             12) run_remove_deckify_kernel;    press_enter ;;
             13) run_mastag_repo_menu ;;
             14) run_ac3_surround_menu ;;
+            15) run_disable_scx_default_scheduler; press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$is_choice'"
