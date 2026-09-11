@@ -689,6 +689,26 @@ run_disable_zram_enable_zswap() {
         print_info "systemd.zram=0 added."
     fi
 
+    # The systemd.zram=0 cmdline flag alone doesn't stop the zram-generator
+    # from regenerating systemd-zram-setup@zram0.service on every boot —
+    # it'll keep retrying and failing (visible in dmesg). The unit has to be
+    # masked, not just disabled, or it comes right back.
+    if systemctl is-enabled systemd-zram-setup@zram0.service &>/dev/null || \
+       [[ "$(systemctl is-active systemd-zram-setup@zram0.service 2>/dev/null)" != "inactive" ]]; then
+        print_info "Stopping systemd-zram-setup@zram0.service..."
+        systemctl stop systemd-zram-setup@zram0.service 2>/dev/null || true
+    fi
+    if [[ "$(systemctl is-enabled systemd-zram-setup@zram0.service 2>/dev/null)" != "masked" ]]; then
+        print_info "Masking systemd-zram-setup@zram0.service..."
+        if systemctl mask systemd-zram-setup@zram0.service; then
+            print_info "systemd-zram-setup@zram0.service masked."
+        else
+            print_error "Failed to mask systemd-zram-setup@zram0.service — check the output above."
+        fi
+    else
+        print_info "systemd-zram-setup@zram0.service already masked — skipping."
+    fi
+
     # --- Enable ZSWAP ---
     if grep -q 'zswap\.enabled=1' "$CONF"; then
         print_info "ZSWAP already enabled in $CONF — skipping."
@@ -898,6 +918,19 @@ bc250_kernel_repo_configured() {
     grep -q "^\[${BC250_KERNEL_REPO_NAME}\]" "$PACMAN_CONF" 2>/dev/null
 }
 
+# Used by every task in the MastaG's Repo submenu except the repo install
+# itself — the repo is a hard prerequisite for kernel/mesa/proton installs,
+# but we don't auto-add it on their behalf; we point the user at the
+# dedicated "Install Repo" task instead so the repo add always happens
+# through one reviewable path.
+bc250_repo_require() {
+    if ! bc250_kernel_repo_configured; then
+        print_error "[$BC250_KERNEL_REPO_NAME] repository is not configured — run 'Install Repo' first (MastaG's Repo > option 1)."
+        return 1
+    fi
+    return 0
+}
+
 bc250_kernel_warn() {
     echo ""
     echo -e "  ${BOLD}${RED}⚠  WARNING: UNSIGNED THIRD-PARTY PACMAN REPOSITORY${RESET}"
@@ -918,10 +951,55 @@ bc250_kernel_warn() {
     [[ "${bc250_kernel_ack,,}" == "yes" ]]
 }
 
-run_install_bc250_kernel() {
-    print_step "13" "Installing BC-250 CachyOS Kernel"
+run_install_bc250_repo() {
+    print_step "MR-1" "Install Repo (MastaG's BC-250 CachyOS repo)"
+
+    if bc250_kernel_repo_configured; then
+        print_info "[$BC250_KERNEL_REPO_NAME] repository is already configured — skipping."
+        return 0
+    fi
 
     bc250_kernel_warn || { print_info "Cancelled."; return 0; }
+
+    print_info "Adding [$BC250_KERNEL_REPO_NAME] repository to $PACMAN_CONF..."
+    if [[ ! -f "${PACMAN_CONF}.bak" ]]; then
+        print_info "Creating original backup at ${PACMAN_CONF}.bak ..."
+        cp "$PACMAN_CONF" "${PACMAN_CONF}.bak"
+    fi
+    # Insert above the first real repo section (e.g. [core]) rather than
+    # appending at the end. Pacman resolves same-named packages by
+    # first-listed-repo-wins, so putting bc250-cachyos below the stock
+    # repos would let a same-named stock package silently shadow ours.
+    # [options] isn't a repo section, so skip past it if present.
+    local repo_block insert_line
+    repo_block="$(printf '[%s]\nSigLevel = Optional TrustAll\nServer = %s\n' \
+        "$BC250_KERNEL_REPO_NAME" "$BC250_KERNEL_REPO_SERVER")"
+    insert_line="$(awk '/^\[options\]/{o=1;next} o && /^\[/{print NR; exit} !o && /^\[/{print NR; exit}' "$PACMAN_CONF")"
+    if [[ -n "$insert_line" ]]; then
+        awk -v line="$insert_line" -v block="$repo_block" \
+            'NR==line{printf "%s\n\n", block} {print}' "$PACMAN_CONF" > "${PACMAN_CONF}.tmp" \
+            && mv "${PACMAN_CONF}.tmp" "$PACMAN_CONF"
+    else
+        # No existing repo section found (unusual) — fall back to appending.
+        {
+            echo ""
+            printf '%s' "$repo_block"
+        } >> "$PACMAN_CONF"
+    fi
+
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    print_success "[$BC250_KERNEL_REPO_NAME] repository installed."
+}
+
+run_install_bc250_kernel() {
+    print_step "MR-2" "Install Kernel"
+
+    bc250_repo_require || return 1
 
     echo ""
     print_section "Select Kernel Variant"
@@ -965,36 +1043,6 @@ run_install_bc250_kernel() {
     fi
 
     if [[ "$already_installed" -eq 0 ]]; then
-        if ! bc250_kernel_repo_configured; then
-            print_info "Adding [$BC250_KERNEL_REPO_NAME] repository to $PACMAN_CONF..."
-            if [[ ! -f "${PACMAN_CONF}.bak" ]]; then
-                print_info "Creating original backup at ${PACMAN_CONF}.bak ..."
-                cp "$PACMAN_CONF" "${PACMAN_CONF}.bak"
-            fi
-            # Insert above the first real repo section (e.g. [core]) rather than
-            # appending at the end. Pacman resolves same-named packages by
-            # first-listed-repo-wins, so putting bc250-cachyos below the stock
-            # repos would let a same-named stock package silently shadow ours.
-            # [options] isn't a repo section, so skip past it if present.
-            local repo_block insert_line
-            repo_block="$(printf '[%s]\nSigLevel = Optional TrustAll\nServer = %s\n' \
-                "$BC250_KERNEL_REPO_NAME" "$BC250_KERNEL_REPO_SERVER")"
-            insert_line="$(awk '/^\[options\]/{o=1;next} o && /^\[/{print NR; exit} !o && /^\[/{print NR; exit}' "$PACMAN_CONF")"
-            if [[ -n "$insert_line" ]]; then
-                awk -v line="$insert_line" -v block="$repo_block" \
-                    'NR==line{printf "%s\n\n", block} {print}' "$PACMAN_CONF" > "${PACMAN_CONF}.tmp" \
-                    && mv "${PACMAN_CONF}.tmp" "$PACMAN_CONF"
-            else
-                # No existing repo section found (unusual) — fall back to appending.
-                {
-                    echo ""
-                    printf '%s' "$repo_block"
-                } >> "$PACMAN_CONF"
-            fi
-        else
-            print_info "[$BC250_KERNEL_REPO_NAME] repository already configured — skipping."
-        fi
-
         print_info "Refreshing pacman databases..."
         if ! pacman -Syy; then
             print_error "Failed to refresh pacman databases — check the output above."
@@ -1046,8 +1094,299 @@ run_install_bc250_kernel() {
     echo -e "     special action is needed here going forward.${RESET}\n"
 }
 
+# The set of Mesa/Vulkan/OpenCL packages relevant to this AMD APU — deliberately
+# narrower than the repo's full published set (which mirrors every upstream
+# Mesa driver, including Intel/Nouveau/Broadcom/etc. that don't apply here).
+BC250_MESA_PKGS=(
+    "mesa" "lib32-mesa"
+    "vulkan-radeon" "lib32-vulkan-radeon"
+    "opencl-mesa" "lib32-opencl-mesa"
+    "vulkan-mesa-layers" "lib32-vulkan-mesa-layers"
+    "vulkan-mesa-implicit-layers" "lib32-vulkan-mesa-implicit-layers"
+)
+
+run_install_bc250_mesa() {
+    print_step "MR-3" "Install Mesa/Vulkan"
+
+    bc250_repo_require || return 1
+
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    echo ""
+    print_info "This installs the BC-250-patched Mesa/RADV build (mesh/task shaders,"
+    print_info "compute queue, GFX10.3 promotion) from [$BC250_KERNEL_REPO_NAME]:"
+    printf '    %s\n' "${BC250_MESA_PKGS[@]}"
+    echo ""
+    if ! confirm "Proceed? Note: pacman resolves each of these against whichever configured repo lists it, so if any stock package is somehow newer it may win instead."; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Installing ${BC250_MESA_PKGS[*]}..."
+    if ! pacman -S --needed --noconfirm "${BC250_MESA_PKGS[@]}"; then
+        print_error "Failed to install one or more Mesa/Vulkan packages — check the output above."
+        return 1
+    fi
+
+    print_success "Mesa/Vulkan installed from [$BC250_KERNEL_REPO_NAME]."
+}
+
+run_install_bc250_proton_cachyos() {
+    print_step "MR-4" "Install proton-cachyos-native-bc250"
+
+    bc250_repo_require || return 1
+
+    if pacman -Qq proton-cachyos-native-bc250 &>/dev/null; then
+        print_info "proton-cachyos-native-bc250 is already installed — skipping."
+        return 0
+    fi
+
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    print_info "Installing proton-cachyos-native-bc250..."
+    if ! pacman -S --needed --noconfirm proton-cachyos-native-bc250; then
+        print_error "Failed to install proton-cachyos-native-bc250 — check the output above."
+        return 1
+    fi
+
+    print_success "proton-cachyos-native-bc250 installed."
+}
+
+run_install_bc250_protonge() {
+    print_step "MR-5" "Install protonge-latest-bc250"
+
+    bc250_repo_require || return 1
+
+    if pacman -Qq protonge-latest-bc250 &>/dev/null; then
+        print_info "protonge-latest-bc250 is already installed — skipping."
+        return 0
+    fi
+
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    print_info "Installing protonge-latest-bc250..."
+    if ! pacman -S --needed --noconfirm protonge-latest-bc250; then
+        print_error "Failed to install protonge-latest-bc250 — check the output above."
+        return 1
+    fi
+
+    print_success "protonge-latest-bc250 installed."
+}
+
+run_install_bc250_dual_audio() {
+    print_step "MR-7" "Install bc250-dual-audio"
+
+    bc250_repo_require || return 1
+
+    if pacman -Qq bc250-dual-audio &>/dev/null; then
+        print_info "bc250-dual-audio is already installed — skipping."
+        return 0
+    fi
+
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    print_info "Installing bc250-dual-audio..."
+    if ! pacman -S --needed --noconfirm bc250-dual-audio; then
+        print_error "Failed to install bc250-dual-audio — check the output above."
+        return 1
+    fi
+
+    print_success "bc250-dual-audio installed."
+}
+
+# Patches the cyan-skillfish-governor-smu config so GPU usage/frequency are
+# handled entirely by kernel-mode reporting instead of direct SMU access.
+# Only correct on a modified/patched BIOS + this repo's kernel, which expose
+# gpu_busy_percent and GPU Metrics natively (see "Included BC-250 patches" in
+# the linux-cachyos-bc250 README) — on stock BIOS/firmware this data isn't
+# available via the kernel, so the governor would be left unable to read
+# usage or set frequency correctly.
+run_patch_bc250_gpu_config_modified_bios() {
+    print_step "MR-6" "Patch GPU Governor for Modified BIOS"
+
+    if [[ ! -f "$GPU_DEST" ]]; then
+        print_error "cyan-skillfish-governor-smu config not found at $GPU_DEST — install GPU Governor first (Initial Setup > GPU Governor)."
+        return 1
+    fi
+
+    if ! bc250_kernel_variant_installed; then
+        echo ""
+        echo -e "  ${BOLD}${YELLOW}⚠  No BC-250 CachyOS kernel variant is currently installed.${RESET}"
+        echo -e "  ${WHITE}Kernel-mode GPU reporting depends on patches only present in that"
+        echo -e "  kernel — this will likely not work correctly without it.${RESET}"
+        echo ""
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}${YELLOW}⚠  This is for a modified/patched BIOS only.${RESET}"
+    echo -e "  ${WHITE}It switches the GPU governor from direct SMU access to kernel-mode"
+    echo -e "  usage/frequency reporting:${RESET}"
+    echo ""
+    echo -e "    ${CYAN}[gpu-usage]${RESET}"
+    echo -e "    fix-metrics = false"
+    echo -e "    fix-freq = false"
+    echo -e "    method = \"kernel\""
+    echo -e "    ${CYAN}[gpu]${RESET}"
+    echo -e "    set-method = \"kernel\""
+    echo ""
+    echo -e "  ${WHITE}Only apply this if your BIOS mod actually exposes kernel-mode GPU"
+    echo -e "  telemetry — applying it on a stock/unmodified BIOS may leave the"
+    echo -e "  governor unable to read GPU usage or set frequency correctly.${RESET}"
+    echo ""
+    if ! confirm "Proceed with patching $GPU_DEST for kernel mode?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Backing up current config to ${GPU_DEST}.bak..."
+    if ! cp "$GPU_DEST" "${GPU_DEST}.bak"; then
+        print_error "Failed to back up $GPU_DEST — aborting before making changes."
+        return 1
+    fi
+
+    # [gpu-usage] fix-metrics
+    if grep -q '^fix-metrics' "$GPU_DEST"; then
+        sed -i 's/^fix-metrics[[:space:]]*=.*/fix-metrics = false/' "$GPU_DEST"
+    else
+        print_error "Could not find 'fix-metrics' in $GPU_DEST — config doesn't match the expected layout. No changes applied beyond the backup."
+        return 1
+    fi
+
+    # [gpu-usage] fix-freq — update if present, otherwise insert right after
+    # fix-metrics (matching upstream's own layout, same as gpu_governor_apply_fix_freq).
+    if grep -q '^fix-freq' "$GPU_DEST"; then
+        sed -i 's/^fix-freq[[:space:]]*=.*/fix-freq = false/' "$GPU_DEST"
+    else
+        sed -i '/^fix-metrics/a fix-freq = false' "$GPU_DEST"
+    fi
+
+    # [gpu-usage] method — anchored so it can't accidentally match "set-method" below.
+    if grep -q '^method[[:space:]]*=' "$GPU_DEST"; then
+        sed -i 's/^method[[:space:]]*=.*/method = "kernel"/' "$GPU_DEST"
+    else
+        print_error "Could not find 'method' under [gpu-usage] in $GPU_DEST — config doesn't match the expected layout. Restore from ${GPU_DEST}.bak if needed."
+        return 1
+    fi
+
+    # [gpu] set-method
+    if grep -q '^set-method[[:space:]]*=' "$GPU_DEST"; then
+        sed -i 's/^set-method[[:space:]]*=.*/set-method = "kernel"/' "$GPU_DEST"
+    else
+        print_error "Could not find 'set-method' under [gpu] in $GPU_DEST — config doesn't match the expected layout. Restore from ${GPU_DEST}.bak if needed."
+        return 1
+    fi
+
+    print_info "Restarting $GPU_SERVICE..."
+    systemctl restart "$GPU_SERVICE"
+    if systemctl is-active --quiet "$GPU_SERVICE"; then
+        print_success "GPU config patched for kernel mode and service restarted successfully."
+    else
+        print_error "GPU service failed to start after patching! Check: journalctl -u $GPU_SERVICE"
+        print_info "Restore the previous config with: cp ${GPU_DEST}.bak $GPU_DEST && systemctl restart $GPU_SERVICE"
+        return 1
+    fi
+}
+
+show_mastag_repo_menu() {
+    print_banner
+    print_section "MastaG's Repo (linux-cachyos-bc250)"
+    echo -e "  ${DIM}BC-250-specific kernel, Mesa/Vulkan, and Proton builds — unsigned repo.${RESET}\n"
+    local repo_status
+    if bc250_kernel_repo_configured; then
+        repo_status="${GREEN}configured${RESET}"
+    else
+        repo_status="${DIM}not configured${RESET}"
+    fi
+    echo -e "  ${CYAN}Repo status${RESET}  ${repo_status}\n"
+    print_item "1" "Install Repo"                       "Prerequisite — adds [$BC250_KERNEL_REPO_NAME] to pacman.conf"
+    print_item "2" "Install Kernel"                      "Standard, BORE, or RC kernel variant"
+    print_item "3" "Install Mesa/Vulkan"                 "BC-250-patched Mesa/RADV build"
+    print_item "4" "Install proton-cachyos-native-bc250" ""
+    print_item "5" "Install protonge-latest-bc250"       ""
+    print_item "6" "Patch GPU Governor for Modified BIOS" "Switches usage & frequency control from SMU to kernel-reported values"
+    print_item "7" "Install bc250-dual-audio"             "5.1 surround audio support"
+    echo ""
+    print_item "0" "Back" ""
+    echo ""
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_mastag_repo_menu() {
+    while true; do
+        show_mastag_repo_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" mr_choice
+
+        case "${mr_choice^^}" in
+            1) run_install_bc250_repo;                    press_enter ;;
+            2) run_install_bc250_kernel;                  press_enter ;;
+            3) run_install_bc250_mesa;                     press_enter ;;
+            4) run_install_bc250_proton_cachyos;           press_enter ;;
+            5) run_install_bc250_protonge;                 press_enter ;;
+            6) run_patch_bc250_gpu_config_modified_bios;   press_enter ;;
+            7) run_install_bc250_dual_audio;               press_enter ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$mr_choice'"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+run_revert_bc250_repo() {
+    print_step "RMR-1" "Revert Repo (remove [$BC250_KERNEL_REPO_NAME])"
+
+    if ! bc250_kernel_repo_configured; then
+        print_info "[$BC250_KERNEL_REPO_NAME] repository is not configured — nothing to revert."
+        return 0
+    fi
+
+    local any_installed=0
+    local pkg
+    for pkg in "${BC250_KERNEL_VARIANT_PKGS[@]}" proton-cachyos-native-bc250 protonge-latest-bc250; do
+        pacman -Qq "$pkg" &>/dev/null && any_installed=1
+    done
+
+    if [[ "$any_installed" -eq 1 ]]; then
+        echo ""
+        echo -e "  ${BOLD}${YELLOW}⚠  Packages from this repo (kernel and/or Proton builds) are still installed.${RESET}"
+        echo -e "  ${WHITE}Removing the repo won't uninstall them, but they'll stop receiving updates"
+        echo -e "  through it. Consider reverting those first (Revert Kernel / Revert Proton) if"
+        echo -e "  you want a full removal.${RESET}"
+        echo ""
+    fi
+
+    if ! confirm "Remove the [$BC250_KERNEL_REPO_NAME] repository from $PACMAN_CONF?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Removing [$BC250_KERNEL_REPO_NAME] repository from $PACMAN_CONF..."
+    sed -i "/^\[${BC250_KERNEL_REPO_NAME}\]$/,+2d" "$PACMAN_CONF"
+    print_info "Refreshing pacman databases..."
+    pacman -Syy || true
+
+    print_success "[$BC250_KERNEL_REPO_NAME] repository removed."
+}
+
 run_revert_bc250_kernel() {
-    print_step "R-10" "Revert BC-250 CachyOS Kernel"
+    print_step "RMR-2" "Revert Kernel"
 
     local -a installed_pkgs=()
     local pkg
@@ -1055,7 +1394,7 @@ run_revert_bc250_kernel() {
         pacman -Qq "$pkg" &>/dev/null && installed_pkgs+=("$pkg")
     done
 
-    if [[ "${#installed_pkgs[@]}" -eq 0 ]] && ! bc250_kernel_repo_configured; then
+    if [[ "${#installed_pkgs[@]}" -eq 0 ]]; then
         print_info "No BC-250 CachyOS kernel variant appears to be installed — nothing to revert."
         return 0
     fi
@@ -1116,19 +1455,6 @@ run_revert_bc250_kernel() {
         pacman -Qq "$pkg" &>/dev/null && any_remaining=1
     done
 
-    if bc250_kernel_repo_configured; then
-        if [[ "$any_remaining" -eq 0 ]]; then
-            if confirm "No BC-250 kernel variants remain installed. Also remove the [$BC250_KERNEL_REPO_NAME] repository from $PACMAN_CONF? (This also removes access to its Mesa/Vulkan packages.)"; then
-                print_info "Removing [$BC250_KERNEL_REPO_NAME] repository from $PACMAN_CONF..."
-                sed -i "/^\[${BC250_KERNEL_REPO_NAME}\]$/,+2d" "$PACMAN_CONF"
-                print_info "Refreshing pacman databases..."
-                pacman -Syy || true
-            fi
-        else
-            print_info "Other BC-250 kernel variants remain installed — keeping the [$BC250_KERNEL_REPO_NAME] repository configured."
-        fi
-    fi
-
     # nct6687 is built in-tree by the BC-250 kernel variants; if none remain
     # installed, the running/fallback kernel likely won't have it, so remove
     # the boot-time module load to avoid a harmless-but-confusing
@@ -1154,6 +1480,169 @@ run_revert_bc250_kernel() {
     fi
 
     print_success "BC-250 CachyOS kernel removed."
+}
+
+run_revert_bc250_mesa() {
+    print_step "RMR-3" "Revert Mesa/Vulkan to stock versions"
+
+    if bc250_kernel_repo_configured; then
+        print_error "[$BC250_KERNEL_REPO_NAME] repository is still configured — remove it first (Revert Repo) before reverting Mesa/Vulkan."
+        return 1
+    fi
+
+    # Pacman doesn't record which repo a package was installed from, so we
+    # can't just ask "what came from bc250-cachyos?". Instead, once that repo
+    # is gone from pacman.conf, we find every currently-installed
+    # mesa/vulkan-family package by name and reinstall it — pacman will now
+    # resolve each one against whatever repo remains configured (stock
+    # Arch/CachyOS), which is exactly the "back to the main version" result.
+    # Unlike 'pacman -Syu' (which only ever moves forward), a targeted
+    # 'pacman -S <pkg>' will happily install an older sync-db version over a
+    # newer installed one, which is what actually undoes the custom build.
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    local -a mesa_pkgs=()
+    mapfile -t mesa_pkgs < <(pacman -Qq | grep -E '^(lib32-)?(mesa|opencl-mesa|vulkan-)' || true)
+
+    if [[ "${#mesa_pkgs[@]}" -eq 0 ]]; then
+        print_info "No Mesa/Vulkan packages found installed — nothing to revert."
+        return 0
+    fi
+
+    echo ""
+    print_info "These installed packages will be reinstalled from your currently configured repos:"
+    printf '    %s\n' "${mesa_pkgs[@]}"
+    echo ""
+    if ! confirm "Proceed? Packages with no equivalent in a remaining repo (e.g. AUR-only -git/testing builds) will fail individually and can be removed manually afterward."; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Reinstalling Mesa/Vulkan packages from stock repos..."
+    if pacman -S --noconfirm "${mesa_pkgs[@]}"; then
+        print_success "Mesa/Vulkan packages reverted to your configured repos' versions."
+    else
+        print_error "One or more packages could not be reinstalled — check the output above."
+        print_info "This usually means a package (e.g. mesa-git, vulkan-radeon-testing) only ever existed in the [$BC250_KERNEL_REPO_NAME] repo and has no stock equivalent."
+        print_info "Remove those manually with 'pacman -R <pkg>' if you no longer want them, or reinstall the rest individually."
+        return 1
+    fi
+}
+
+run_revert_bc250_proton_cachyos() {
+    print_step "RMR-4" "Revert proton-cachyos-native-bc250"
+
+    if ! pacman -Qq proton-cachyos-native-bc250 &>/dev/null; then
+        print_info "proton-cachyos-native-bc250 is not installed — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "Remove proton-cachyos-native-bc250?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Removing proton-cachyos-native-bc250..."
+    if ! pacman -Rs --noconfirm proton-cachyos-native-bc250; then
+        print_error "Failed to remove proton-cachyos-native-bc250 — check the output above."
+        return 1
+    fi
+
+    print_success "proton-cachyos-native-bc250 removed."
+}
+
+run_revert_bc250_protonge() {
+    print_step "RMR-5" "Revert protonge-latest-bc250"
+
+    if ! pacman -Qq protonge-latest-bc250 &>/dev/null; then
+        print_info "protonge-latest-bc250 is not installed — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "Remove protonge-latest-bc250?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Removing protonge-latest-bc250..."
+    if ! pacman -Rs --noconfirm protonge-latest-bc250; then
+        print_error "Failed to remove protonge-latest-bc250 — check the output above."
+        return 1
+    fi
+
+    print_success "protonge-latest-bc250 removed."
+}
+
+run_revert_bc250_dual_audio() {
+    print_step "RMR-7" "Revert bc250-dual-audio"
+
+    if ! pacman -Qq bc250-dual-audio &>/dev/null; then
+        print_info "bc250-dual-audio is not installed — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "Remove bc250-dual-audio?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Removing bc250-dual-audio..."
+    if ! pacman -Rs --noconfirm bc250-dual-audio; then
+        print_error "Failed to remove bc250-dual-audio — check the output above."
+        return 1
+    fi
+
+    print_success "bc250-dual-audio removed."
+}
+
+show_revert_mastag_repo_menu() {
+    print_banner
+    print_section "Revert MastaG's Repo"
+    echo -e "  ${DIM}Undo kernel, Mesa/Vulkan, and Proton packages from [$BC250_KERNEL_REPO_NAME].${RESET}\n"
+    local repo_status
+    if bc250_kernel_repo_configured; then
+        repo_status="${GREEN}configured${RESET}"
+    else
+        repo_status="${DIM}not configured${RESET}"
+    fi
+    echo -e "  ${CYAN}Repo status${RESET}  ${repo_status}\n"
+    print_item "1" "Revert Repo"                       "Remove [$BC250_KERNEL_REPO_NAME] from pacman.conf"
+    print_item "2" "Revert Kernel"                      "Remove installed BC-250 kernel variant(s)"
+    print_item "3" "Revert Mesa/Vulkan"                 "Reinstall from stock repos (repo must be removed first)"
+    print_item "4" "Revert proton-cachyos-native-bc250" ""
+    print_item "5" "Revert protonge-latest-bc250"       ""
+    print_item "6" "Revert 8-Core Metrics Fix"          "Remove amdgpu.cs_legacy_8core_metrics kernel param"
+    print_item "7" "Revert bc250-dual-audio"            "5.1 surround audio support"
+    echo ""
+    print_item "0" "Back" ""
+    echo ""
+    echo -e "  ${BOLD}${CYAN}═════════════════════════════════════════════════════════════════════${RESET}"
+}
+
+run_revert_mastag_repo_menu() {
+    while true; do
+        show_revert_mastag_repo_menu
+        read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" rmr_choice
+
+        case "${rmr_choice^^}" in
+            1) run_revert_bc250_repo;               press_enter ;;
+            2) run_revert_bc250_kernel;              press_enter ;;
+            3) run_revert_bc250_mesa;                press_enter ;;
+            4) run_revert_bc250_proton_cachyos;      press_enter ;;
+            5) run_revert_bc250_protonge;            press_enter ;;
+            6) run_revert_cs_legacy_8core_metrics;   press_enter ;;
+            7) run_revert_bc250_dual_audio;          press_enter ;;
+            0) return 0 ;;
+            *)
+                print_error "Invalid selection: '$rmr_choice'"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 # ==============================================================================
@@ -1510,13 +1999,14 @@ bc250_kernel_variant_installed() {
 # BC-250 CachyOS kernel. Stock firmware has no metrics table slot for some
 # of the extra-core data, so without this flag tools reading those sensors
 # get scrambled values instead of merely incomplete ones. Requires the
-# BC-250 kernel (option 13) — the flag is a no-op on any other kernel.
+# BC-250 kernel (Initial Setup > MastaG's Repo > Install Kernel) — the flag
+# is a no-op on any other kernel.
 run_enable_cs_legacy_8core_metrics() {
     print_step "13b" "Enabling 8-Core Metrics Reporting"
 
     if ! bc250_kernel_variant_installed; then
         print_error "This requires the BC-250 CachyOS kernel — install it first via"
-        print_error "Initial Setup > Install BC-250 Kernel (option 13). The flag is a"
+        print_error "Initial Setup > MastaG's Repo > Install Kernel. The flag is a"
         print_error "no-op on any other kernel."
         return 1
     fi
@@ -3131,6 +3621,17 @@ run_revert_zswap() {
         print_info "systemd.zram=0 not found — ZRAM already enabled."
     fi
 
+    # Undo the mask from run_disable_zram_enable_zswap so the zram-generator
+    # can create and start the unit again on next boot.
+    if [[ "$(systemctl is-enabled systemd-zram-setup@zram0.service 2>/dev/null)" == "masked" ]]; then
+        print_info "Unmasking systemd-zram-setup@zram0.service..."
+        if systemctl unmask systemd-zram-setup@zram0.service; then
+            print_info "systemd-zram-setup@zram0.service unmasked."
+        else
+            print_error "Failed to unmask systemd-zram-setup@zram0.service — check the output above."
+        fi
+    fi
+
     # --- Remove lz4 from initramfs ---
     initramfs_remove_module lz4_compress || true
     initramfs_remove_module lz4 || true
@@ -3226,6 +3727,48 @@ run_disable_mitigations() {
     fi
     print_success "mitigations=off added. Reboot to apply."
     echo -e "  ${DIM}Note: this disables Spectre/Meltdown mitigations for a performance gain.${RESET}\n"
+}
+
+# CachyOS ships sched-ext (scx_loader + scxctl), which can run a BPF scheduler
+# (e.g. scx_bpfland, scx_lavd) in place of the kernel's built-in scheduler
+# (BORE/EEVDF). This is the terminal equivalent of the SCX Manager GUI's
+# "Disable the current scheduler" button — but scoped to survive reboot:
+# 'scxctl stop' alone only stops the scheduler for this session; scx_loader
+# will load its configured default_sched again on next boot. Disabling the
+# service itself is what makes it stick.
+run_disable_scx_default_scheduler() {
+    print_step "15" "Disabling Default Scheduler (sched-ext)"
+
+    if ! command -v scxctl &>/dev/null; then
+        print_error "scxctl not found — install it first with: sudo pacman -S scx-tools"
+        return 1
+    fi
+
+    if ! systemctl list-unit-files scx_loader.service &>/dev/null; then
+        print_info "scx_loader.service not found — no sched-ext scheduler is configured. Nothing to disable."
+        return 0
+    fi
+
+    if systemctl is-active --quiet scx_loader.service; then
+        local current_sched
+        current_sched="$(scxctl get 2>/dev/null || echo unknown)"
+        print_info "Currently active: $current_sched"
+    else
+        print_info "scx_loader.service is not currently running."
+    fi
+
+    if ! confirm "Disable sched-ext and permanently stop scx_loader.service? The kernel's built-in scheduler (BORE/EEVDF) will take over, now and after reboot."; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Stopping and disabling scx_loader.service..."
+    if ! systemctl disable --now scx_loader.service; then
+        print_error "Failed to disable scx_loader.service — check the output above."
+        return 1
+    fi
+
+    print_success "sched-ext disabled — the kernel's built-in scheduler will be used, including after reboot."
 }
 
 run_status() {
@@ -3559,6 +4102,34 @@ run_revert_mitigations() {
     sed -i 's/ mitigations=off//g' "$CONF"
     bootloader_update
     print_success "mitigations=off removed. Reboot to re-enable CPU security mitigations."
+}
+
+run_revert_scx_default_scheduler() {
+    print_step "R-13" "Revert Disable Default Scheduler"
+
+    if ! systemctl list-unit-files scx_loader.service &>/dev/null; then
+        print_info "scx_loader.service not found — nothing to revert."
+        return 0
+    fi
+
+    if systemctl is-enabled --quiet scx_loader.service 2>/dev/null && \
+       systemctl is-active --quiet scx_loader.service; then
+        print_info "scx_loader.service is already enabled and running — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "Re-enable and start scx_loader.service, restoring sched-ext scheduling?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Enabling and starting scx_loader.service..."
+    if ! systemctl enable --now scx_loader.service; then
+        print_error "Failed to enable scx_loader.service — check the output above."
+        return 1
+    fi
+
+    print_success "sched-ext re-enabled — scx_loader will load the configured default scheduler again."
 }
 
 run_revert_cs_legacy_8core_metrics() {
@@ -4949,9 +5520,10 @@ show_revert_menu() {
     print_item  "7"  "Revert VRAM Ceiling"     "Remove ttm.pages_limit kernel param"
     print_item  "8"  "Revert ACPI Fix"         "Remove SSDT overrides & acpi_override hook"
     print_item  "9"  "Revert CPU Cores Unlock" "Remove UEFI boot entry & .efi file"
-    print_item  "10" "Revert BC-250 Kernel"    "Remove kernel & repo from pacman.conf"
+    print_item  "10" "Revert MastaG's Repo"   "Kernel, Mesa/Vulkan, Proton — submenu"
     print_item  "11" "Revert 5.1 Surround Sound" "Restore default HDMI stereo profile"
     print_item  "12" "Revert 8-Core Metrics Fix" "Remove amdgpu.cs_legacy_8core_metrics kernel param"
+    print_item  "13" "Revert Disable Default Scheduler" "Re-enable scx_loader.service"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -4973,9 +5545,10 @@ run_revert_menu() {
             7) run_revert_ttm_pages_limit;      press_enter ;;
             8) run_revert_acpi_fix;             press_enter ;;
             9) run_revert_cpu_cores_unlock_efi; press_enter ;;
-            10) run_revert_bc250_kernel;        press_enter ;;
+            10) run_revert_mastag_repo_menu ;;
             11) run_revert_ac3_surround;        press_enter ;;
             12) run_revert_cs_legacy_8core_metrics; press_enter ;;
+            13) run_revert_scx_default_scheduler; press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
@@ -5052,8 +5625,9 @@ show_initial_setup_menu() {
     print_item  "10" "ACPI Fix"                "SSDT override + CPU governor control"
     print_item  "11" "BC-250 Memory Config"    "Configure VRAM size via bc250_memcfg"
     print_item  "12" "Remove Deckify Kernel"   "Verify new kernel boots first"
-    print_item  "13" "Install BC-250 Kernel"   "Standard, BORE, or RC — unsigned repo"
+    print_item  "13" "MastaG's Repo"          "Kernel, Mesa/Vulkan, Proton — unsigned repo"
     print_item  "14" "5.1 Surround Sound"      "AC-3 Dolby Digital encoding over HDMI"
+    print_item  "15" "Disable Default Scheduler" "Stop & disable scx_loader — kernel falls back to BORE/EEVDF"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -5079,8 +5653,9 @@ run_initial_setup_menu() {
             10) run_acpi_menu ;;
             11) run_memcfg_menu ;;
             12) run_remove_deckify_kernel;    press_enter ;;
-            13) run_install_bc250_kernel;     press_enter ;;
+            13) run_mastag_repo_menu ;;
             14) run_ac3_surround_menu ;;
+            15) run_disable_scx_default_scheduler; press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$is_choice'"
