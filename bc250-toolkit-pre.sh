@@ -1186,7 +1186,7 @@ run_install_bc250_protonge() {
 }
 
 run_install_bc250_dual_audio() {
-    print_step "MR-7" "Install bc250-dual-audio"
+    print_step "MR-6" "Install bc250-dual-audio"
 
     bc250_repo_require || return 1
 
@@ -1218,7 +1218,7 @@ run_install_bc250_dual_audio() {
 # available via the kernel, so the governor would be left unable to read
 # usage or set frequency correctly.
 run_patch_bc250_gpu_config_modified_bios() {
-    print_step "MR-6" "Patch GPU Governor for Modified BIOS"
+    print_step "MR-7" "Patch GPU Governor for Modified BIOS"
 
     if [[ ! -f "$GPU_DEST" ]]; then
         print_error "cyan-skillfish-governor-smu config not found at $GPU_DEST — install GPU Governor first (Initial Setup > GPU Governor)."
@@ -1319,8 +1319,10 @@ show_mastag_repo_menu() {
     print_item "3" "Install Mesa/Vulkan"                 "BC-250-patched Mesa/RADV build"
     print_item "4" "Install proton-cachyos-native-bc250" ""
     print_item "5" "Install protonge-latest-bc250"       ""
-    print_item "6" "Patch GPU Governor for Modified BIOS" "Switches usage & frequency control from SMU to kernel-reported values"
-    print_item "7" "Install bc250-dual-audio"             "5.1 surround audio support"
+    print_item "6" "Install bc250-dual-audio"             "5.1 surround audio support"
+    echo ""
+    print_section "GPU Governor Patch"
+    print_item "7" "Patch GPU Governor for Modified BIOS" "Switches usage & frequency control from SMU to kernel-reported values"
     echo ""
     print_item "0" "Back" ""
     echo ""
@@ -1338,8 +1340,8 @@ run_mastag_repo_menu() {
             3) run_install_bc250_mesa;                     press_enter ;;
             4) run_install_bc250_proton_cachyos;           press_enter ;;
             5) run_install_bc250_protonge;                 press_enter ;;
-            6) run_patch_bc250_gpu_config_modified_bios;   press_enter ;;
-            7) run_install_bc250_dual_audio;               press_enter ;;
+            6) run_install_bc250_dual_audio;               press_enter ;;
+            7) run_patch_bc250_gpu_config_modified_bios;   press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$mr_choice'"
