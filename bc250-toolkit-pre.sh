@@ -1961,6 +1961,7 @@ run_cpu_unlock_patch_metrics() {
 [Unit]
 Description=BC-250 SMU unlock + metrics patch
 After=multi-user.target
+Before=$GPU_SERVICE
 
 [Service]
 Type=oneshot
