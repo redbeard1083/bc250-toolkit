@@ -18,7 +18,7 @@ It does the following:
 7. Displays a status window showing you your current settings.
 8. Unlock compute units thanks to: https://github.com/WinnieLV/bc250-cu-live-manager
 9. Set vram split and ttm pages: https://github.com/fanoush/bc250_memcfg
-10. Unlock CPU Cores: https://github.com/rw-r-r-0644/bc250-core-unlock , https://github.com/Hexxeh/bc250-efi-core-unlock 
+10. Unlock CPU Cores and patch CPU metrics: https://github.com/rw-r-r-0644/bc250-core-unlock , https://github.com/Hexxeh/bc250-efi-core-unlock , https://github.com/rw-r-r-0644/bc250-smu-unlock , https://github.com/GabriWar/bc250-smu-unlock-bios5
 11. Install ACPI Fix: https://github.com/mendesrr/bc250-acpi-fix-updated-8c
 12. Install custom BC-250 kernel: https://github.com/MastaG/linux-cachyos-bc250 (WARNING:  If you are using a modified bios to unlock the CPU cores, you will need to use the option patch the GPU config for proper metrics reporting every timem after changing the performance profile.)
 13. Enable 5.1 AC3 audio over DP/HDMI: https://github.com/rpf16rj/bc250-steamos-real-toolkit/tree/main/extras/hdmi-ac3-encoding
