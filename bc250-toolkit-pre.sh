@@ -1036,12 +1036,6 @@ run_install_bc250_kernel() {
         already_installed=1
     fi
 
-    echo ""
-    local enable_metrics_fix=0
-    if confirm "Add amdgpu.cs_legacy_8core_metrics=1 to the boot cmdline? Fixes scrambled GPU/APU telemetry on this kernel (only relevant if you monitor those sensors)."; then
-        enable_metrics_fix=1
-    fi
-
     if [[ "$already_installed" -eq 0 ]]; then
         print_info "Refreshing pacman databases..."
         if ! pacman -Syy; then
@@ -1071,10 +1065,6 @@ run_install_bc250_kernel() {
         else
             print_error "Failed to write /etc/modules-load.d/nct6687.conf — enable the nct6687 module manually."
         fi
-    fi
-
-    if [[ "$enable_metrics_fix" -eq 1 ]]; then
-        run_enable_cs_legacy_8core_metrics
     fi
 
     if [[ "$already_installed" -eq 1 ]]; then
@@ -1902,6 +1892,105 @@ run_cpu_cores_unlock_efi() {
     echo -e "  ${BOLD}${YELLOW}A reboot is required to apply.${RESET}\n"
 }
 
+# ==============================================================================
+# CPU CORES UNLOCK — Persistent SMU Metrics Patch (systemd service)
+# ==============================================================================
+
+CPU_UNLOCK_METRICS_BIOS3_REPO="https://github.com/rw-r-r-0644/bc250-smu-unlock.git"
+CPU_UNLOCK_METRICS_BIOS5_REPO="https://github.com/GabriWar/bc250-smu-unlock-bios5.git"
+CPU_UNLOCK_METRICS_DIR="/opt/bc250-smu-unlock"
+CPU_UNLOCK_METRICS_SERVICE="bc250-smu-metrics-patch.service"
+
+run_cpu_unlock_patch_metrics() {
+    print_step "08c" "CPU Cores Unlock — Patch SMU Metrics (Persistent)"
+
+    echo ""
+    echo -e "  ${BOLD}${RED}⚠  WARNING${RESET}"
+    echo ""
+    echo -e "  ${WHITE}This installs a systemd service that runs an SMU exploit (arbitrary"
+    echo -e "  code execution on the SMU's own processor) plus a firmware metrics patch"
+    echo -e "  on EVERY boot, before anything else touches GPU/CPU telemetry.${RESET}"
+    echo ""
+    if ! confirm "Do you understand and want to proceed?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    echo ""
+    print_section "Select BIOS Version"
+    print_item "1" "BIOS 3" "SMU firmware 0.58.6.0 (rw-r-r-0644/bc250-smu-unlock)"
+    print_item "2" "BIOS 5" "SMU firmware 0.58.7.1 (GabriWar/bc250-smu-unlock-bios5)"
+    echo ""
+    print_item "0" "Cancel" ""
+    echo ""
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Select BIOS version:${RESET} ")" bios_choice
+
+    local repo_url
+    case "$bios_choice" in
+        1) repo_url="$CPU_UNLOCK_METRICS_BIOS3_REPO" ;;
+        2) repo_url="$CPU_UNLOCK_METRICS_BIOS5_REPO" ;;
+        0) print_info "Cancelled."; return 0 ;;
+        *) print_error "Invalid selection: '$bios_choice'"; return 1 ;;
+    esac
+
+    if ! command -v git &>/dev/null; then
+        print_error "git not found — install it first with: sudo pacman -S git"
+        return 1
+    fi
+
+    if [[ -d "$CPU_UNLOCK_METRICS_DIR" ]]; then
+        print_info "Removing existing clone at $CPU_UNLOCK_METRICS_DIR..."
+        rm -rf "$CPU_UNLOCK_METRICS_DIR"
+    fi
+
+    print_info "Cloning $repo_url..."
+    if ! git clone --depth 1 "$repo_url" "$CPU_UNLOCK_METRICS_DIR"; then
+        print_error "Failed to clone $repo_url — check the output above."
+        return 1
+    fi
+
+    if [[ ! -f "$CPU_UNLOCK_METRICS_DIR/unlock.py" || ! -f "$CPU_UNLOCK_METRICS_DIR/patcher.py" ]]; then
+        print_error "unlock.py and/or patcher.py not found in the cloned repo at $CPU_UNLOCK_METRICS_DIR."
+        print_info "Contents found:"
+        ls -la "$CPU_UNLOCK_METRICS_DIR"
+        print_error "Continuing anyway — the systemd service will be created but will fail at boot until this is resolved."
+    fi
+
+    print_info "Creating systemd service $CPU_UNLOCK_METRICS_SERVICE..."
+    cat > "/etc/systemd/system/$CPU_UNLOCK_METRICS_SERVICE" <<EOF
+[Unit]
+Description=BC-250 SMU unlock + metrics patch
+After=multi-user.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=$CPU_UNLOCK_METRICS_DIR
+ExecStart=/usr/bin/python3 $CPU_UNLOCK_METRICS_DIR/unlock.py
+ExecStart=/usr/bin/python3 $CPU_UNLOCK_METRICS_DIR/patcher.py
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    print_info "Enabling and starting $CPU_UNLOCK_METRICS_SERVICE..."
+    if ! systemctl enable --now "$CPU_UNLOCK_METRICS_SERVICE"; then
+        print_error "Failed to enable/start $CPU_UNLOCK_METRICS_SERVICE — check: systemctl status $CPU_UNLOCK_METRICS_SERVICE"
+        return 1
+    fi
+
+    if systemctl is-active --quiet "$CPU_UNLOCK_METRICS_SERVICE"; then
+        print_success "$CPU_UNLOCK_METRICS_SERVICE installed and ran successfully."
+    else
+        print_error "$CPU_UNLOCK_METRICS_SERVICE did not report active — check:"
+        print_error "  systemctl status $CPU_UNLOCK_METRICS_SERVICE"
+        print_error "  journalctl -u $CPU_UNLOCK_METRICS_SERVICE"
+        return 1
+    fi
+}
+
+
 run_revert_cpu_cores_unlock_efi() {
     print_step "R-9" "Revert CPU Cores Unlock"
 
@@ -1945,6 +2034,32 @@ run_revert_cpu_cores_unlock_efi() {
     echo -e "  power the system down completely and turn it back on.${RESET}\n"
 }
 
+run_revert_cpu_unlock_patch_metrics() {
+    print_step "R-14" "Revert CPU Cores Unlock — SMU Metrics Patch"
+
+    if [[ ! -f "/etc/systemd/system/$CPU_UNLOCK_METRICS_SERVICE" ]]; then
+        print_info "$CPU_UNLOCK_METRICS_SERVICE not found — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "Stop, disable, and remove $CPU_UNLOCK_METRICS_SERVICE and its cloned repo at $CPU_UNLOCK_METRICS_DIR?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Stopping and disabling $CPU_UNLOCK_METRICS_SERVICE..."
+    systemctl disable --now "$CPU_UNLOCK_METRICS_SERVICE" 2>/dev/null
+    rm -f "/etc/systemd/system/$CPU_UNLOCK_METRICS_SERVICE"
+    systemctl daemon-reload
+
+    if [[ -d "$CPU_UNLOCK_METRICS_DIR" ]]; then
+        print_info "Removing cloned repo at $CPU_UNLOCK_METRICS_DIR..."
+        rm -rf "$CPU_UNLOCK_METRICS_DIR"
+    fi
+
+    print_success "SMU metrics patch service removed."
+}
+
 # ---- CPU Cores Unlock submenu (two-step process) ----
 
 show_cpu_cores_unlock_menu() {
@@ -1958,9 +2073,17 @@ show_cpu_cores_unlock_menu() {
         permanent_status="${DIM}not installed${RESET}"
     fi
     echo -e "  ${CYAN}Permanent (EFI entry)${RESET}  ${permanent_status}"
+    local metrics_status
+    if [[ -f "/etc/systemd/system/$CPU_UNLOCK_METRICS_SERVICE" ]]; then
+        metrics_status="${GREEN}installed${RESET}"
+    else
+        metrics_status="${DIM}not installed${RESET}"
+    fi
+    echo -e "  ${CYAN}SMU Metrics Patch${RESET}      ${metrics_status}"
     echo ""
     print_item "1" "Step 1: Test Unlock"    "Temporary — clears on full power off"
     print_item "2" "Step 2: Make Permanent" "Installs EFI boot entry (requires PERMANENT confirmation)"
+    print_item "3" "Patch SMU Metrics"      "Persistent systemd service — fixes telemetry, BIOS 3 or 5"
     echo ""
     print_item "0" "Back" ""
     echo ""
@@ -1973,8 +2096,9 @@ run_cpu_cores_unlock_menu() {
         read -rp "$(echo -e "  ${BOLD}${WHITE}Enter selection:${RESET} ")" cu_choice
 
         case "${cu_choice^^}" in
-            1) run_cpu_cores_test_unlock; press_enter ;;
-            2) run_cpu_cores_unlock_efi;  press_enter ;;
+            1) run_cpu_cores_test_unlock;      press_enter ;;
+            2) run_cpu_cores_unlock_efi;       press_enter ;;
+            3) run_cpu_unlock_patch_metrics;   press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$cu_choice'"
@@ -1985,69 +2109,12 @@ run_cpu_cores_unlock_menu() {
 }
 
 # Checks whether any BC-250 CachyOS kernel variant package is installed.
-# amdgpu.cs_legacy_8core_metrics=1 only does anything on that kernel's
-# amdgpu build — its the one carrying the legacy-metrics patch. On any
-# other kernel (Deckify, stock CachyOS, etc.) the flag is simply ignored,
-# so this is required, not merely relevant.
 bc250_kernel_variant_installed() {
     local pkg
     for pkg in "${BC250_KERNEL_VARIANT_PKGS[@]}"; do
         pacman -Qq "$pkg" &>/dev/null && return 0
     done
     return 1
-}
-
-# Kernel parameter fix for scrambled GPU/APU telemetry when running the
-# BC-250 CachyOS kernel. Stock firmware has no metrics table slot for some
-# of the extra-core data, so without this flag tools reading those sensors
-# get scrambled values instead of merely incomplete ones. Requires the
-# BC-250 kernel (Initial Setup > MastaG's Repo > Install Kernel) — the flag
-# is a no-op on any other kernel.
-run_enable_cs_legacy_8core_metrics() {
-    print_step "13b" "Enabling 8-Core Metrics Reporting"
-
-    if ! bc250_kernel_variant_installed; then
-        print_error "This requires the BC-250 CachyOS kernel — install it first via"
-        print_error "Initial Setup > MastaG's Repo > Install Kernel. The flag is a"
-        print_error "no-op on any other kernel."
-        return 1
-    fi
-
-    local CONF
-    CONF="$(bootloader_conf)"
-    local BOOTLOADER
-    BOOTLOADER="$(detect_bootloader)"
-
-    if [[ -z "$CONF" ]] || [[ ! -f "$CONF" ]]; then
-        print_error "Bootloader config not found. Supported: Limine, GRUB."
-        return 1
-    fi
-    print_info "Detected bootloader: $BOOTLOADER ($CONF)"
-
-    if [[ ! -f "${CONF}.bak" ]]; then
-        print_info "Creating original backup at ${CONF}.bak ..."
-        cp "$CONF" "${CONF}.bak"
-    else
-        print_info "Backup already exists at ${CONF}.bak — preserving original."
-    fi
-
-    if grep -q 'amdgpu.cs_legacy_8core_metrics=1' "$CONF"; then
-        print_info "amdgpu.cs_legacy_8core_metrics=1 already present — skipping."
-        return 0
-    fi
-
-    local cmdline_var cmdline_var_esc
-    cmdline_var="$(bootloader_cmdline_var)"
-    cmdline_var_esc="$(bootloader_cmdline_var_escaped)"
-    print_info "Adding amdgpu.cs_legacy_8core_metrics=1..."
-    sed -i "/^${cmdline_var_esc}/s/\"\$/ amdgpu.cs_legacy_8core_metrics=1\"/" "$CONF"
-
-    if [[ "$SKIP_LIMINE_UPDATE" -eq 0 ]]; then
-        bootloader_update
-    fi
-    print_success "amdgpu.cs_legacy_8core_metrics=1 added. Reboot to apply."
-    echo -e "  ${DIM}Corrects scrambled GPU/APU telemetry on the BC-250 kernel. Some sensor${RESET}"
-    echo -e "  ${DIM}slots still won't be reported — stock firmware has no table slot for them.${RESET}\n"
 }
 
 # ==============================================================================
@@ -4134,6 +4201,11 @@ run_revert_scx_default_scheduler() {
     print_success "sched-ext re-enabled — scx_loader will load the configured default scheduler again."
 }
 
+# This flag is deprecated and no longer offered as an "enable" task — it's
+# been superseded by the SMU firmware-level metrics patch (bc250-smu-unlock,
+# baked into a modified BIOS) paired with the GPU Governor's kernel-mode
+# patch. This function is kept solely so anyone who already set the flag on
+# an earlier version of this toolkit can clean it up.
 run_revert_cs_legacy_8core_metrics() {
     local CONF
     CONF="$(bootloader_conf)"
@@ -5526,6 +5598,7 @@ show_revert_menu() {
     print_item  "11" "Revert 5.1 Surround Sound" "Restore default HDMI stereo profile"
     print_item  "12" "Revert 8-Core Metrics Fix" "Remove amdgpu.cs_legacy_8core_metrics kernel param"
     print_item  "13" "Revert Disable Default Scheduler" "Re-enable scx_loader.service"
+    print_item  "14" "Revert SMU Metrics Patch" "Remove bc250-smu-metrics-patch.service"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -5551,6 +5624,7 @@ run_revert_menu() {
             11) run_revert_ac3_surround;        press_enter ;;
             12) run_revert_cs_legacy_8core_metrics; press_enter ;;
             13) run_revert_scx_default_scheduler; press_enter ;;
+            14) run_revert_cpu_unlock_patch_metrics; press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
