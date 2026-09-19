@@ -655,6 +655,113 @@ run_set_loglevel() {
     print_success "loglevel set to 0. Reboot to apply."
 }
 
+CPU_SCALING_GOVERNOR_SERVICE="bc250-cpu-scaling-governor.service"
+
+# Dynamically reads the available governors from the running kernel/cpufreq
+# driver rather than hardcoding a list, so this works correctly whether the
+# system is on acpi-cpufreq, amd-pstate, or anything else that exposes
+# different governor sets.
+run_set_cpu_scaling_governor() {
+    print_step "15" "Set CPU Scaling Governor"
+
+    local sys_gov_avail="/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"
+    if [[ ! -f "$sys_gov_avail" ]]; then
+        print_error "$sys_gov_avail not found — cpufreq scaling isn't available on this kernel."
+        return 1
+    fi
+
+    local current_gov
+    current_gov="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+    print_info "Current governor: $current_gov"
+
+    local -a governors
+    read -ra governors < "$sys_gov_avail"
+
+    if [[ "${#governors[@]}" -eq 0 ]]; then
+        print_error "No available governors reported by $sys_gov_avail — cannot continue."
+        return 1
+    fi
+
+    echo ""
+    print_section "Select CPU Scaling Governor"
+    local i marker
+    for i in "${!governors[@]}"; do
+        marker=""
+        [[ "${governors[$i]}" == "$current_gov" ]] && marker="  ${GREEN}(current)${RESET}"
+        print_item "$((i+1))" "${governors[$i]}${marker}" ""
+    done
+    echo ""
+    print_item "0" "Cancel" ""
+    echo ""
+    read -rp "$(echo -e "  ${BOLD}${WHITE}Select governor:${RESET} ")" gov_choice
+
+    if [[ "$gov_choice" == "0" ]]; then
+        print_info "Cancelled."
+        return 0
+    fi
+    if ! [[ "$gov_choice" =~ ^[0-9]+$ ]] || (( gov_choice < 1 || gov_choice > ${#governors[@]} )); then
+        print_error "Invalid selection: '$gov_choice'"
+        return 1
+    fi
+
+    local selected_gov="${governors[$((gov_choice-1))]}"
+
+    print_info "Applying '$selected_gov' to all CPU cores for this session..."
+    local f apply_failed=0
+    for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
+        echo "$selected_gov" > "$f" 2>/dev/null || apply_failed=1
+    done
+    if [[ "$apply_failed" -eq 1 ]]; then
+        print_error "Failed to apply '$selected_gov' to one or more cores."
+    else
+        print_success "'$selected_gov' applied to all cores."
+    fi
+
+    print_info "Creating $CPU_SCALING_GOVERNOR_SERVICE to persist across reboots..."
+    cat > "/etc/systemd/system/$CPU_SCALING_GOVERNOR_SERVICE" <<EOF
+[Unit]
+Description=Set CPU scaling governor to $selected_gov
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do echo "$selected_gov" > "\$f"; done'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    if ! systemctl enable --now "$CPU_SCALING_GOVERNOR_SERVICE"; then
+        print_error "Failed to enable $CPU_SCALING_GOVERNOR_SERVICE — check the output above."
+        return 1
+    fi
+
+    print_success "'$selected_gov' set as the CPU scaling governor, now and on every boot."
+}
+
+run_revert_cpu_scaling_governor() {
+    print_step "R-15" "Revert CPU Scaling Governor"
+
+    if [[ ! -f "/etc/systemd/system/$CPU_SCALING_GOVERNOR_SERVICE" ]]; then
+        print_info "$CPU_SCALING_GOVERNOR_SERVICE not found — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "Stop, disable, and remove $CPU_SCALING_GOVERNOR_SERVICE? The kernel's own default governor will apply on next boot."; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Stopping and disabling $CPU_SCALING_GOVERNOR_SERVICE..."
+    systemctl disable --now "$CPU_SCALING_GOVERNOR_SERVICE" 2>/dev/null
+    rm -f "/etc/systemd/system/$CPU_SCALING_GOVERNOR_SERVICE"
+    systemctl daemon-reload
+
+    print_success "CPU scaling governor override removed. Current session is unaffected until reboot."
+}
+
 run_disable_zram_enable_zswap() {
     local CONF
     CONF="$(bootloader_conf)"
@@ -5601,6 +5708,7 @@ show_revert_menu() {
     print_item  "12" "Revert 8-Core Metrics Fix" "Remove amdgpu.cs_legacy_8core_metrics kernel param"
     print_item  "13" "Revert Disable Default Scheduler" "Re-enable scx_loader.service"
     print_item  "14" "Revert SMU Metrics Patch" "Remove bc250-smu-metrics-patch.service"
+    print_item  "15" "Revert CPU Scaling Governor" "Remove bc250-cpu-scaling-governor.service"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -5627,6 +5735,7 @@ run_revert_menu() {
             12) run_revert_cs_legacy_8core_metrics; press_enter ;;
             13) run_revert_scx_default_scheduler; press_enter ;;
             14) run_revert_cpu_unlock_patch_metrics; press_enter ;;
+            15) run_revert_cpu_scaling_governor; press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
@@ -5705,9 +5814,10 @@ show_initial_setup_menu() {
     print_item  "12" "Remove Deckify Kernel"   "Verify new kernel boots first"
     print_item  "13" "5.1 Surround Sound"      "AC-3 Dolby Digital encoding over HDMI"
     print_item  "14" "Disable Default Scheduler" "Stop & disable scx_loader — kernel falls back to BORE/EEVDF"
+    print_item  "15" "CPU Scaling Governor"    "performance/powersave/schedutil — reads live options from kernel"
     echo ""
     print_section "MastaG's Repo"
-    print_item  "15" "MastaG's Repo"          "Kernel, Mesa/Vulkan, Proton — unsigned repo"
+    print_item  "16" "MastaG's Repo"          "Kernel, Mesa/Vulkan, Proton — unsigned repo"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -5735,7 +5845,8 @@ run_initial_setup_menu() {
             12) run_remove_deckify_kernel;    press_enter ;;
             13) run_ac3_surround_menu ;;
             14) run_disable_scx_default_scheduler; press_enter ;;
-            15) run_mastag_repo_menu ;;
+            15) run_set_cpu_scaling_governor; press_enter ;;
+            16) run_mastag_repo_menu ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$is_choice'"
