@@ -1960,7 +1960,8 @@ run_cpu_unlock_patch_metrics() {
     cat > "/etc/systemd/system/$CPU_UNLOCK_METRICS_SERVICE" <<EOF
 [Unit]
 Description=BC-250 SMU unlock + metrics patch
-After=multi-user.target
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
 Before=$GPU_SERVICE
 
 [Service]
