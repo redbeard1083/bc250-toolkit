@@ -2816,6 +2816,18 @@ max_temperature = 90
 EOF
 }
 
+# Dedicated 80°C variant for "Redbeard's Sweet Spot" — same frequency/scale as
+# write_cpu_overclock_4ghz, but max_temperature lowered to match that
+# preset's GPU side (80°C), rather than sharing the 90°C writer used by
+# "Extreme III", which documents 90°C explicitly.
+write_cpu_overclock_4ghz_80c() { cat > "$CPU_TMPFILE" <<'EOF'
+[overclock]
+frequency = 4000
+scale = -30
+max_temperature = 80
+EOF
+}
+
 write_gpu_overclock_1500mhz() { cat > "$GPU_TMPFILE" <<'EOF'
 [timing.intervals]
 sample = 250
@@ -3446,8 +3458,8 @@ oc_match_preset() {
     gpu_freq=$(awk -F'= ' '/^frequency/{print $2}' "$GPU_DEST" 2>/dev/null | tr -d ' ' | tail -1)
 
     # Preset CPU MHz values matching PRESET_CPU_WRITERS order (slowest to fastest)
-    local preset_cpu_freqs=(3500 3500 3500 3500 3500 3500 3850 4000)
-    local preset_gpu_freqs=(1500 1600 1750 1850 2000 2100 2100 2350)
+    local preset_cpu_freqs=(3500 3500 3500 3500 3500 3500 3850 4000 4000)
+    local preset_gpu_freqs=(1500 1600 1750 1850 2000 2100 2100 2350 2000)
 
     for i in "${!PRESET_NAMES[@]}"; do
         if [[ "$cpu_freq" == "${preset_cpu_freqs[$i]}" && "$gpu_freq" == "${preset_gpu_freqs[$i]}" ]]; then
@@ -3458,7 +3470,7 @@ oc_match_preset() {
     echo "Custom"
 }
 
-PRESET_NAMES=("Stock" "Mild" "Moderate" "Strong" "Aggressive" "Extreme I ⚠" "Extreme II ⚠" "Extreme III ⚠")
+PRESET_NAMES=("Stock" "Mild" "Moderate" "Strong" "Aggressive" "Extreme I ⚠" "Extreme II ⚠" "Extreme III ⚠" "Redbeard's Sweet Spot ⚠")
 PRESET_DESCS=(
     "CPU 3.5GHz, GPU 1500MHz — 80°C"
     "CPU 3.5GHz, GPU 1600MHz — 80°C"
@@ -3468,9 +3480,10 @@ PRESET_DESCS=(
     "CPU 3.5GHz, GPU 2100MHz — 80°C"
     "CPU 3.85GHz, GPU 2100MHz — 80°C"
     "CPU 4GHz, GPU 2350MHz — 90°C"
+    "CPU 4GHz, GPU 2000MHz — 80°C"
 )
-PRESET_CPU_WRITERS=(write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_overclock_3_85ghz write_cpu_overclock_4ghz)
-PRESET_GPU_WRITERS=(write_gpu_overclock_1500mhz write_gpu_overclock_1600mhz write_gpu_overclock_1750mhz write_gpu_overclock_1850mhz write_gpu_overclock_2000mhz write_gpu_overclock_2100mhz write_gpu_overclock_2100mhz write_gpu_overclock_2350mhz)
+PRESET_CPU_WRITERS=(write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_undervolt_3_5ghz write_cpu_overclock_3_85ghz write_cpu_overclock_4ghz write_cpu_overclock_4ghz_80c)
+PRESET_GPU_WRITERS=(write_gpu_overclock_1500mhz write_gpu_overclock_1600mhz write_gpu_overclock_1750mhz write_gpu_overclock_1850mhz write_gpu_overclock_2000mhz write_gpu_overclock_2100mhz write_gpu_overclock_2100mhz write_gpu_overclock_2350mhz write_gpu_overclock_2000mhz)
 # Presets 6-8 (index 5-7) are high-risk and require OC acknowledgement
 PRESET_HIGH_RISK_THRESHOLD=5
 
