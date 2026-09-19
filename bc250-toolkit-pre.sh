@@ -2824,6 +2824,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -2870,6 +2871,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -2919,6 +2921,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -2974,6 +2977,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -3029,6 +3033,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -3087,6 +3092,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -3151,6 +3157,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -3230,6 +3237,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
