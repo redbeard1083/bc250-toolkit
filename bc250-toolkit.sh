@@ -2584,7 +2584,7 @@ run_install_acpi_fix() {
 }
 
 run_acpi_show_power_info() {
-    print_step "AS-2" "CPU Power Info"
+    print_step "AS-3" "CPU Power Info"
 
     if ! command -v cpupower &>/dev/null; then
         print_error "cpupower is not installed."
@@ -2600,7 +2600,19 @@ run_acpi_show_power_info() {
 }
 
 run_set_cpu_governor() {
-    print_step "AS-3" "Set CPU Governor"
+    print_step "AS-2" "Set CPU Governor"
+
+    if ! acpi_fix_installed; then
+        print_error "ACPI Fix isn't installed — run Step 1: Install ACPI Fix first, then reboot."
+        return 1
+    fi
+
+    local sys_gov_avail="/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"
+    if [[ ! -f "$sys_gov_avail" ]]; then
+        print_error "$sys_gov_avail not found — cpufreq scaling isn't available yet."
+        print_error "ACPI Fix is installed but its effect requires a reboot to take hold — reboot and try again."
+        return 1
+    fi
 
     local current
     if current="$(cpupower_current_governor)"; then
@@ -2609,21 +2621,35 @@ run_set_cpu_governor() {
         print_info "Could not read the current governor from sysfs."
     fi
 
+    local -a governors
+    read -ra governors < "$sys_gov_avail"
+    if [[ "${#governors[@]}" -eq 0 ]]; then
+        print_error "No available governors reported by $sys_gov_avail — cannot continue."
+        return 1
+    fi
+
     echo ""
-    print_item "1" "schedutil"   "Dynamic, kernel-driven scaling (default)"
-    print_item "2" "performance" "Locks CPUs at max frequency"
+    print_section "Select CPU Governor"
+    local i marker
+    for i in "${!governors[@]}"; do
+        marker=""
+        [[ "${governors[$i]}" == "$current" ]] && marker="  ${GREEN}(current)${RESET}"
+        print_item "$((i+1))" "${governors[$i]}${marker}" ""
+    done
     echo ""
     print_item "0" "Cancel" ""
     echo ""
     read -rp "$(echo -e "  ${BOLD}${WHITE}Select governor:${RESET} ")" gov_choice
 
-    local target_gov
-    case "$gov_choice" in
-        1) target_gov="schedutil" ;;
-        2) target_gov="performance" ;;
-        0) print_info "Cancelled."; return 0 ;;
-        *) print_error "Invalid selection."; return 1 ;;
-    esac
+    if [[ "$gov_choice" == "0" ]]; then
+        print_info "Cancelled."
+        return 0
+    fi
+    if ! [[ "$gov_choice" =~ ^[0-9]+$ ]] || (( gov_choice < 1 || gov_choice > ${#governors[@]} )); then
+        print_error "Invalid selection: '$gov_choice'"
+        return 1
+    fi
+    local target_gov="${governors[$((gov_choice-1))]}"
 
     if ! confirm "Set CPU governor to '${target_gov}'?"; then
         print_info "Cancelled."
@@ -2681,9 +2707,9 @@ show_acpi_menu() {
         echo -e "  ${CYAN}Governor${RESET}  ${DIM}unknown${RESET}"
     fi
     echo ""
-    print_item "1" "Install ACPI Fix"    "Downloads SSDT overrides, rebuilds initramfs"
-    print_item "2" "Show CPU Power Info" "cpupower idle-info / frequency-info"
-    print_item "3" "Set CPU Governor"    "Switch between schedutil and performance"
+    print_item "1" "Step 1: Install ACPI Fix" "Downloads SSDT overrides, rebuilds initramfs — reboot required"
+    print_item "2" "Step 2: Set CPU Governor" "Switch governor — reads live options from kernel"
+    print_item "3" "Show CPU Power Info"      "cpupower idle-info / frequency-info"
     echo ""
     print_item "0" "Back" ""
     echo ""
@@ -2697,8 +2723,8 @@ run_acpi_menu() {
 
         case "${acpi_choice^^}" in
             1) run_install_acpi_fix;     press_enter ;;
-            2) run_acpi_show_power_info; press_enter ;;
-            3) run_set_cpu_governor;     press_enter ;;
+            2) run_set_cpu_governor;     press_enter ;;
+            3) run_acpi_show_power_info; press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$acpi_choice'"
@@ -2736,10 +2762,21 @@ run_revert_acpi_fix() {
 
     initramfs_rebuild || print_error "Initramfs rebuild failed — check the output above."
 
+    # Without the SSDT-PST override, cpufreq scaling won't be functional after
+    # the next reboot — cpupower.service enforcing a governor at that point is
+    # meaningless at best, and a source of a confusing failed-unit state at
+    # worst. Disable it now rather than leave it to find out at boot.
+    if systemctl list-unit-files "$CPUPOWER_SERVICE" &>/dev/null && \
+       { systemctl is-enabled --quiet "$CPUPOWER_SERVICE" 2>/dev/null || \
+         systemctl is-active --quiet "$CPUPOWER_SERVICE" 2>/dev/null; }; then
+        print_info "Stopping and disabling $CPUPOWER_SERVICE (no functional cpufreq without ACPI Fix)..."
+        systemctl disable --now "$CPUPOWER_SERVICE" 2>/dev/null
+    fi
+
     print_success "ACPI Fix removed."
     echo -e "  ${BOLD}${YELLOW}A reboot is required to fully revert.${RESET}\n"
-    echo -e "  ${DIM}Note: this does not change your CPU governor setting — use 'Set CPU"
-    echo -e "  Governor' from the ACPI Fix menu if you also want to reset that.${RESET}\n"
+    echo -e "  ${DIM}Note: $CPUPOWER_CONF's GOVERNOR= setting was left as-is — re-running"
+    echo -e "  'Install ACPI Fix' and 'Set CPU Governor' later will pick it back up.${RESET}\n"
 }
 
 # ==============================================================================
@@ -2774,7 +2811,7 @@ EOF
 write_cpu_overclock_4ghz() { cat > "$CPU_TMPFILE" <<'EOF'
 [overclock]
 frequency = 4000
-scale = -37
+scale = -30
 max_temperature = 90
 EOF
 }
@@ -2787,6 +2824,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -2833,6 +2871,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -2882,6 +2921,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -2937,6 +2977,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -2992,6 +3033,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -3050,6 +3092,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -3114,6 +3157,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -3193,6 +3237,7 @@ adjust = 100_000
 fix-metrics = true
 method = "busy-flag" # "busy-flag" or "process"
 flush-every = 10
+temp-read = "sysfs"
 [gpu]
 set-method = "smu"  # "smu" or "kernel"
 
@@ -3430,7 +3475,7 @@ PRESET_GPU_WRITERS=(write_gpu_overclock_1500mhz write_gpu_overclock_1600mhz writ
 PRESET_HIGH_RISK_THRESHOLD=5
 
 CPU_NAMES=("Undervolt 3.5 GHz (stock)" "Overclock 3.85 GHz" "Overclock 4 GHz")
-CPU_DESCS=("3500 MHz, scale -22, max 80°C" "3850 MHz, scale -30, max 90°C" "4000 MHz, scale -37, max 90°C")
+CPU_DESCS=("3500 MHz, scale -22, max 80°C" "3850 MHz, scale -30, max 90°C" "4000 MHz, scale -30, max 90°C")
 CPU_WRITERS=(write_cpu_undervolt_3_5ghz write_cpu_overclock_3_85ghz write_cpu_overclock_4ghz)
 
 GPU_NAMES=("1500 MHz" "1600 MHz" "1750 MHz" "1850 MHz" "2000 MHz" "2100 MHz ⚠" "2300 MHz ⚠" "2350 MHz ⚠")
