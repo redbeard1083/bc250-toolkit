@@ -1962,7 +1962,7 @@ run_cpu_unlock_patch_metrics() {
 Description=BC-250 SMU unlock + metrics patch
 After=systemd-udev-settle.service
 Wants=systemd-udev-settle.service
-Before=$GPU_SERVICE
+Before=bc250-smu-oc.service $GPU_SERVICE
 
 [Service]
 Type=oneshot
