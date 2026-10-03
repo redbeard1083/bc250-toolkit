@@ -273,6 +273,21 @@ aur_remove() {
     esac
 }
 
+aur_rebuild() {
+    local package="$1"
+    if ! ensure_aur_helper; then
+        print_error "No AUR helper available and automatic installation of yay failed."
+        return 1
+    fi
+    local helper
+    helper="$(aur_helper)"
+    print_info "Rebuilding $package via $helper..."
+    case "$helper" in
+        yay)  sudo -u "$REAL_USER" yay -S --rebuild --noconfirm "$package" ;;
+        paru) sudo -u "$REAL_USER" paru -S --rebuild --noconfirm "$package" ;;
+    esac
+}
+
 # Bootloader detection
 detect_bootloader() {
     if [[ -f /etc/default/limine ]]; then echo "limine"
@@ -1841,7 +1856,7 @@ run_cpu_cores_unlock_efi() {
     user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
     local build_dir="$user_home/.cache/bc250-toolkit/bc250-efi-core-unlock"
 
-    print_info "Cloning bc250-efi-core-unlock as $REAL_USER..."
+print_info "Cloning bc250-efi-core-unlock as $REAL_USER..."
     sudo -u "$REAL_USER" mkdir -p "$(dirname "$build_dir")"
     if [[ -d "$build_dir" ]]; then
         print_info "Directory already exists — pulling latest changes..."
@@ -1850,29 +1865,35 @@ run_cpu_cores_unlock_efi() {
         sudo -u "$REAL_USER" git clone "$CPU_UNLOCK_EFI_REPO_URL" "$build_dir" || { print_error "Failed to clone repository."; return 1; }
     fi
 
-    print_info "Cloning yoppeh/efi dependency..."
-    if [[ -d "$build_dir/efi" ]]; then
-        sudo -u "$REAL_USER" git -C "$build_dir/efi" pull || { print_error "Failed to pull efi dependency."; return 1; }
-    else
-        sudo -u "$REAL_USER" git clone "$CPU_UNLOCK_EFI_YOPPEH_URL" "$build_dir/efi" || { print_error "Failed to clone efi dependency."; return 1; }
-    fi
-
-    print_info "Patching Makefile..."
-    sudo -u "$REAL_USER" sed -i 's/yoppeh-efi/efi/g' "$build_dir/Makefile"
+    print_info "Initializing git submodules..."
+    sudo -u "$REAL_USER" git -C "$build_dir" submodule update --init --recursive || {
+        # Fallback if submodule init fails: clone directly into the path expected by Hexxeh's Makefile
+        print_info "Submodule init failed — manually cloning yoppeh/efi dependency..."
+        sudo -u "$REAL_USER" git clone "$CPU_UNLOCK_EFI_YOPPEH_URL" "$build_dir/yoppeh-efi" || { print_error "Failed to clone efi dependency."; return 1; }
+    }
 
     print_info "Building with clang..."
-    if ! sudo -u "$REAL_USER" bash -c "cd '$build_dir' && make clang"; then
+    if ! sudo -u "$REAL_USER" bash -c "cd '$build_dir' && make clean && make clang"; then
         print_error "Build failed."
         return 1
     fi
-    if [[ ! -f "$build_dir/bc250-unlock.efi" ]]; then
-        print_error "Build did not produce bc250-unlock.efi."
+
+    if [[ ! -f "$build_dir/bc250-unlock.efi" && ! -f "$build_dir/bc250-core-unlock.efi" ]]; then
+        print_error "Build did not produce an .efi binary."
         return 1
+    fi
+
+    # Handle binary naming regardless of output target name
+    local compiled_bin
+    if [[ -f "$build_dir/bc250-unlock.efi" ]]; then
+        compiled_bin="$build_dir/bc250-unlock.efi"
+    else
+        compiled_bin="$build_dir/bc250-core-unlock.efi"
     fi
 
     print_info "Installing to $esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME..."
     mkdir -p "$esp_mount/EFI/BOOT"
-    cp "$build_dir/bc250-unlock.efi" "$esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME"
+    cp "$compiled_bin" "$esp_mount/EFI/BOOT/$CPU_UNLOCK_EFI_BIN_NAME"
 
     if ! confirm "Create a UEFI boot entry '$CPU_UNLOCK_EFI_LABEL' on $disk (partition $part)? This will typically become your default boot entry."; then
         print_info "Cancelled before creating the boot entry."
@@ -5164,6 +5185,128 @@ cu_install_umr() {
     fi
 }
 
+# Rebuilds umr from the AUR. Fixes "failed to read $CU_ASIC" errors, which
+# usually mean umr's bundled ASIC definitions are stale relative to the
+# currently running kernel/mesa and need a fresh build against the current
+# environment, not just a reinstall of the same cached package.
+cu_repair_umr() {
+    print_info "Rebuilding umr — this fixes \"failed to read $CU_ASIC\" errors caused by a stale build."
+    if aur_rebuild umr; then
+        cu_info "umr rebuilt successfully."
+        cu_find_umr && cu_info "Found at: $CU_UMR"
+    else
+        cu_die "Failed to rebuild umr — check the output above."
+        return 1
+    fi
+}
+
+cu_uninstall_umr() {
+    if ! cu_find_umr; then
+        print_info "umr not found — nothing to uninstall."
+        return 0
+    fi
+
+    print_info "Found umr at: $CU_UMR"
+
+    if command -v pacman >/dev/null 2>&1 && pacman -Qi umr >/dev/null 2>&1; then
+        # Covers both a plain pacman install and an AUR-helper install —
+        # AUR packages built via yay/paru still register in the pacman
+        # local database, so this check catches both paths.
+        if ! confirm "Remove the 'umr' package via pacman?"; then
+            print_info "Cancelled."
+            return 0
+        fi
+        if pacman -Rs --noconfirm umr; then
+            cu_info "umr package removed."
+        else
+            cu_die "pacman could not remove umr — check the output above."
+            return 1
+        fi
+    elif command -v rpm-ostree >/dev/null 2>&1 && rpm -q umr >/dev/null 2>&1; then
+        if ! confirm "Remove the 'umr' package via rpm-ostree? (reboot required to complete)"; then
+            print_info "Cancelled."
+            return 0
+        fi
+        if rpm-ostree uninstall umr; then
+            cu_info "umr staged for removal — reboot to complete."
+        else
+            cu_die "rpm-ostree could not remove umr."
+            return 1
+        fi
+    elif command -v dnf >/dev/null 2>&1 && rpm -q umr >/dev/null 2>&1; then
+        if ! confirm "Remove the 'umr' package via dnf?"; then
+            print_info "Cancelled."
+            return 0
+        fi
+        if dnf remove -y umr; then
+            cu_info "umr package removed."
+        else
+            cu_die "dnf could not remove umr."
+            return 1
+        fi
+    else
+        # Found a binary (e.g. a manual build at /opt/umr/build/src/app/umr)
+        # that no supported package manager claims — nothing to uninstall
+        # through a package manager, so offer to just delete the binary.
+        cu_warn "umr at $CU_UMR doesn't appear to be tracked by pacman, dnf, or rpm-ostree."
+        cu_warn "It may have been built manually (e.g. under /opt/umr)."
+        if ! confirm "Delete the binary at $CU_UMR directly?"; then
+            print_info "Cancelled."
+            return 0
+        fi
+        if rm -f "$CU_UMR"; then
+            cu_info "Removed $CU_UMR."
+            if [[ "$CU_UMR" == /opt/umr/* ]]; then
+                cu_info "This looked like a manual build under /opt/umr — you may also want to"
+                cu_info "'rm -rf /opt/umr' separately to remove the rest of the build tree."
+            fi
+        else
+            cu_die "Failed to remove $CU_UMR."
+            return 1
+        fi
+    fi
+
+    CU_UMR=""
+}
+
+# Full revert for the GPU Compute Units Unlock feature, in the order that
+# actually matters: live state first (needs umr present), then the boot
+# service/saved profile, then umr itself last (nothing after this step
+# needs it). Each step confirms independently — declining one doesn't
+# block the others, since they're separable concerns.
+run_revert_cu_unlock() {
+    print_step "R-15" "Revert GPU Compute Units Unlock"
+
+    echo ""
+    print_info "This reverts the GPU Compute Units Unlock feature in three steps:"
+    print_info "  1. Reset live compute-pair routing to driver default"
+    print_info "  2. Remove the boot persistence service and saved CU profile"
+    print_info "  3. Uninstall umr"
+    echo ""
+
+    print_section "Step 1: Reset Live CU State"
+    if cu_find_umr; then
+        # This revert's own prompts (below, and inside each step) already
+        # cover informed consent — re-running the full "type unlock" Danger
+        # Zone disclaimer here would be redundant, so set the flag directly.
+        CU_DISCLAIMER_ACCEPTED=1
+        cu_stock_dispatch
+    else
+        print_info "umr not found — skipping live reset (nothing to reset without it)."
+    fi
+
+    echo ""
+    print_section "Step 2: Remove Boot Service & Saved Profile"
+    cu_uninstall_service
+
+    echo ""
+    print_section "Step 3: Uninstall umr"
+    cu_uninstall_umr
+
+    echo ""
+    print_success "GPU Compute Units Unlock reverted."
+}
+
 dz_warn() {
     echo ""
     echo -e "  ${BOLD}${RED}⚠  WARNING${RESET}"
@@ -5197,17 +5340,19 @@ show_danger_zone_menu() {
     echo -e "  ${DIM}Direct hardware register access. Read the status dashboard before making changes.${RESET}\n"
     print_section "Prerequisites"
     print_item  "1"  "Install umr"              ""
+    print_item  "2"  "Repair UMR"               "Fixes \"failed to read cyan_skillfish.gfx1013\" errors"
+    print_item  "3"  "Uninstall umr"            ""
     echo ""
     print_section "Compute Unit Management"
-    print_item  "2"  "CU Status Dashboard"       ""
-    print_item  "3"  "Edit Compute Pairs"        ""
-    print_item  "4"  "Enable All Compute Pairs"  ""
-    print_item  "5"  "Reset to Driver Default"   ""
+    print_item  "4"  "CU Status Dashboard"       ""
+    print_item  "5"  "Edit Compute Pairs"        ""
+    print_item  "6"  "Enable All Compute Pairs"  ""
+    print_item  "7"  "Reset to Driver Default"   ""
     echo ""
     print_section "Boot Persistence"
-    print_item  "6"  "Install Boot Service"      ""
-    print_item  "7"  "Save Boot Profile"         ""
-    print_item  "8"  "Uninstall Boot Service"    ""
+    print_item  "8"  "Install Boot Service"      ""
+    print_item  "9"  "Save Boot Profile"         ""
+    print_item  "10" "Uninstall Boot Service"    ""
     echo ""
     print_item  "0"  "Back"                      ""
     echo ""
@@ -5222,13 +5367,15 @@ run_danger_zone_menu() {
 
         case "${dz_choice^^}" in
             1) cu_install_umr;          press_enter ;;
-            2) cu_register_status;      press_enter ;;
-            3) cu_table_editor ;;
-            4) cu_enable_all;           press_enter ;;
-            5) cu_stock_dispatch;       press_enter ;;
-            6) cu_install_service;      press_enter ;;
-            7) cu_write_service_table;  press_enter ;;
-            8) cu_uninstall_service;    press_enter ;;
+            2) cu_repair_umr;           press_enter ;;
+            3) cu_uninstall_umr;        press_enter ;;
+            4) cu_register_status;      press_enter ;;
+            5) cu_table_editor ;;
+            6) cu_enable_all;           press_enter ;;
+            7) cu_stock_dispatch;       press_enter ;;
+            8) cu_install_service;      press_enter ;;
+            9) cu_write_service_table;  press_enter ;;
+            10) cu_uninstall_service;   press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$dz_choice'"
@@ -5659,6 +5806,7 @@ show_revert_menu() {
     print_item  "12" "Revert 8-Core Metrics Fix" "Remove amdgpu.cs_legacy_8core_metrics kernel param"
     print_item  "13" "Revert Disable Default Scheduler" "Re-enable scx_loader.service"
     print_item  "14" "Revert SMU Metrics Patch" "Remove bc250-smu-metrics-patch.service"
+    print_item  "15" "Revert GPU Compute Units Unlock" "Reset live CU state, remove boot service, uninstall umr"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -5685,6 +5833,7 @@ run_revert_menu() {
             12) run_revert_cs_legacy_8core_metrics; press_enter ;;
             13) run_revert_scx_default_scheduler; press_enter ;;
             14) run_revert_cpu_unlock_patch_metrics; press_enter ;;
+            15) run_revert_cu_unlock;            press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
