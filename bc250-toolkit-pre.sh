@@ -1215,6 +1215,31 @@ run_install_bc250_dual_audio() {
     print_success "bc250-dual-audio installed."
 }
 
+run_install_bc250_cec() {
+    print_step "MR-7" "Install bc250-cec"
+
+    bc250_repo_require || return 1
+
+    if pacman -Qq bc250-cec &>/dev/null; then
+        print_info "bc250-cec is already installed — skipping."
+        return 0
+    fi
+
+    print_info "Refreshing pacman databases..."
+    if ! pacman -Syy; then
+        print_error "Failed to refresh pacman databases — check the output above."
+        return 1
+    fi
+
+    print_info "Installing bc250-cec..."
+    if ! pacman -S --needed --noconfirm bc250-cec; then
+        print_error "Failed to install bc250-cec — check the output above."
+        return 1
+    fi
+
+    print_success "bc250-cec installed."
+}
+
 # Patches the cyan-skillfish-governor-smu config so GPU usage/frequency are
 # handled entirely by kernel-mode reporting instead of direct SMU access.
 # Only correct on a modified/patched BIOS + this repo's kernel, which expose
@@ -1223,7 +1248,7 @@ run_install_bc250_dual_audio() {
 # available via the kernel, so the governor would be left unable to read
 # usage or set frequency correctly.
 run_patch_bc250_gpu_config_modified_bios() {
-    print_step "MR-7" "Patch GPU Governor for Modified BIOS"
+    print_step "MR-8" "Patch GPU Governor for Modified BIOS"
 
     if [[ ! -f "$GPU_DEST" ]]; then
         print_error "cyan-skillfish-governor-smu config not found at $GPU_DEST — install GPU Governor first (Initial Setup > GPU Governor)."
@@ -1325,9 +1350,10 @@ show_mastag_repo_menu() {
     print_item "4" "Install proton-cachyos-native-bc250" ""
     print_item "5" "Install protonge-latest-bc250"       ""
     print_item "6" "Install bc250-dual-audio"             "5.1 surround audio support"
+    print_item "7" "Install bc250-cec"                    "BC-250 CEC patches"
     echo ""
     print_section "GPU Governor Patch"
-    print_item "7" "Patch GPU Governor for Modified BIOS" "Switches usage & frequency control from SMU to kernel-reported values"
+    print_item "8" "Patch GPU Governor for Modified BIOS" "Switches usage & frequency control from SMU to kernel-reported values"
     echo ""
     print_item "0" "Back" ""
     echo ""
@@ -1346,7 +1372,8 @@ run_mastag_repo_menu() {
             4) run_install_bc250_proton_cachyos;           press_enter ;;
             5) run_install_bc250_protonge;                 press_enter ;;
             6) run_install_bc250_dual_audio;               press_enter ;;
-            7) run_patch_bc250_gpu_config_modified_bios;   press_enter ;;
+            7) run_install_bc250_cec;                      press_enter ;;
+            8) run_patch_bc250_gpu_config_modified_bios;   press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$mr_choice'"
@@ -1606,6 +1633,28 @@ run_revert_bc250_dual_audio() {
     print_success "bc250-dual-audio removed."
 }
 
+run_revert_bc250_cec() {
+    print_step "RMR-8" "Revert bc250-cec"
+
+    if ! pacman -Qq bc250-cec &>/dev/null; then
+        print_info "bc250-cec is not installed — nothing to revert."
+        return 0
+    fi
+
+    if ! confirm "Remove bc250-cec?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    print_info "Removing bc250-cec..."
+    if ! pacman -Rs --noconfirm bc250-cec; then
+        print_error "Failed to remove bc250-cec — check the output above."
+        return 1
+    fi
+
+    print_success "bc250-cec removed."
+}
+
 show_revert_mastag_repo_menu() {
     print_banner
     print_section "Revert MastaG's Repo"
@@ -1624,6 +1673,7 @@ show_revert_mastag_repo_menu() {
     print_item "5" "Revert protonge-latest-bc250"       ""
     print_item "6" "Revert 8-Core Metrics Fix"          "Remove amdgpu.cs_legacy_8core_metrics kernel param"
     print_item "7" "Revert bc250-dual-audio"            "5.1 surround audio support"
+    print_item "8" "Revert bc250-cec"                   "BC-250 CEC patches"
     echo ""
     print_item "0" "Back" ""
     echo ""
@@ -1643,6 +1693,7 @@ run_revert_mastag_repo_menu() {
             5) run_revert_bc250_protonge;            press_enter ;;
             6) run_revert_cs_legacy_8core_metrics;   press_enter ;;
             7) run_revert_bc250_dual_audio;          press_enter ;;
+            8) run_revert_bc250_cec;                 press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$rmr_choice'"
@@ -1856,7 +1907,7 @@ run_cpu_cores_unlock_efi() {
     user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
     local build_dir="$user_home/.cache/bc250-toolkit/bc250-efi-core-unlock"
 
-print_info "Cloning bc250-efi-core-unlock as $REAL_USER..."
+    print_info "Cloning bc250-efi-core-unlock as $REAL_USER..."
     sudo -u "$REAL_USER" mkdir -p "$(dirname "$build_dir")"
     if [[ -d "$build_dir" ]]; then
         print_info "Directory already exists — pulling latest changes..."
@@ -5341,18 +5392,16 @@ show_danger_zone_menu() {
     print_section "Prerequisites"
     print_item  "1"  "Install umr"              ""
     print_item  "2"  "Repair UMR"               "Fixes \"failed to read cyan_skillfish.gfx1013\" errors"
-    print_item  "3"  "Uninstall umr"            ""
     echo ""
     print_section "Compute Unit Management"
-    print_item  "4"  "CU Status Dashboard"       ""
-    print_item  "5"  "Edit Compute Pairs"        ""
-    print_item  "6"  "Enable All Compute Pairs"  ""
-    print_item  "7"  "Reset to Driver Default"   ""
+    print_item  "3"  "CU Status Dashboard"       ""
+    print_item  "4"  "Edit Compute Pairs"        ""
+    print_item  "5"  "Enable All Compute Pairs"  ""
+    print_item  "6"  "Reset to Driver Default"   ""
     echo ""
     print_section "Boot Persistence"
-    print_item  "8"  "Install Boot Service"      ""
-    print_item  "9"  "Save Boot Profile"         ""
-    print_item  "10" "Uninstall Boot Service"    ""
+    print_item  "7"  "Install Boot Service"      ""
+    print_item  "8"  "Save Boot Profile"         ""
     echo ""
     print_item  "0"  "Back"                      ""
     echo ""
@@ -5368,14 +5417,12 @@ run_danger_zone_menu() {
         case "${dz_choice^^}" in
             1) cu_install_umr;          press_enter ;;
             2) cu_repair_umr;           press_enter ;;
-            3) cu_uninstall_umr;        press_enter ;;
-            4) cu_register_status;      press_enter ;;
-            5) cu_table_editor ;;
-            6) cu_enable_all;           press_enter ;;
-            7) cu_stock_dispatch;       press_enter ;;
-            8) cu_install_service;      press_enter ;;
-            9) cu_write_service_table;  press_enter ;;
-            10) cu_uninstall_service;   press_enter ;;
+            3) cu_register_status;      press_enter ;;
+            4) cu_table_editor ;;
+            5) cu_enable_all;           press_enter ;;
+            6) cu_stock_dispatch;       press_enter ;;
+            7) cu_install_service;      press_enter ;;
+            8) cu_write_service_table;  press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$dz_choice'"
@@ -5797,16 +5844,22 @@ show_revert_menu() {
     print_item  "3"  "Revert ZSWAP"            "Re-enable ZRAM, remove swapfile"
     print_item  "4"  "Revert loglevel"         "Restore loglevel to default (3)"
     print_item  "5"  "Revert Mitigations"      "Re-enable CPU security mitigations"
-    print_item  "6"  "Revert DolphinBar"       "Remove DolphinBar udev rules"
-    print_item  "7"  "Revert VRAM Ceiling"     "Remove ttm.pages_limit kernel param"
-    print_item  "8"  "Revert ACPI Fix"         "Remove SSDT overrides & acpi_override hook"
-    print_item  "9"  "Revert CPU Cores Unlock" "Remove UEFI boot entry & .efi file"
-    print_item  "10" "Revert MastaG's Repo"   "Kernel, Mesa/Vulkan, Proton — submenu"
+    echo ""
+    print_section "⚠  Manual Steps"
+    print_item  "6"  "Revert CPU Cores Unlock" "Remove UEFI boot entry & .efi file"
+    print_item  "7"  "Revert SMU Metrics Patch" "Remove bc250-smu-metrics-patch.service"
+    print_item  "8"  "Revert GPU Compute Units Unlock" "Reset live CU state, remove boot service, uninstall umr"
+    print_item  "9"  "Revert ACPI Fix"         "Remove SSDT overrides & acpi_override hook"
+    print_item  "10" "Revert VRAM Ceiling"     "Remove ttm.pages_limit kernel param"
     print_item  "11" "Revert 5.1 Surround Sound" "Restore default HDMI stereo profile"
     print_item  "12" "Revert 8-Core Metrics Fix" "Remove amdgpu.cs_legacy_8core_metrics kernel param"
     print_item  "13" "Revert Disable Default Scheduler" "Re-enable scx_loader.service"
-    print_item  "14" "Revert SMU Metrics Patch" "Remove bc250-smu-metrics-patch.service"
-    print_item  "15" "Revert GPU Compute Units Unlock" "Reset live CU state, remove boot service, uninstall umr"
+    echo ""
+    print_section "MastaG's Repo"
+    print_item  "14" "Revert MastaG's Repo"   "Kernel, Mesa/Vulkan, Proton — submenu"
+    echo ""
+    print_section "Additional Tools"
+    print_item  "15" "Revert DolphinBar"       "Remove DolphinBar udev rules"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -5824,16 +5877,16 @@ run_revert_menu() {
             3) run_revert_zswap;                press_enter ;;
             4) run_revert_loglevel;             press_enter ;;
             5) run_revert_mitigations;          press_enter ;;
-            6) run_revert_dolphinbar;           press_enter ;;
-            7) run_revert_ttm_pages_limit;      press_enter ;;
-            8) run_revert_acpi_fix;             press_enter ;;
-            9) run_revert_cpu_cores_unlock_efi; press_enter ;;
-            10) run_revert_mastag_repo_menu ;;
+            6) run_revert_cpu_cores_unlock_efi; press_enter ;;
+            7) run_revert_cpu_unlock_patch_metrics; press_enter ;;
+            8) run_revert_cu_unlock;            press_enter ;;
+            9) run_revert_acpi_fix;             press_enter ;;
+            10) run_revert_ttm_pages_limit;     press_enter ;;
             11) run_revert_ac3_surround;        press_enter ;;
             12) run_revert_cs_legacy_8core_metrics; press_enter ;;
             13) run_revert_scx_default_scheduler; press_enter ;;
-            14) run_revert_cpu_unlock_patch_metrics; press_enter ;;
-            15) run_revert_cu_unlock;            press_enter ;;
+            14) run_revert_mastag_repo_menu ;;
+            15) run_revert_dolphinbar;          press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
