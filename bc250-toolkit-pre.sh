@@ -5860,6 +5860,7 @@ show_revert_menu() {
     echo ""
     print_section "Additional Tools"
     print_item  "15" "Revert DolphinBar"       "Remove DolphinBar udev rules"
+    print_item  "16" "Revert BC-250 VA-API Driver" "Run the project's uninstaller, remove cached source"
     echo ""
     print_item  "0"  "Back"                    ""
     echo ""
@@ -5887,6 +5888,7 @@ run_revert_menu() {
             13) run_revert_scx_default_scheduler; press_enter ;;
             14) run_revert_mastag_repo_menu ;;
             15) run_revert_dolphinbar;          press_enter ;;
+            16) run_revert_bc250_va_driver;     press_enter ;;
             0) return ;;
             *)
                 print_error "Invalid selection: '$rev_choice'"
@@ -6042,6 +6044,83 @@ run_install_protonup_qt() {
     fi
 }
 
+BC250_VCN_REPO_URL="https://github.com/simpmix/bc250-encoding-decoding-fix.git"
+
+# VA-API software video encoder (Vulkan compute), built from source. The
+# audio-fix DKMS module bundled in the same repo is a separate, independent
+# component and is deliberately NOT installed by this task.
+run_install_bc250_va_driver() {
+    print_step "AT-6" "Install BC-250 VA-API Video Driver"
+
+    if ! confirm "Build and install the BC-250 VA-API video driver from source?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    local user_home
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    local build_dir="$user_home/.cache/bc250-toolkit/bc250-encoding-decoding-fix"
+
+    print_info "Cloning bc250-encoding-decoding-fix as $REAL_USER..."
+    sudo -u "$REAL_USER" mkdir -p "$(dirname "$build_dir")"
+    if [[ -d "$build_dir" ]]; then
+        print_info "Directory already exists — pulling latest changes..."
+        sudo -u "$REAL_USER" git -C "$build_dir" pull || { print_error "Failed to pull repository."; return 1; }
+    else
+        sudo -u "$REAL_USER" git clone "$BC250_VCN_REPO_URL" "$build_dir" || { print_error "Failed to clone repository."; return 1; }
+    fi
+
+    print_info "Running build_and_install.sh (builds and installs the driver; per upstream, run as root)..."
+    if ! bash -c "cd '$build_dir' && chmod +x build_and_install.sh tools/*.sh 2>/dev/null; ./build_and_install.sh"; then
+        print_error "build_and_install.sh failed — check the output above."
+        return 1
+    fi
+
+    print_success "BC-250 VA-API video driver installed."
+    echo -e "  ${DIM}Verify with: $build_dir/tools/bc250_diagnose.sh${RESET}"
+    echo -e "  ${DIM}Test with:   LIBVA_DRIVER_NAME=bc250 vainfo${RESET}\n"
+}
+
+# The upstream installer picks its DRI directory from a candidate list
+# (/usr/local/lib64/dri on some systems, others elsewhere), so removal is
+# delegated to the project's own tools/bc250_uninstall.sh rather than
+# guessing paths here. The cached source is only deleted after the
+# uninstaller succeeds, so a failed run can be retried.
+run_revert_bc250_va_driver() {
+    print_step "R-16" "Revert BC-250 VA-API Video Driver"
+
+    local user_home
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    local build_dir="$user_home/.cache/bc250-toolkit/bc250-encoding-decoding-fix"
+    local uninstaller="$build_dir/tools/bc250_uninstall.sh"
+
+    if [[ ! -d "$build_dir" ]]; then
+        print_info "No cached source at $build_dir — nothing to run."
+        print_info "If the driver is still installed, re-run Install BC-250 VA-API Driver first so the uninstaller is available."
+        return 0
+    fi
+
+    if [[ ! -f "$uninstaller" ]]; then
+        print_error "$uninstaller not found in the cached source."
+        print_error "Check $build_dir/tools/ for the project's uninstall script."
+        return 1
+    fi
+
+    if ! confirm "Run the project's uninstaller (bc250_uninstall.sh) and remove the cached source?"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    if ! bash "$uninstaller"; then
+        print_error "bc250_uninstall.sh reported a failure — leaving $build_dir in place so you can retry."
+        return 1
+    fi
+
+    print_info "Removing cached source at $build_dir..."
+    rm -rf "$build_dir"
+    print_success "BC-250 VA-API video driver removed."
+}
+
 show_experimental_menu() {
     print_banner
     print_section "Additional Tools"
@@ -6051,6 +6130,7 @@ show_experimental_menu() {
     print_item  "3"  "Install Decky"       "Install the Decky plugin loader"
     print_item  "4"  "Install EmuDeck"     "Install the EmuDeck emulation suite"
     print_item  "5"  "Install ProtonUp-Qt" "Manage Proton and Wine versions"
+    print_item  "6"  "Install BC-250 VA-API Driver" "Software H.264 encode via GPU compute shaders"
     echo ""
     print_item  "0"  "Back"               ""
     echo ""
@@ -6068,6 +6148,7 @@ run_experimental_menu() {
             3) run_install_decky;         press_enter ;;
             4) run_install_emudeck;       press_enter ;;
             5) run_install_protonup_qt;   press_enter ;;
+            6) run_install_bc250_va_driver; press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$exp_choice'"
