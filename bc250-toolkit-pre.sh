@@ -536,8 +536,45 @@ run_cpu_governor() {
     echo -e "  ${DIM}bc250-detect / bc250-apply are on ${REAL_USER}'s PATH at ${user_bin}${RESET}\n"
 }
 
+# A core-unlock helper left on some systems (/usr/local/libexec/bc250-core-unlock/
+# try-unlock-bc250.sh, run at boot by bc250-unlock.service) contains
+# `systemctl stop cyan-skillfish-governor-smu`. It fires while the governor's
+# boot start job is still pending, which cancels that job, so the governor
+# intermittently never starts. This toolkit does not create that script; this
+# only fixes it where it already exists. The stop line is replaced with a no-op
+# (`:`), the original is kept as <script>.bak, and the edit is rolled back if
+# the result no longer parses. Lines ending in a backslash are left alone.
+bc250_fix_legacy_unlock_governor_stop() {
+    local script="/usr/local/libexec/bc250-core-unlock/try-unlock-bc250.sh"
+    local stop_re='^[[:space:]]*systemctl stop cyan-skillfish-governor-smu[^\\]*$'
+
+    [[ -f "$script" ]] || return 0
+    grep -qE "$stop_re" "$script" || return 0
+
+    print_info "Found a core-unlock helper that stops the GPU governor on every boot:"
+    print_info "  $script"
+    print_info "That cancels the governor's start at boot, so it sometimes never runs."
+    if ! confirm "Disable that stop command? (original saved as ${script}.bak)"; then
+        print_info "Skipped — the GPU governor may fail to start on some boots."
+        return 0
+    fi
+
+    [[ -f "${script}.bak" ]] || cp "$script" "${script}.bak"
+    sed -i 's/^\([[:space:]]*\)systemctl stop cyan-skillfish-governor-smu[^\\]*$/\1: # disabled by bc250-toolkit - this stopped the GPU governor every boot/' "$script"
+    if ! bash -n "$script"; then
+        cp "${script}.bak" "$script"
+        print_error "The edited script failed a syntax check — restored the original."
+        return 1
+    fi
+    print_success "Core-unlock helper no longer stops the GPU governor."
+}
+
 run_gpu_governor() {
     print_step "03" "Installing GPU Governor"
+
+    # Runs before the already-installed check below on purpose: the systems
+    # that need this fix already have the governor installed.
+    bc250_fix_legacy_unlock_governor_stop || true
 
     if systemctl is-enabled cyan-skillfish-governor-smu.service &>/dev/null || \
        pacman -Qq cyan-skillfish-governor-smu &>/dev/null; then
@@ -6121,6 +6158,82 @@ run_revert_bc250_va_driver() {
     print_success "BC-250 VA-API video driver removed."
 }
 
+# HelixSR runs NVIDIA's DLSS network as an FSR 3.1 replacement for D3D12 games
+# under Proton. It ships as a closed-source zip on GitHub releases. The
+# release's helixsr-setup.sh is interactive (finds Steam games, asks per game,
+# offers to download NVIDIA's DLSS DLL) and is meant to run as the normal user:
+# it uses $HOME for the Steam library, a portable Python and a wine prefix, and
+# calls sudo itself only to install python-numpy. So every step here runs as
+# $REAL_USER, never root.
+#
+# The latest tag comes from the github.com /releases/latest redirect (no API,
+# so no unauthenticated rate limit). The asset is assumed to be named
+# HelixSR-<version>.zip, which holds for 1.8.1. The extracted folder is kept:
+# re-running its helixsr-setup.sh adds or removes games, and
+# helixsr-uninstall.sh lives there. Each version extracts into its own folder,
+# as upstream advises for updates.
+run_install_helixsr() {
+    print_step "AT-7" "Install HelixSR"
+
+    local repo="https://github.com/lonewolf0622/HelixSR"
+
+    if ! command -v bsdtar >/dev/null 2>&1; then
+        print_error "bsdtar not found (part of libarchive) — needed to extract the release."
+        return 1
+    fi
+
+    local user_home dest_root
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    dest_root="$user_home/HelixSR"
+
+    print_info "Finding the latest HelixSR release..."
+    local final tag ver
+    final="$(curl -sIL -o /dev/null -w '%{url_effective}' "$repo/releases/latest" || true)"
+    if [[ "$final" != */releases/tag/* ]]; then
+        print_error "Could not determine the latest release (got: ${final:-nothing}) — check your network."
+        return 1
+    fi
+    tag="${final##*/}"
+    ver="${tag#v}"
+    print_info "Latest release: $tag"
+
+    local release_dir="$dest_root/HelixSR-$ver"
+    if [[ -f "$release_dir/helixsr-setup.sh" ]]; then
+        print_info "HelixSR $ver is already downloaded at $release_dir — skipping download."
+    else
+        local zip="$dest_root/HelixSR-$ver.zip"
+        local url="$repo/releases/download/$tag/HelixSR-$ver.zip"
+        sudo -u "$REAL_USER" mkdir -p "$dest_root"
+        print_info "Downloading HelixSR-$ver.zip..."
+        if ! sudo -u "$REAL_USER" curl -fL --retry 3 -o "$zip" "$url"; then
+            print_error "Failed to download $url"
+            sudo -u "$REAL_USER" rm -f "$zip"
+            return 1
+        fi
+        print_info "Extracting to $dest_root..."
+        if ! sudo -u "$REAL_USER" bsdtar -xf "$zip" -C "$dest_root"; then
+            print_error "Failed to extract $zip"
+            return 1
+        fi
+        sudo -u "$REAL_USER" rm -f "$zip"
+        if [[ ! -f "$release_dir/helixsr-setup.sh" ]]; then
+            print_error "helixsr-setup.sh not found in $release_dir after extracting — the release layout may have changed."
+            return 1
+        fi
+    fi
+    sudo -u "$REAL_USER" chmod +x "$release_dir"/helixsr-*.sh
+
+    print_info "Launching HelixSR setup as $REAL_USER (interactive — answer its prompts)..."
+    if ! sudo -H -u "$REAL_USER" bash -c "cd '$release_dir' && ./helixsr-setup.sh"; then
+        print_error "helixsr-setup.sh exited with an error — check the output above."
+        return 1
+    fi
+
+    print_success "HelixSR setup finished."
+    echo -e "  ${DIM}Add or remove games later: $release_dir/helixsr-setup.sh${RESET}"
+    echo -e "  ${DIM}Uninstall:                 $release_dir/helixsr-uninstall.sh${RESET}\n"
+}
+
 show_experimental_menu() {
     print_banner
     print_section "Additional Tools"
@@ -6131,6 +6244,7 @@ show_experimental_menu() {
     print_item  "4"  "Install EmuDeck"     "Install the EmuDeck emulation suite"
     print_item  "5"  "Install ProtonUp-Qt" "Manage Proton and Wine versions"
     print_item  "6"  "Install BC-250 VA-API Driver" "Software H.264 encode via GPU compute shaders"
+    print_item  "7"  "Install HelixSR (DLSS)" "DLSS upscaling for D3D12 games via Proton"
     echo ""
     print_item  "0"  "Back"               ""
     echo ""
@@ -6149,6 +6263,7 @@ run_experimental_menu() {
             4) run_install_emudeck;       press_enter ;;
             5) run_install_protonup_qt;   press_enter ;;
             6) run_install_bc250_va_driver; press_enter ;;
+            7) run_install_helixsr;         press_enter ;;
             0) return 0 ;;
             *)
                 print_error "Invalid selection: '$exp_choice'"
